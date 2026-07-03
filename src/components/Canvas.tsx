@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { startDevServer, stopDevServer } from "../lib/api";
+import { registerCanvasIframe } from "../lib/bridge";
 import { useStore } from "../lib/store";
 import { VIEWPORTS } from "../lib/types";
+import type { SelectedElement } from "../lib/types";
 import { RefreshIcon } from "./icons";
 
 export function Canvas() {
@@ -17,6 +19,19 @@ export function Canvas() {
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const viewport = VIEWPORTS.find((v) => v.id === viewportId)!;
+
+  // Overlay → editor messages (FR-2.2): element selections from the iframe.
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      const m = e.data;
+      if (!m || m.__dedup !== true) return;
+      if (m.type === "selected") {
+        useStore.getState().setSelected(m.payload as SelectedElement);
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
 
   // ⌘/Ctrl + scroll to zoom the canvas (FR-6.1).
   const scrollAreaRef = useRef<HTMLDivElement>(null);
@@ -41,6 +56,8 @@ export function Canvas() {
       await startDevServer(
         project.root,
         project.packageManager,
+        project.framework,
+        project.devScript,
         useStore.getState().customCommand ?? undefined,
       );
     } catch {
@@ -145,7 +162,10 @@ export function Canvas() {
             }}
           >
             <iframe
-              ref={iframeRef}
+              ref={(el) => {
+                iframeRef.current = el;
+                registerCanvasIframe(el);
+              }}
               src={devUrl}
               title="app-canvas"
               className="w-full h-full border-0 bg-white"

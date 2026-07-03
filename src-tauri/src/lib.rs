@@ -3,13 +3,14 @@
 
 mod devserver;
 mod git;
+mod instrument;
 mod project;
 mod proxy;
 mod recents;
 
-use devserver::DevServerState;
-use project::{PackageManager, ProjectInfo};
-use tauri::{AppHandle, Manager, State};
+use devserver::{DevServerState, ExecSpec};
+use project::{Framework, PackageManager, ProjectInfo};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
 fn detect_project(root: String) -> ProjectInfo {
@@ -27,9 +28,37 @@ fn start_dev_server(
     state: State<'_, DevServerState>,
     root: String,
     package_manager: PackageManager,
+    framework: Framework,
+    dev_script: Option<String>,
     custom_command: Option<String>,
 ) -> Result<(), String> {
-    devserver::start(&app, &state, &root, package_manager, custom_command)
+    let exec = if let Some(cmd) = custom_command {
+        // The user's explicit command wins; no rewriting on top of it.
+        ExecSpec::Shell(cmd)
+    } else if framework == Framework::Vite {
+        match instrument::setup(&root, dev_script.as_deref()) {
+            Ok(Some(instr)) => ExecSpec::Direct {
+                program: instr.program,
+                args: instr.args,
+            },
+            Ok(None) => ExecSpec::Script(package_manager),
+            Err(e) => {
+                // Instrumentation is an enhancement, not a requirement — run
+                // plain and tell the user why inspection is unavailable.
+                let _ = app.emit(
+                    "devserver://log",
+                    serde_json::json!({
+                        "stream": "stderr",
+                        "line": format!("dedup: tagging setup failed ({e}) — inspection disabled"),
+                    }),
+                );
+                ExecSpec::Script(package_manager)
+            }
+        }
+    } else {
+        ExecSpec::Script(package_manager)
+    };
+    devserver::start(&app, &state, &root, exec)
 }
 
 #[tauri::command]

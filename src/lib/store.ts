@@ -1,9 +1,11 @@
 import { create } from "zustand";
+import { sendToOverlay } from "./bridge";
 import type {
   DevServerStatus,
   GitStatus,
   LogEvent,
   ProjectInfo,
+  SelectedElement,
   Viewport,
 } from "./types";
 
@@ -30,6 +32,9 @@ interface AppState {
   viewportId: Viewport["id"];
   zoom: number;
 
+  /** Element currently selected on the canvas (FR-2.2). */
+  selected: SelectedElement | null;
+
   // actions
   enterEditor: (
     project: ProjectInfo,
@@ -45,6 +50,11 @@ interface AppState {
   toggleConsole: (open?: boolean) => void;
   setViewport: (id: Viewport["id"]) => void;
   setZoom: (zoom: number) => void;
+  setSelected: (sel: SelectedElement | null) => void;
+  /** Clear selection here and in the overlay. */
+  clearSelection: () => void;
+  /** Ask the overlay to select an element by dedupId (breadcrumb clicks). */
+  selectById: (id: string) => void;
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -64,6 +74,7 @@ export const useStore = create<AppState>((set) => ({
 
   viewportId: "desktop",
   zoom: 1,
+  selected: null,
 
   enterEditor: (project, git, customCommand = null) =>
     set({
@@ -77,6 +88,7 @@ export const useStore = create<AppState>((set) => ({
       exitCode: null,
       crashed: false,
       logs: [],
+      selected: null,
     }),
 
   backToLaunch: () =>
@@ -90,6 +102,7 @@ export const useStore = create<AppState>((set) => ({
       devPort: null,
       logs: [],
       crashed: false,
+      selected: null,
     }),
 
   setDevStatus: (devStatus) => set({ devStatus }),
@@ -115,4 +128,13 @@ export const useStore = create<AppState>((set) => ({
   setViewport: (viewportId) => set({ viewportId }),
 
   setZoom: (zoom) => set({ zoom: Math.min(2, Math.max(0.25, zoom)) }),
+
+  setSelected: (selected) => set({ selected }),
+
+  clearSelection: () => {
+    sendToOverlay({ type: "clear" });
+    set({ selected: null });
+  },
+
+  selectById: (id) => sendToOverlay({ type: "select-id", id }),
 }));

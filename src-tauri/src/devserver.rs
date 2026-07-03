@@ -69,14 +69,26 @@ struct StatusEvent {
     status: &'static str,
 }
 
-/// Spawn the dev server. `custom_command`, when present, is run through a shell
-/// (the escape hatch from FR-1.3); otherwise we run `<pm> run dev` in `root`.
+/// How to launch the dev server.
+pub enum ExecSpec {
+    /// `<pm> run dev` in the project root.
+    Script(PackageManager),
+    /// User-supplied command through a shell (FR-1.3 escape hatch).
+    Shell(String),
+    /// Direct binary invocation — used for the instrumented Vite launch
+    /// (`node_modules/.bin/vite … --config node_modules/.dedup/vite.config.mjs`).
+    Direct {
+        program: std::path::PathBuf,
+        args: Vec<String>,
+    },
+}
+
+/// Spawn the dev server according to `exec`.
 pub fn start(
     app: &AppHandle,
     state: &DevServerState,
     root: &str,
-    package_manager: PackageManager,
-    custom_command: Option<String>,
+    exec: ExecSpec,
 ) -> Result<(), String> {
     {
         let guard = state.0.lock().map_err(|_| "state lock poisoned")?;
@@ -85,7 +97,17 @@ pub fn start(
         }
     }
 
-    let mut cmd = build_command(root, package_manager, custom_command.as_deref());
+    if matches!(exec, ExecSpec::Direct { .. }) {
+        let _ = app.emit(
+            EVT_LOG,
+            LogEvent {
+                stream: "stdout",
+                line: "dedup: element tagging enabled (vite + dedup plugin)".into(),
+            },
+        );
+    }
+
+    let mut cmd = build_command(root, &exec);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -201,30 +223,39 @@ pub fn is_running(state: &DevServerState) -> bool {
         .unwrap_or(false)
 }
 
-fn build_command(root: &str, pm: PackageManager, custom: Option<&str>) -> Command {
-    if let Some(cmd_str) = custom {
-        let mut c = Command::new("/bin/sh");
-        c.arg("-lc").arg(cmd_str).current_dir(root);
-        return c;
-    }
-    let bin = match pm {
-        PackageManager::Pnpm => "pnpm",
-        PackageManager::Yarn => "yarn",
-        PackageManager::Bun => "bun",
-        PackageManager::Npm | PackageManager::Unknown => "npm",
-    };
-    // `run dev` works uniformly across pnpm/npm/bun; yarn allows `yarn dev`.
-    let mut c = Command::new(bin);
-    match pm {
-        PackageManager::Yarn => {
-            c.arg("dev");
+fn build_command(root: &str, exec: &ExecSpec) -> Command {
+    match exec {
+        ExecSpec::Shell(cmd_str) => {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-lc").arg(cmd_str).current_dir(root);
+            c
         }
-        _ => {
-            c.arg("run").arg("dev");
+        ExecSpec::Direct { program, args } => {
+            let mut c = Command::new(program);
+            c.args(args).current_dir(root);
+            c
+        }
+        ExecSpec::Script(pm) => {
+            let bin = match pm {
+                PackageManager::Pnpm => "pnpm",
+                PackageManager::Yarn => "yarn",
+                PackageManager::Bun => "bun",
+                PackageManager::Npm | PackageManager::Unknown => "npm",
+            };
+            // `run dev` works uniformly across pnpm/npm/bun; yarn allows `yarn dev`.
+            let mut c = Command::new(bin);
+            match pm {
+                PackageManager::Yarn => {
+                    c.arg("dev");
+                }
+                _ => {
+                    c.arg("run").arg("dev");
+                }
+            }
+            c.current_dir(root);
+            c
         }
     }
-    c.current_dir(root);
-    c
 }
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(

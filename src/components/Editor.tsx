@@ -71,6 +71,8 @@ export function Editor() {
           await startDevServer(
             project.root,
             project.packageManager,
+            project.framework,
+            project.devScript,
             useStore.getState().customCommand ?? undefined,
           );
         } catch (e) {
@@ -97,7 +99,9 @@ export function Editor() {
         else return;
         e.preventDefault();
       } else if (e.key === "Escape") {
-        useStore.getState().toggleConsole(false);
+        const s = useStore.getState();
+        if (s.selected) s.clearSelection();
+        else s.toggleConsole(false);
       }
     };
     window.addEventListener("keydown", onKey);

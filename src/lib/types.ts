@@ -61,6 +61,35 @@ export type DevServerStatus =
   | "stopped"
   | "crashed";
 
+// --- Element selection (FR-2.2, FR-2.4) -----------------------------------
+
+/** One tagged element as reported by the canvas overlay. */
+export interface ElementRef {
+  /** `file:line:col` — the source position of the JSX element. */
+  dedupId: string;
+  /** Enclosing component name, when the tagger could determine it. */
+  component: string | null;
+  /** DOM tag name (or lowercased component tag for custom elements). */
+  tag: string;
+}
+
+export interface SelectedElement extends ElementRef {
+  rect: { x: number; y: number; width: number; height: number };
+  /** How many DOM instances share this source position (.map() loops). */
+  instanceCount: number;
+  /** Innermost-first chain of tagged ancestors, including the element. */
+  ancestry: ElementRef[];
+}
+
+/** Parse a dedupId back into its parts. */
+export function parseDedupId(
+  id: string,
+): { file: string; line: number; col: number } | null {
+  const m = id.match(/^(.*):(\d+):(\d+)$/);
+  if (!m) return null;
+  return { file: m[1], line: Number(m[2]), col: Number(m[3]) };
+}
+
 // Canvas viewport presets (FR-1.4).
 export interface Viewport {
   id: "mobile" | "tablet" | "desktop";

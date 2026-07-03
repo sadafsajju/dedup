@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ExitEvent,
+  Framework,
   GitStatus,
   LogEvent,
   PackageManager,
@@ -23,11 +24,15 @@ export const gitStatus = (root: string) =>
 export const startDevServer = (
   root: string,
   packageManager: PackageManager,
+  framework: Framework,
+  devScript: string | null,
   customCommand?: string,
 ) =>
   invoke<void>("start_dev_server", {
     root,
     packageManager,
+    framework,
+    devScript,
     customCommand: customCommand ?? null,
   });
 
