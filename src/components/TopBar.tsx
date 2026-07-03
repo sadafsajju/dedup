@@ -1,8 +1,10 @@
+import { useEffect, useState } from "react";
 import { stopDevServer } from "../lib/api";
 import { useStore } from "../lib/store";
 import { VIEWPORTS } from "../lib/types";
 import type { DevServerStatus } from "../lib/types";
 import { ChevronIcon, GitBranchIcon, DuplicatesIcon } from "./icons";
+import { ReviewPanel } from "./ReviewPanel";
 
 const STATUS_META: Record<DevServerStatus, { label: string; dot: string }> = {
   idle: { label: "Idle", dot: "bg-ink-faint" },
@@ -31,6 +33,12 @@ export function TopBar() {
   const dirtyCount = Object.values(staged).filter(
     (e) => e.current !== e.original,
   ).length;
+  const [reviewOpen, setReviewOpen] = useState(false);
+
+  // Nothing left to review → close the popover.
+  useEffect(() => {
+    if (dirtyCount === 0) setReviewOpen(false);
+  }, [dirtyCount]);
 
   async function goBack() {
     await stopDevServer();
@@ -106,32 +114,48 @@ export function TopBar() {
         )}
       </div>
 
-      {/* Save state (FR-3.7, FR-4.5) */}
-      {saveError ? (
-        <button
-          onClick={saveAll}
-          className="rounded-md px-2.5 py-1 text-2xs bg-danger/15 text-danger hover:bg-danger/25"
-          title={saveError}
-        >
-          Save failed — retry
-        </button>
-      ) : dirtyCount > 0 ? (
-        <button
-          onClick={saveAll}
-          disabled={saving}
-          className="rounded-md px-2.5 py-1 text-2xs font-medium bg-accent text-white hover:brightness-110 disabled:opacity-60"
-          title="⌘S"
-        >
-          {saving ? "Saving…" : `Save ${dirtyCount} ⌘S`}
-        </button>
-      ) : lastSave ? (
-        <span
-          className="text-2xs text-ink-faint px-1.5"
-          title={`Committed on ${lastSave.branch}`}
-        >
-          Saved <span className="font-mono">{lastSave.hash}</span>
-        </span>
-      ) : null}
+      {/* Save state + staged-diff review (FR-3.7, FR-4.5) */}
+      <div className="relative flex items-center gap-1.5">
+        {saveError ? (
+          <button
+            onClick={saveAll}
+            className="rounded-md px-2.5 py-1 text-2xs bg-danger/15 text-danger hover:bg-danger/25"
+            title={saveError}
+          >
+            Save failed — retry
+          </button>
+        ) : dirtyCount > 0 ? (
+          <>
+            <button
+              onClick={() => setReviewOpen((v) => !v)}
+              className={`rounded-md px-2 py-1 text-2xs ${
+                reviewOpen
+                  ? "bg-surface-3 text-ink"
+                  : "bg-surface-2 text-ink-dim hover:text-ink"
+              }`}
+              title="Review staged changes"
+            >
+              {dirtyCount} edit{dirtyCount === 1 ? "" : "s"}
+            </button>
+            <button
+              onClick={saveAll}
+              disabled={saving}
+              className="rounded-md px-2.5 py-1 text-2xs font-medium bg-accent text-white hover:brightness-110 disabled:opacity-60"
+              title="⌘S"
+            >
+              {saving ? "Saving…" : "Save ⌘S"}
+            </button>
+          </>
+        ) : lastSave ? (
+          <span
+            className="text-2xs text-ink-faint px-1.5"
+            title={`Committed on ${lastSave.branch}`}
+          >
+            Saved <span className="font-mono">{lastSave.hash}</span>
+          </span>
+        ) : null}
+        {reviewOpen && <ReviewPanel onClose={() => setReviewOpen(false)} />}
+      </div>
 
       <button
         disabled

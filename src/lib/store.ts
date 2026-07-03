@@ -17,6 +17,14 @@ const MAX_LOG_LINES = 2000;
 
 type View = "launch" | "editor";
 
+/** One undoable step: the staged entry's state before and after (null =
+ * not staged, i.e. the element matched its source). */
+interface EditOp {
+  dedupId: string;
+  before: StagedEdit | null;
+  after: StagedEdit | null;
+}
+
 interface AppState {
   view: View;
   project: ProjectInfo | null;
@@ -43,8 +51,8 @@ interface AppState {
 
   /** Unsaved class edits keyed by dedupId (FR-3.7). */
   staged: Record<string, StagedEdit>;
-  undoStack: Array<{ dedupId: string; from: string; to: string }>;
-  redoStack: Array<{ dedupId: string; from: string; to: string }>;
+  undoStack: EditOp[];
+  redoStack: EditOp[];
   saving: boolean;
   lastSave: { branch: string; hash: string } | null;
   saveError: string | null;
@@ -74,10 +82,33 @@ interface AppState {
   effectiveClassName: () => string | null;
   /** Stage a class edit + live-patch the canvas (FR-3.7). */
   applyClassEdit: (next: string) => void;
+  /** Discard one staged edit (review panel), undoable. */
+  revertEdit: (dedupId: string) => void;
   undo: () => void;
   redo: () => void;
   /** Write staged edits to source, commit on the session branch (FR-4.x). */
   saveAll: () => Promise<void>;
+}
+
+/** Set one staged entry to a snapshot (or remove it) and sync the canvas. */
+function applyOp(
+  dedupId: string,
+  entry: StagedEdit | null,
+  set: (partial: Partial<AppState>) => void,
+  get: () => AppState,
+) {
+  const staged = { ...get().staged };
+  if (entry) {
+    staged[dedupId] = entry;
+    sendToOverlay({ type: "set-class", id: dedupId, className: entry.current });
+  } else {
+    const prev = staged[dedupId];
+    delete staged[dedupId];
+    if (prev) {
+      sendToOverlay({ type: "reset-class", id: dedupId, className: prev.original });
+    }
+  }
+  set({ staged });
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -229,12 +260,12 @@ export const useStore = create<AppState>((set, get) => ({
     const pos = parseDedupId(selected.dedupId);
     if (!pos) return;
 
-    const existing = staged[selected.dedupId];
-    const from = existing?.current ?? sourceInfo.className ?? "";
+    const before = staged[selected.dedupId] ?? null;
+    const from = before?.current ?? sourceInfo.className ?? "";
     if (next === from) return;
 
-    const entry: StagedEdit = existing
-      ? { ...existing, current: next }
+    const after: StagedEdit = before
+      ? { ...before, current: next }
       : {
           dedupId: selected.dedupId,
           file: pos.file,
@@ -247,61 +278,43 @@ export const useStore = create<AppState>((set, get) => ({
 
     sendToOverlay({ type: "set-class", id: selected.dedupId, className: next });
     set({
-      staged: { ...staged, [selected.dedupId]: entry },
-      undoStack: [...undoStack, { dedupId: selected.dedupId, from, to: next }],
+      staged: { ...staged, [selected.dedupId]: after },
+      undoStack: [...undoStack, { dedupId: selected.dedupId, before, after }],
+      redoStack: [],
+    });
+  },
+
+  revertEdit: (dedupId) => {
+    const { staged, undoStack } = get();
+    const before = staged[dedupId];
+    if (!before) return;
+    const nextStaged = { ...staged };
+    delete nextStaged[dedupId];
+    sendToOverlay({ type: "reset-class", id: dedupId, className: before.original });
+    set({
+      staged: nextStaged,
+      undoStack: [...undoStack, { dedupId, before, after: null }],
       redoStack: [],
     });
   },
 
   undo: () => {
-    const { undoStack, redoStack, staged } = get();
+    const { undoStack, redoStack } = get();
     const op = undoStack[undoStack.length - 1];
     if (!op) return;
-    const entry = staged[op.dedupId];
-    if (entry) {
-      const nextStaged = { ...staged };
-      if (op.from === entry.original) {
-        // Fully reverted — drop the staged entry and let source rule again.
-        delete nextStaged[op.dedupId];
-        sendToOverlay({
-          type: "reset-class",
-          id: op.dedupId,
-          className: entry.original,
-        });
-      } else {
-        nextStaged[op.dedupId] = { ...entry, current: op.from };
-        sendToOverlay({ type: "set-class", id: op.dedupId, className: op.from });
-      }
-      set({
-        staged: nextStaged,
-        undoStack: undoStack.slice(0, -1),
-        redoStack: [...redoStack, op],
-      });
-    } else {
-      set({ undoStack: undoStack.slice(0, -1) });
-    }
+    applyOp(op.dedupId, op.before, set, get);
+    set({
+      undoStack: undoStack.slice(0, -1),
+      redoStack: [...redoStack, op],
+    });
   },
 
   redo: () => {
-    const { undoStack, redoStack, staged, selected } = get();
+    const { undoStack, redoStack } = get();
     const op = redoStack[redoStack.length - 1];
     if (!op) return;
-    const entry = staged[op.dedupId];
-    const pos = parseDedupId(op.dedupId);
-    if (!pos) return;
-    const base: StagedEdit = entry ?? {
-      dedupId: op.dedupId,
-      file: pos.file,
-      line: pos.line,
-      col: pos.col,
-      original: op.from,
-      current: op.from,
-      component:
-        selected?.dedupId === op.dedupId ? selected.component : null,
-    };
-    sendToOverlay({ type: "set-class", id: op.dedupId, className: op.to });
+    applyOp(op.dedupId, op.after, set, get);
     set({
-      staged: { ...staged, [op.dedupId]: { ...base, current: op.to } },
       redoStack: redoStack.slice(0, -1),
       undoStack: [...undoStack, op],
     });
