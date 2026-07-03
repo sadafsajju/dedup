@@ -1,0 +1,110 @@
+import { stopDevServer } from "../lib/api";
+import { useStore } from "../lib/store";
+import { VIEWPORTS } from "../lib/types";
+import type { DevServerStatus } from "../lib/types";
+import { ChevronIcon, GitBranchIcon, DuplicatesIcon } from "./icons";
+
+const STATUS_META: Record<DevServerStatus, { label: string; dot: string }> = {
+  idle: { label: "Idle", dot: "bg-ink-faint" },
+  starting: { label: "Starting", dot: "bg-warn animate-pulse" },
+  ready: { label: "Running", dot: "bg-positive" },
+  stopping: { label: "Stopping", dot: "bg-warn" },
+  stopped: { label: "Stopped", dot: "bg-ink-faint" },
+  crashed: { label: "Crashed", dot: "bg-danger" },
+};
+
+export function TopBar() {
+  const project = useStore((s) => s.project);
+  const git = useStore((s) => s.git);
+  const devStatus = useStore((s) => s.devStatus);
+  const devPort = useStore((s) => s.devPort);
+  const viewportId = useStore((s) => s.viewportId);
+  const setViewport = useStore((s) => s.setViewport);
+  const zoom = useStore((s) => s.zoom);
+  const setZoom = useStore((s) => s.setZoom);
+  const backToLaunch = useStore((s) => s.backToLaunch);
+
+  async function goBack() {
+    await stopDevServer();
+    backToLaunch();
+  }
+
+  const status = STATUS_META[devStatus];
+
+  return (
+    <header className="h-11 shrink-0 flex items-center gap-3 px-3 border-b border-line bg-surface-1 select-none">
+      <button
+        onClick={goBack}
+        className="flex items-center gap-1 text-ink-dim hover:text-ink text-2xs px-1.5 py-1 rounded hover:bg-surface-2"
+        title="Close project"
+      >
+        <ChevronIcon size={14} className="rotate-180" />
+      </button>
+
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="text-[13px] font-medium truncate">{project?.name}</span>
+        {git?.isRepo && (
+          <span className="inline-flex items-center gap-1 text-2xs text-ink-dim bg-surface-2 rounded px-1.5 py-0.5 shrink-0">
+            <GitBranchIcon size={11} />
+            <span className="font-mono">{git.branch ?? "?"}</span>
+          </span>
+        )}
+      </div>
+
+      <div className="flex-1" />
+
+      {/* Viewport switcher (FR-1.4, FR-6.4 ⌘1/2/3) */}
+      <div className="flex items-center gap-0.5 bg-surface-2 rounded-md p-0.5">
+        {VIEWPORTS.map((v) => (
+          <button
+            key={v.id}
+            onClick={() => setViewport(v.id)}
+            className={`text-2xs px-2 py-1 rounded ${
+              viewportId === v.id
+                ? "bg-surface-3 text-ink"
+                : "text-ink-dim hover:text-ink"
+            }`}
+            title={`${v.label} · ${v.width}px`}
+          >
+            {v.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex items-center gap-1 text-2xs text-ink-dim">
+        <button
+          onClick={() => setZoom(zoom - 0.1)}
+          className="w-5 h-5 rounded hover:bg-surface-2"
+        >
+          −
+        </button>
+        <span className="w-9 text-center tabular-nums">
+          {Math.round(zoom * 100)}%
+        </span>
+        <button
+          onClick={() => setZoom(zoom + 0.1)}
+          className="w-5 h-5 rounded hover:bg-surface-2"
+        >
+          +
+        </button>
+      </div>
+
+      {/* Dev-server status */}
+      <div className="flex items-center gap-1.5 text-2xs text-ink-dim px-2">
+        <span className={`h-2 w-2 rounded-full ${status.dot}`} />
+        <span>{status.label}</span>
+        {devPort && devStatus === "ready" && (
+          <span className="font-mono text-ink-faint">:{devPort}</span>
+        )}
+      </div>
+
+      <button
+        disabled
+        className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-2xs bg-surface-2 text-ink-faint cursor-not-allowed"
+        title="Duplicate scan — Phase 3"
+      >
+        <DuplicatesIcon size={13} /> Scan
+      </button>
+    </header>
+  );
+}
