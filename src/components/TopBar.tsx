@@ -23,6 +23,14 @@ export function TopBar() {
   const zoom = useStore((s) => s.zoom);
   const setZoom = useStore((s) => s.setZoom);
   const backToLaunch = useStore((s) => s.backToLaunch);
+  const staged = useStore((s) => s.staged);
+  const saving = useStore((s) => s.saving);
+  const saveError = useStore((s) => s.saveError);
+  const lastSave = useStore((s) => s.lastSave);
+  const saveAll = useStore((s) => s.saveAll);
+  const dirtyCount = Object.values(staged).filter(
+    (e) => e.current !== e.original,
+  ).length;
 
   async function goBack() {
     await stopDevServer();
@@ -97,6 +105,33 @@ export function TopBar() {
           <span className="font-mono text-ink-faint">:{devPort}</span>
         )}
       </div>
+
+      {/* Save state (FR-3.7, FR-4.5) */}
+      {saveError ? (
+        <button
+          onClick={saveAll}
+          className="rounded-md px-2.5 py-1 text-2xs bg-danger/15 text-danger hover:bg-danger/25"
+          title={saveError}
+        >
+          Save failed — retry
+        </button>
+      ) : dirtyCount > 0 ? (
+        <button
+          onClick={saveAll}
+          disabled={saving}
+          className="rounded-md px-2.5 py-1 text-2xs font-medium bg-accent text-white hover:brightness-110 disabled:opacity-60"
+          title="⌘S"
+        >
+          {saving ? "Saving…" : `Save ${dirtyCount} ⌘S`}
+        </button>
+      ) : lastSave ? (
+        <span
+          className="text-2xs text-ink-faint px-1.5"
+          title={`Committed on ${lastSave.branch}`}
+        >
+          Saved <span className="font-mono">{lastSave.hash}</span>
+        </span>
+      ) : null}
 
       <button
         disabled

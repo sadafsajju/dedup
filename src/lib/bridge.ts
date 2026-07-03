@@ -3,7 +3,10 @@
 
 type OverlayCommand =
   | { type: "select-id"; id: string }
-  | { type: "clear" };
+  | { type: "clear" }
+  | { type: "set-class"; id: string; className: string }
+  | { type: "reset-class"; id: string; className?: string }
+  | { type: "clear-staged" };
 
 let iframe: HTMLIFrameElement | null = null;
 

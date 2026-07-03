@@ -7,6 +7,7 @@ mod instrument;
 mod project;
 mod proxy;
 mod recents;
+mod sidecar;
 
 use devserver::{DevServerState, ExecSpec};
 use project::{Framework, PackageManager, ProjectInfo};
@@ -71,6 +72,40 @@ fn dev_server_running(state: State<'_, DevServerState>) -> bool {
     devserver::is_running(&state)
 }
 
+/// Read className + editability for the element at `file:line:col` (FR-4.2).
+#[tauri::command]
+fn inspect_element(
+    root: String,
+    file: String,
+    line: u32,
+    col: u32,
+) -> Result<serde_json::Value, String> {
+    sidecar::inspect(&root, &file, line, col)
+}
+
+/// Apply staged class edits to one file via AST rewrite (FR-4.1).
+#[tauri::command]
+fn write_classes(
+    root: String,
+    file: String,
+    edits: Vec<sidecar::ClassEdit>,
+) -> Result<serde_json::Value, String> {
+    sidecar::write(&root, &file, &edits)
+}
+
+/// First-write branch guarantee + commit-per-save (FR-4.5, FR-4.6).
+/// Returns (branch, short hash).
+#[tauri::command]
+fn commit_session(
+    root: String,
+    message: String,
+    paths: Vec<String>,
+) -> Result<(String, String), String> {
+    let branch = git::ensure_session_branch(&root)?;
+    let hash = git::commit_paths(&root, &message, &paths)?;
+    Ok((branch, hash))
+}
+
 #[tauri::command]
 fn get_recent_projects(app: AppHandle) -> Vec<recents::RecentProject> {
     recents::load(&app)
@@ -98,6 +133,9 @@ pub fn run() {
             start_dev_server,
             stop_dev_server,
             dev_server_running,
+            inspect_element,
+            write_classes,
+            commit_session,
             get_recent_projects,
             add_recent_project,
             remove_recent_project,

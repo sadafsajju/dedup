@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "build:plugin": "node plugin-src/build.mjs",
     "test:plugin": "node plugin-src/smoke.mjs",
+    "test:tw": "node --experimental-strip-types plugin-src/tailwind.test.mts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

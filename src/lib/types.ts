@@ -71,6 +71,28 @@ export interface ElementRef {
   component: string | null;
   /** DOM tag name (or lowercased component tag for custom elements). */
   tag: string;
+  /** The element's current DOM class attribute (may include runtime classes). */
+  domClassName: string;
+}
+
+/** What the source says about the selected element's className (FR-4.2). */
+export interface SourceClassInfo {
+  editable: boolean;
+  /** Static class string from source; null when dynamic. */
+  className: string | null;
+  /** Why the panel is read-only, when it is. */
+  reason: string | null;
+}
+
+/** An unsaved class edit, keyed by dedupId (FR-3.7). */
+export interface StagedEdit {
+  dedupId: string;
+  file: string;
+  line: number;
+  col: number;
+  original: string;
+  current: string;
+  component: string | null;
 }
 
 export interface SelectedElement extends ElementRef {

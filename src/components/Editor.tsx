@@ -89,16 +89,25 @@ export function Editor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.root]);
 
-  // Keyboard: ⌘1/2/3 viewport presets, Esc closes console (FR-6.4).
+  // Keyboard (FR-6.4): ⌘S save, ⌘Z/⇧⌘Z undo/redo, ⌘1/2/3 viewports, Esc.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const inField =
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement;
       if (e.metaKey || e.ctrlKey) {
-        if (e.key === "1") useStore.getState().setViewport("mobile");
-        else if (e.key === "2") useStore.getState().setViewport("tablet");
-        else if (e.key === "3") useStore.getState().setViewport("desktop");
-        else return;
+        const s = useStore.getState();
+        if (e.key === "1") s.setViewport("mobile");
+        else if (e.key === "2") s.setViewport("tablet");
+        else if (e.key === "3") s.setViewport("desktop");
+        else if (e.key === "s") void s.saveAll();
+        else if (e.key === "z" && !inField) {
+          // In fields, let the browser's own text undo work.
+          if (e.shiftKey) s.redo();
+          else s.undo();
+        } else return;
         e.preventDefault();
-      } else if (e.key === "Escape") {
+      } else if (e.key === "Escape" && !inField) {
         const s = useStore.getState();
         if (s.selected) s.clearSelection();
         else s.toggleConsole(false);

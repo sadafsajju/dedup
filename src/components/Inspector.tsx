@@ -1,11 +1,17 @@
 import { useStore } from "../lib/store";
 import { parseDedupId } from "../lib/types";
-import { ChevronIcon } from "./icons";
+import { ChevronIcon, WarnIcon } from "./icons";
+import { StylePanel } from "./StylePanel";
 
 export function Inspector() {
   const project = useStore((s) => s.project);
   const selected = useStore((s) => s.selected);
   const selectById = useStore((s) => s.selectById);
+  const sourceInfo = useStore((s) => s.sourceInfo);
+  const staged = useStore((s) => s.staged);
+  const effective = selected
+    ? (staged[selected.dedupId]?.current ?? sourceInfo?.className ?? null)
+    : null;
 
   // Ancestry arrives innermost-first; breadcrumb reads root-first (FR-2.4).
   const crumbs = selected ? [...selected.ancestry].reverse() : [];
@@ -83,10 +89,30 @@ export function Inspector() {
             </div>
           </div>
 
-          <div className="px-3 py-3 text-2xs text-ink-faint leading-relaxed">
-            Style controls (layout, size, typography, fill) land in Phase 2 —
-            the Tailwind class editor writes back to source from here.
-          </div>
+          {sourceInfo === null ? (
+            <div className="px-3 py-3 text-2xs text-ink-faint">
+              Reading source…
+            </div>
+          ) : sourceInfo.editable && effective !== null ? (
+            <StylePanel className={effective} />
+          ) : (
+            <div className="px-3 py-3 border-b border-line">
+              <div className="flex gap-2 items-start">
+                <WarnIcon size={13} className="text-warn shrink-0 mt-px" />
+                <div className="text-2xs text-ink-dim leading-relaxed">
+                  <span className="text-ink">Read-only:</span> this element's
+                  classes are {sourceInfo.reason ?? "not statically editable"}.
+                  Edit it in your editor — dedup only rewrites what it can
+                  rewrite safely.
+                </div>
+              </div>
+              {selected.domClassName && (
+                <div className="mt-2 text-2xs font-mono text-ink-faint break-words select-text">
+                  {selected.domClassName}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       ) : (
         <div className="flex-1 flex flex-col items-center justify-center px-6 text-center gap-2">

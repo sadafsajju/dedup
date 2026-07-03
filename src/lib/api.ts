@@ -41,6 +41,40 @@ export const stopDevServer = () => invoke<void>("stop_dev_server");
 export const devServerRunning = () =>
   invoke<boolean>("dev_server_running");
 
+// --- Write-back (FR-4.x) ---------------------------------------------------
+
+export interface InspectResult {
+  ok: boolean;
+  error?: string;
+  editable?: boolean;
+  className?: string | null;
+  reason?: string | null;
+}
+
+export const inspectElement = (
+  root: string,
+  file: string,
+  line: number,
+  col: number,
+) => invoke<InspectResult>("inspect_element", { root, file, line, col });
+
+export interface ClassEdit {
+  line: number;
+  col: number;
+  className: string;
+}
+
+export const writeClasses = (root: string, file: string, edits: ClassEdit[]) =>
+  invoke<{ ok: boolean; error?: string }>("write_classes", {
+    root,
+    file,
+    edits,
+  });
+
+/** Returns [branch, shortHash]. */
+export const commitSession = (root: string, message: string, paths: string[]) =>
+  invoke<[string, string]>("commit_session", { root, message, paths });
+
 export const getRecentProjects = () =>
   invoke<RecentProject[]>("get_recent_projects");
 

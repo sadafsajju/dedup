@@ -11,6 +11,9 @@
 
   let hoverEl = null;
   let selectedEl = null;
+  // Staged (unsaved) class patches by dedupId — reapplied after HMR swaps
+  // the DOM out from under us, so live edits survive until save/discard.
+  const stagedClasses = new Map();
 
   // --- chrome -------------------------------------------------------------
 
@@ -80,7 +83,19 @@
       dedupId: el.getAttribute("data-dedup-id"),
       component: el.getAttribute("data-dedup-component") || null,
       tag: el.tagName.toLowerCase(),
+      domClassName: el.getAttribute("class") || "",
     };
+  }
+
+  function applyStaged() {
+    for (const [id, cls] of stagedClasses) {
+      const els = document.querySelectorAll(
+        `[data-dedup-id="${CSS.escape(id)}"]`,
+      );
+      for (const el of els) {
+        if (el.getAttribute("class") !== cls) el.setAttribute("class", cls);
+      }
+    }
   }
 
   function payload(el) {
@@ -153,6 +168,24 @@
       selectedEl = null;
       hoverEl = null;
       repaint();
+    } else if (m.type === "set-class") {
+      // Live patch (FR-3.7): apply to every instance of the source element.
+      stagedClasses.set(m.id, m.className);
+      applyStaged();
+      repaint();
+    } else if (m.type === "reset-class") {
+      stagedClasses.delete(m.id);
+      if (typeof m.className === "string") {
+        for (const el of document.querySelectorAll(
+          `[data-dedup-id="${CSS.escape(m.id)}"]`,
+        )) {
+          el.setAttribute("class", m.className);
+        }
+      }
+      repaint();
+    } else if (m.type === "clear-staged") {
+      // After save the source equals the staged state; HMR owns it again.
+      stagedClasses.clear();
     }
   });
 
@@ -200,8 +233,12 @@
 
   window.addEventListener("scroll", repaint, true);
   window.addEventListener("resize", repaint, true);
-  // HMR swaps DOM nodes under us; cheap periodic sync keeps boxes honest.
-  setInterval(repaint, 500);
+  // HMR swaps DOM nodes under us; cheap periodic sync keeps boxes honest and
+  // re-applies staged class patches to freshly rendered elements.
+  setInterval(() => {
+    applyStaged();
+    repaint();
+  }, 500);
 
   post("overlay-ready", {});
 })();
