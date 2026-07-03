@@ -70,10 +70,14 @@ export function LaunchScreen() {
     if (path) inspect(path);
   }
 
-  async function confirmOpen(info: ProjectInfo, git: GitStatus) {
+  async function confirmOpen(
+    info: ProjectInfo,
+    git: GitStatus,
+    customCommand: string | null,
+  ) {
     const updated = await addRecentProject(info.root, info.name);
     setRecents(updated);
-    enterEditor(info, git);
+    enterEditor(info, git, customCommand);
   }
 
   async function dropRecent(path: string, e: React.MouseEvent) {
@@ -158,7 +162,7 @@ export function LaunchScreen() {
           info={candidate.info}
           git={candidate.git}
           onCancel={() => setCandidate(null)}
-          onConfirm={() => confirmOpen(candidate.info, candidate.git)}
+          onConfirm={(cmd) => confirmOpen(candidate.info, candidate.git, cmd)}
         />
       )}
     </div>

@@ -15,6 +15,8 @@ interface AppState {
   view: View;
   project: ProjectInfo | null;
   git: GitStatus | null;
+  /** Custom dev command override (FR-1.3); null = `<pm> run dev`. */
+  customCommand: string | null;
 
   devStatus: DevServerStatus;
   devUrl: string | null;
@@ -29,7 +31,11 @@ interface AppState {
   zoom: number;
 
   // actions
-  enterEditor: (project: ProjectInfo, git: GitStatus | null) => void;
+  enterEditor: (
+    project: ProjectInfo,
+    git: GitStatus | null,
+    customCommand?: string | null,
+  ) => void;
   backToLaunch: () => void;
   setDevStatus: (status: DevServerStatus) => void;
   setDevReady: (url: string, port: number) => void;
@@ -45,6 +51,7 @@ export const useStore = create<AppState>((set) => ({
   view: "launch",
   project: null,
   git: null,
+  customCommand: null,
 
   devStatus: "idle",
   devUrl: null,
@@ -58,11 +65,12 @@ export const useStore = create<AppState>((set) => ({
   viewportId: "desktop",
   zoom: 1,
 
-  enterEditor: (project, git) =>
+  enterEditor: (project, git, customCommand = null) =>
     set({
       view: "editor",
       project,
       git,
+      customCommand,
       devStatus: "idle",
       devUrl: null,
       devPort: null,
@@ -76,6 +84,7 @@ export const useStore = create<AppState>((set) => ({
       view: "launch",
       project: null,
       git: null,
+      customCommand: null,
       devStatus: "idle",
       devUrl: null,
       devPort: null,

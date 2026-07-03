@@ -68,7 +68,11 @@ export function Editor() {
         startedRef.current = true;
         setDevStatus("starting");
         try {
-          await startDevServer(project.root, project.packageManager);
+          await startDevServer(
+            project.root,
+            project.packageManager,
+            useStore.getState().customCommand ?? undefined,
+          );
         } catch (e) {
           appendLog({ stream: "stderr", line: `dedup: ${String(e)}` });
           setCrashed(null);

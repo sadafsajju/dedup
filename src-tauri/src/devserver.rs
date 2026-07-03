@@ -153,19 +153,34 @@ pub fn stop(app: &AppHandle, state: &DevServerState) -> Result<(), String> {
         }
     };
     let _ = app.emit(EVT_STATUS, StatusEvent { status: "stopping" });
+    kill_group(pgid, 1500);
+    Ok(())
+}
 
+/// Last-resort teardown for app exit (⌘Q etc.), where no events are needed
+/// and no window remains. Never leaves the user's dev server orphaned.
+pub fn shutdown(state: &DevServerState) {
+    let pgid = match state.0.lock() {
+        Ok(mut guard) => match guard.take() {
+            Some(s) => s.pgid,
+            None => return,
+        },
+        Err(_) => return,
+    };
+    kill_group(pgid, 500);
+}
+
+fn kill_group(pgid: i32, grace_ms: u64) {
     #[cfg(unix)]
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
-        // Give it a moment, then make sure it's gone.
-        thread::sleep(std::time::Duration::from_millis(1500));
+        thread::sleep(std::time::Duration::from_millis(grace_ms));
         libc::killpg(pgid, libc::SIGKILL);
     }
     #[cfg(not(unix))]
     {
-        let _ = pgid;
+        let _ = (pgid, grace_ms);
     }
-    Ok(())
 }
 
 pub fn is_running(state: &DevServerState) -> bool {
@@ -241,32 +256,44 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     });
 }
 
-/// Remove ANSI CSI escape sequences so logs and URL parsing see plain text.
+/// Remove ANSI escape sequences (CSI and OSC) so logs and URL parsing see
+/// plain text. Operates on chars so multi-byte UTF-8 (Vite's `➜` arrows)
+/// survives intact.
 fn strip_ansi(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            // ESC — skip until the sequence terminator.
-            i += 1;
-            if i < bytes.len() && bytes[i] == b'[' {
-                i += 1;
-                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    i += 1; // consume the final byte
-                }
-            } else {
-                // Non-CSI escape (e.g. ESC ] ...); skip the next byte.
-                if i < bytes.len() {
-                    i += 1;
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: ESC [ ... final byte in @..~
+            Some('[') => {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c2) {
+                        break;
+                    }
                 }
             }
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            // OSC: ESC ] ... terminated by BEL or ST (ESC \)
+            Some(']') => {
+                chars.next();
+                while let Some(c2) = chars.next() {
+                    if c2 == '\u{07}' {
+                        break;
+                    }
+                    if c2 == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Two-char escape (ESC X): drop the next char.
+            _ => {
+                chars.next();
+            }
         }
     }
     out
@@ -294,6 +321,20 @@ mod tests {
     }
 
     #[test]
+    fn strip_ansi_preserves_utf8() {
+        assert_eq!(strip_ansi("  ➜  Local:"), "  ➜  Local:");
+    }
+
+    #[test]
+    fn extracts_https_url_from_basic_ssl_vite() {
+        // Vite + @vitejs/plugin-basic-ssl serves over https (mintWash setup).
+        assert_eq!(
+            extract_local_url("  ➜  Local:   https://localhost:5174/"),
+            Some(("https://localhost:5174".to_string(), 5174))
+        );
+    }
+
+    #[test]
     fn extracts_next_url_and_normalizes_host() {
         assert_eq!(
             extract_local_url("   - Local:        http://127.0.0.1:3000"),
@@ -316,22 +357,26 @@ mod tests {
     }
 }
 
-/// Pull the first `http://<localhost|127.0.0.1|0.0.0.0>:PORT` out of a log line.
-/// Returns a normalized (localhost) URL plus the port.
+/// Pull the first `http(s)://<local host>:PORT` out of a log line — plain HTTP
+/// and HTTPS (e.g. Vite with @vitejs/plugin-basic-ssl serves `https://`).
+/// Returns a normalized (localhost, scheme-preserving) URL plus the port.
 fn extract_local_url(line: &str) -> Option<(String, u16)> {
-    const HOSTS: [&str; 3] = [
-        "http://localhost:",
-        "http://127.0.0.1:",
-        "http://0.0.0.0:",
-    ];
-    for host in HOSTS {
-        if let Some(idx) = line.find(host) {
-            let rest = &line[idx + host.len()..];
+    const SCHEMES: [&str; 2] = ["http", "https"];
+    const HOSTS: [&str; 4] = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"];
+    for scheme in SCHEMES {
+        for host in HOSTS {
+            let prefix = format!("{scheme}://{host}:");
+            let Some(idx) = line.find(&prefix) else {
+                continue;
+            };
+            let rest = &line[idx + prefix.len()..];
             let port_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if port_str.is_empty() {
                 continue;
             }
-            let port: u16 = port_str.parse().ok()?;
+            let Ok(port) = port_str.parse::<u16>() else {
+                continue;
+            };
             // Grab any trailing path up to whitespace, normalize host to localhost.
             let after_port = &rest[port_str.len()..];
             let path: String = after_port
@@ -339,7 +384,7 @@ fn extract_local_url(line: &str) -> Option<(String, u16)> {
                 .take_while(|c| !c.is_whitespace())
                 .collect();
             let path = path.trim_end_matches('/');
-            let url = format!("http://localhost:{port}{path}");
+            let url = format!("{scheme}://localhost:{port}{path}");
             return Some((url, port));
         }
     }

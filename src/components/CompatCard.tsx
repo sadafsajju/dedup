@@ -6,7 +6,7 @@ interface Props {
   info: ProjectInfo;
   git: GitStatus;
   onCancel: () => void;
-  onConfirm: () => void;
+  onConfirm: (customCommand: string | null) => void;
 }
 
 const SUPPORT_STYLE: Record<
@@ -32,9 +32,13 @@ function Badge({ ok, label }: { ok: boolean; label: string }) {
 
 export function CompatCard({ info, git, onCancel, onConfirm }: Props) {
   const support = SUPPORT_STYLE[info.support];
-  const canOpen = info.support !== "unsupported";
   const [ackDirty, setAckDirty] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [customCommand, setCustomCommand] = useState("");
   const needsAck = git.isRepo && git.isDirty;
+  // A custom command makes an "unsupported: no dev script" project drivable.
+  const canOpen =
+    info.support !== "unsupported" || customCommand.trim().length > 0;
   const blocked = !canOpen || (needsAck && !ackDirty);
 
   const fwLabel =
@@ -86,6 +90,31 @@ export function CompatCard({ info, git, onCancel, onConfirm }: Props) {
           </ul>
         )}
 
+        <div className="px-5 py-3 border-t border-line">
+          <button
+            onClick={() => setShowAdvanced((v) => !v)}
+            className="text-2xs text-ink-dim hover:text-ink"
+          >
+            {showAdvanced ? "▾" : "▸"} Advanced — custom dev command
+          </button>
+          {showAdvanced && (
+            <div className="mt-2">
+              <input
+                value={customCommand}
+                onChange={(e) => setCustomCommand(e.currentTarget.value)}
+                placeholder={`default: ${info.packageManager} run dev`}
+                spellCheck={false}
+                className="w-full rounded-md bg-surface-2 border border-line px-2.5 py-1.5 text-2xs font-mono text-ink placeholder:text-ink-faint focus:outline-none focus:border-accent"
+              />
+              <p className="text-2xs text-ink-faint mt-1.5 leading-snug">
+                Runs via <span className="font-mono">sh -c</span> in the project
+                root. Use this if your dev script needs env flags — e.g. the
+                canvas can't load self-signed HTTPS, so serve plain HTTP here.
+              </p>
+            </div>
+          )}
+        </div>
+
         {needsAck && (
           <div className="px-5 py-3 border-t border-line">
             <label className="flex items-start gap-2 cursor-pointer">
@@ -118,7 +147,7 @@ export function CompatCard({ info, git, onCancel, onConfirm }: Props) {
             Cancel
           </button>
           <button
-            onClick={onConfirm}
+            onClick={() => onConfirm(customCommand.trim() || null)}
             disabled={blocked}
             className="rounded-md px-3.5 py-1.5 text-[13px] font-medium bg-accent text-white hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed"
           >

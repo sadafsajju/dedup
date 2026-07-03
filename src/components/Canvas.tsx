@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { startDevServer, stopDevServer } from "../lib/api";
 import { useStore } from "../lib/store";
 import { VIEWPORTS } from "../lib/types";
@@ -37,9 +37,12 @@ export function Canvas() {
     if (!project) return;
     await stopDevServer();
     setDevStatus("starting");
-    // Remount the iframe on next ready by clearing url handled via store elsewhere.
     try {
-      await startDevServer(project.root, project.packageManager);
+      await startDevServer(
+        project.root,
+        project.packageManager,
+        useStore.getState().customCommand ?? undefined,
+      );
     } catch {
       setDevStatus("crashed");
     }
@@ -48,6 +51,21 @@ export function Canvas() {
   const booting =
     devStatus === "starting" || (devStatus === "idle" && !devUrl);
   const crashed = devStatus === "crashed";
+
+  // Surface a hint if the server runs but we never spot a ready URL (FR-1.6).
+  const [slowStart, setSlowStart] = useState(false);
+  useEffect(() => {
+    if (!booting) {
+      setSlowStart(false);
+      return;
+    }
+    const t = setTimeout(() => setSlowStart(true), 20_000);
+    return () => clearTimeout(t);
+  }, [booting]);
+
+  // Self-signed HTTPS can't be trusted inside the embedded webview — warn
+  // instead of leaving the user with a silently blank canvas.
+  const httpsWarning = devUrl?.startsWith("https://") ?? false;
 
   return (
     <div
@@ -89,11 +107,33 @@ export function Canvas() {
             Starting dev server…
           </div>
           <div className="text-2xs text-ink-faint mt-1 font-mono">
-            {project?.packageManager} run dev
+            {useStore.getState().customCommand ??
+              `${project?.packageManager} run dev`}
           </div>
+          {slowStart && (
+            <div className="mt-5 max-w-xs text-center">
+              <p className="text-2xs text-warn">
+                Still waiting for a ready URL. The server may be running but
+                printing an address dedup doesn't recognize.
+              </p>
+              <button
+                onClick={() => toggleConsole(true)}
+                className="mt-2 rounded-md px-3 py-1.5 text-2xs bg-surface-2 hover:bg-surface-3 text-ink"
+              >
+                Open console
+              </button>
+            </div>
+          )}
         </CenteredPanel>
       ) : (
-        <div className="min-h-full flex items-start justify-center p-10">
+        <div className="min-h-full flex items-start justify-center p-10 relative">
+          {httpsWarning && (
+            <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 max-w-md rounded-md border border-warn/40 bg-surface-1 px-3 py-2 text-2xs text-warn shadow-lg">
+              This dev server uses HTTPS with a self-signed certificate, which
+              the embedded canvas can't trust — it may stay blank. Re-open the
+              project with a custom dev command that serves plain HTTP.
+            </div>
+          )}
           <div
             className="shadow-2xl bg-white rounded-md overflow-hidden shrink-0"
             style={{

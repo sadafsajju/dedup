@@ -8,7 +8,7 @@ mod recents;
 
 use devserver::DevServerState;
 use project::{PackageManager, ProjectInfo};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
 fn detect_project(root: String) -> ProjectInfo {
@@ -72,6 +72,15 @@ pub fn run() {
             add_recent_project,
             remove_recent_project,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // ⌘Q and other app-level exits bypass the window close handler —
+            // make sure the user's dev server never outlives us (FR-1.3).
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<DevServerState>() {
+                    devserver::shutdown(&state);
+                }
+            }
+        });
 }
