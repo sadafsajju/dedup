@@ -431,6 +431,40 @@
     true,
   );
 
+  // --- full-page height reporting -------------------------------------------
+  // The editor sizes the canvas frame to the page's natural height. Reports
+  // are mutation-driven (not resize-driven) so vh-based layouts can't enter a
+  // grow → re-measure → grow feedback loop: resizing the frame mutates
+  // nothing, so no re-report happens.
+  let lastReportedHeight = 0;
+  let heightTimer = null;
+  function reportHeight() {
+    if (heightTimer) return;
+    heightTimer = setTimeout(() => {
+      heightTimer = null;
+      const h = Math.ceil(document.documentElement.scrollHeight);
+      if (Math.abs(h - lastReportedHeight) > 8) {
+        lastReportedHeight = h;
+        post("page-size", { height: h });
+      }
+    }, 200);
+  }
+  const mo = new MutationObserver(reportHeight);
+  function observeBody() {
+    if (document.body) {
+      mo.observe(document.body, { childList: true, subtree: true });
+      reportHeight();
+    }
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", observeBody);
+  } else {
+    observeBody();
+  }
+  window.addEventListener("load", reportHeight);
+  // Images/fonts finishing change height without DOM mutations.
+  document.addEventListener("load", reportHeight, true);
+
   window.addEventListener("scroll", repaint, true);
   window.addEventListener("resize", repaint, true);
   // HMR swaps DOM nodes under us; cheap periodic sync keeps boxes honest and

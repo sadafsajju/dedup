@@ -43,6 +43,8 @@ interface AppState {
 
   viewportId: Viewport["id"];
   zoom: number;
+  /** Natural page height reported by the overlay; frame grows to fit. */
+  contentHeight: number | null;
 
   /** Element currently selected on the canvas (FR-2.2). */
   selected: SelectedElement | null;
@@ -72,6 +74,7 @@ interface AppState {
   toggleConsole: (open?: boolean) => void;
   setViewport: (id: Viewport["id"]) => void;
   setZoom: (zoom: number) => void;
+  setContentHeight: (h: number | null) => void;
   setSelected: (sel: SelectedElement | null) => void;
   /** Clear selection here and in the overlay. */
   clearSelection: () => void;
@@ -128,6 +131,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   viewportId: "desktop",
   zoom: 1,
+  contentHeight: null,
   selected: null,
   sourceInfo: null,
 
@@ -182,7 +186,13 @@ export const useStore = create<AppState>((set, get) => ({
   setDevStatus: (devStatus) => set({ devStatus }),
 
   setDevReady: (url, port) =>
-    set({ devStatus: "ready", devUrl: url, devPort: port, crashed: false }),
+    set({
+      devStatus: "ready",
+      devUrl: url,
+      devPort: port,
+      crashed: false,
+      contentHeight: null,
+    }),
 
   setCrashed: (code) =>
     set({ devStatus: "crashed", crashed: true, exitCode: code }),
@@ -202,6 +212,8 @@ export const useStore = create<AppState>((set, get) => ({
   setViewport: (viewportId) => set({ viewportId }),
 
   setZoom: (zoom) => set({ zoom: Math.min(2, Math.max(0.25, zoom)) }),
+
+  setContentHeight: (contentHeight) => set({ contentHeight }),
 
   setSelected: (selected) => {
     set({ selected, sourceInfo: null });

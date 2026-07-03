@@ -19,6 +19,12 @@ export function Canvas() {
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const viewport = VIEWPORTS.find((v) => v.id === viewportId)!;
+  const contentHeight = useStore((s) => s.contentHeight);
+
+  // Frame shows the full page (Figma-style): at least the device height,
+  // grown to the page's natural height, sanity-capped for runaway layouts.
+  const minHeight = viewport.height ?? 800;
+  const frameHeight = Math.min(Math.max(minHeight, contentHeight ?? 0), 12000);
 
   // Overlay → editor messages (FR-2.2): element selections from the iframe.
   useEffect(() => {
@@ -27,6 +33,8 @@ export function Canvas() {
       if (!m || m.__dedup !== true) return;
       if (m.type === "selected") {
         useStore.getState().setSelected(m.payload as SelectedElement);
+      } else if (m.type === "page-size") {
+        useStore.getState().setContentHeight(m.height as number);
       }
     };
     window.addEventListener("message", onMessage);
@@ -152,24 +160,34 @@ export function Canvas() {
               a custom dev command that serves plain HTTP.
             </div>
           )}
+          {/* Wrapper reserves the *scaled* size so canvas scrolling stays
+              correct at any zoom with tall full-page frames. */}
           <div
-            className="shadow-2xl bg-white rounded-md overflow-hidden shrink-0"
+            className="shrink-0"
             style={{
-              width: viewport.width,
-              height: viewport.height ?? "calc(100vh - 200px)",
-              transform: `scale(${zoom})`,
-              transformOrigin: "top center",
+              width: viewport.width * zoom,
+              height: frameHeight * zoom,
             }}
           >
-            <iframe
-              ref={(el) => {
-                iframeRef.current = el;
-                registerCanvasIframe(el);
+            <div
+              className="shadow-2xl bg-white rounded-md overflow-hidden"
+              style={{
+                width: viewport.width,
+                height: frameHeight,
+                transform: `scale(${zoom})`,
+                transformOrigin: "top left",
               }}
-              src={devUrl}
-              title="app-canvas"
-              className="w-full h-full border-0 bg-white"
-            />
+            >
+              <iframe
+                ref={(el) => {
+                  iframeRef.current = el;
+                  registerCanvasIframe(el);
+                }}
+                src={devUrl}
+                title="app-canvas"
+                className="w-full h-full border-0 bg-white"
+              />
+            </div>
           </div>
         </div>
       )}
