@@ -4,6 +4,7 @@
 mod devserver;
 mod git;
 mod project;
+mod proxy;
 mod recents;
 
 use devserver::DevServerState;

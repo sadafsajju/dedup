@@ -30,6 +30,9 @@ pub struct RunningServer {
     pgid: i32,
     /// Set once we've parsed the ready URL, so we only emit `ready` once.
     url: Option<String>,
+    /// HTTP→HTTPS canvas tunnel, kept alive for self-signed https servers.
+    /// Dropped (and thereby shut down) together with the server slot.
+    tunnel: Option<crate::proxy::Tunnel>,
 }
 
 #[derive(Clone, Serialize)]
@@ -42,8 +45,14 @@ struct LogEvent {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadyEvent {
+    /// What the canvas should load (the tunnel URL when proxied).
     url: String,
+    /// The dev server's own port.
     port: u16,
+    /// True when `url` is a local tunnel in front of a self-signed https server.
+    proxied: bool,
+    /// The dev server's original URL when proxied.
+    upstream_url: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -103,6 +112,7 @@ pub fn start(
         *guard = Some(RunningServer {
             pgid: pid,
             url: None,
+            tunnel: None,
         });
     }
     let _ = app.emit(EVT_STATUS, StatusEvent { status: "starting" });
@@ -238,7 +248,59 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
                         if let Some(server) = guard.as_mut() {
                             if server.url.is_none() {
                                 server.url = Some(url.clone());
-                                let _ = app.emit(EVT_READY, ReadyEvent { url, port });
+
+                                // Self-signed https can't render in the embedded
+                                // canvas — front it with a plain-HTTP tunnel.
+                                let mut canvas_url = url.clone();
+                                let mut proxied = false;
+                                let mut upstream_url = None;
+                                if url.starts_with("https://") {
+                                    match crate::proxy::start(port) {
+                                        Ok(tunnel) => {
+                                            let path = url
+                                                .split_once(&format!("localhost:{port}"))
+                                                .map(|(_, p)| p)
+                                                .unwrap_or("");
+                                            canvas_url = format!(
+                                                "http://localhost:{}{}",
+                                                tunnel.port, path
+                                            );
+                                            upstream_url = Some(url.clone());
+                                            proxied = true;
+                                            let _ = app.emit(
+                                                EVT_LOG,
+                                                LogEvent {
+                                                    stream: "stdout",
+                                                    line: format!(
+                                                        "dedup: canvas tunnel {canvas_url} → {url} (self-signed https)"
+                                                    ),
+                                                },
+                                            );
+                                            server.tunnel = Some(tunnel);
+                                        }
+                                        Err(e) => {
+                                            let _ = app.emit(
+                                                EVT_LOG,
+                                                LogEvent {
+                                                    stream: "stderr",
+                                                    line: format!(
+                                                        "dedup: https tunnel failed ({e}) — canvas may not load"
+                                                    ),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let _ = app.emit(
+                                    EVT_READY,
+                                    ReadyEvent {
+                                        url: canvas_url,
+                                        port,
+                                        proxied,
+                                        upstream_url,
+                                    },
+                                );
                             }
                         }
                     }

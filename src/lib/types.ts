@@ -36,8 +36,14 @@ export interface LogEvent {
   line: string;
 }
 export interface ReadyEvent {
+  /** URL the canvas should load (a local plain-HTTP tunnel when proxied). */
   url: string;
+  /** The dev server's own port. */
   port: number;
+  /** True when url is a tunnel in front of a self-signed https server. */
+  proxied: boolean;
+  /** The dev server's original URL when proxied. */
+  upstreamUrl: string | null;
 }
 export interface ExitEvent {
   code: number | null;

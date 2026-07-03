@@ -63,8 +63,9 @@ export function Canvas() {
     return () => clearTimeout(t);
   }, [booting]);
 
-  // Self-signed HTTPS can't be trusted inside the embedded webview — warn
-  // instead of leaving the user with a silently blank canvas.
+  // Self-signed https is normally fronted by dedup's plain-HTTP tunnel, so a
+  // still-https URL here means the tunnel failed — warn instead of leaving the
+  // user with a silently blank canvas.
   const httpsWarning = devUrl?.startsWith("https://") ?? false;
 
   return (
@@ -129,9 +130,9 @@ export function Canvas() {
         <div className="min-h-full flex items-start justify-center p-10 relative">
           {httpsWarning && (
             <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 max-w-md rounded-md border border-warn/40 bg-surface-1 px-3 py-2 text-2xs text-warn shadow-lg">
-              This dev server uses HTTPS with a self-signed certificate, which
-              the embedded canvas can't trust — it may stay blank. Re-open the
-              project with a custom dev command that serves plain HTTP.
+              dedup couldn't tunnel this self-signed HTTPS dev server (see
+              console), so the canvas may stay blank. Re-open the project with
+              a custom dev command that serves plain HTTP.
             </div>
           )}
           <div
