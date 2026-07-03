@@ -79,10 +79,19 @@ async fn pipe(
         .danger_accept_invalid_hostnames(true)
         .build()?;
     let connector = tokio_native_tls::TlsConnector::from(connector);
-    let tcp = TcpStream::connect(("127.0.0.1", upstream_port)).await?;
+    let tcp = connect_loopback(upstream_port).await?;
     let mut upstream = connector.connect("localhost", tcp).await?;
     let _ = copy_bidirectional(&mut client, &mut upstream).await;
     Ok(())
+}
+
+/// Dev servers on macOS often bind `::1` only (Vite) while others bind
+/// `127.0.0.1` — try both loopbacks instead of trusting a resolver.
+async fn connect_loopback(port: u16) -> std::io::Result<TcpStream> {
+    match TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).await {
+        Ok(t) => Ok(t),
+        Err(_) => TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await,
+    }
 }
 
 #[cfg(test)]
@@ -104,7 +113,9 @@ mod tests {
             .with_single_cert(vec![cert.cert.der().clone()], key)
             .unwrap();
         let config = std::sync::Arc::new(config);
-        let server = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // Bind IPv6-only, like Vite on macOS ([::1]:5173) — the tunnel must
+        // reach it even though its own listener is IPv4.
+        let server = std::net::TcpListener::bind(("::1", 0)).unwrap();
         let upstream_port = server.local_addr().unwrap().port();
 
         std::thread::spawn(move || {
