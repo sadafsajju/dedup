@@ -87,15 +87,207 @@
     };
   }
 
+  // Inline-style props we set per element, so we can cleanly undo them.
+  const touchedProps = new WeakMap();
+
   function applyStaged() {
     for (const [id, cls] of stagedClasses) {
       const els = document.querySelectorAll(
         `[data-dedup-id="${CSS.escape(id)}"]`,
       );
       for (const el of els) {
-        if (el.getAttribute("class") !== cls) el.setAttribute("class", cls);
+        const fresh = !touchedProps.has(el);
+        if (el.getAttribute("class") === cls && !fresh) continue;
+        el.setAttribute("class", cls);
+        previewStyles(el, cls);
       }
     }
+  }
+
+  /** Tailwind JIT only generates CSS for classes present in source — a
+   * class staged live may have no rule yet. Mirror the classes we can
+   * interpret as inline styles so the preview is visible before save;
+   * theme values resolve through Tailwind v4's CSS variables. */
+  function previewStyles(el, cls) {
+    const prev = touchedProps.get(el);
+    if (prev) for (const p of prev) el.style.removeProperty(p);
+    const props = [];
+    for (const token of cls.split(/\s+/)) {
+      if (!token || token.includes(":")) continue; // base classes only
+      const decls = styleFor(token);
+      if (!decls) continue;
+      for (const [prop, value] of decls) {
+        el.style.setProperty(prop, value);
+        props.push(prop);
+      }
+    }
+    touchedProps.set(el, props);
+  }
+
+  function clearPreview(el) {
+    const prev = touchedProps.get(el);
+    if (prev) {
+      for (const p of prev) el.style.removeProperty(p);
+      touchedProps.delete(el);
+    }
+  }
+
+  // --- tiny Tailwind interpreter (preview only; fidelity via theme vars) ----
+
+  const SPACE = (n) => `calc(var(--spacing, 0.25rem) * ${n})`;
+
+  function sizeValue(v, axis) {
+    if (v === "auto") return "auto";
+    if (v === "full") return "100%";
+    if (v === "screen") return axis === "x" ? "100vw" : "100vh";
+    if (v === "min") return "min-content";
+    if (v === "max") return "max-content";
+    if (v === "fit") return "fit-content";
+    if (v === "px") return "1px";
+    if (/^\[.+\]$/.test(v)) return v.slice(1, -1);
+    if (/^\d+\/\d+$/.test(v)) {
+      const [a, b] = v.split("/").map(Number);
+      return `${((a / b) * 100).toFixed(4)}%`;
+    }
+    if (/^\d+(\.\d+)?$/.test(v)) return SPACE(v);
+    return null;
+  }
+
+  function spacingDecl(props, raw) {
+    const neg = raw.startsWith("-");
+    const v = sizeValue(neg ? raw.slice(1) : raw, "x");
+    if (v === null) return null;
+    const value = neg ? `calc(-1 * ${v})` : v;
+    return props.map((p) => [p, value]);
+  }
+
+  function colorValue(v) {
+    if (v === "white") return "#fff";
+    if (v === "black") return "#000";
+    if (v === "transparent") return "transparent";
+    if (v === "current") return "currentColor";
+    if (v === "inherit") return "inherit";
+    if (/^\[.+\]$/.test(v)) return v.slice(1, -1);
+    if (/^[a-z]+-(?:50|[1-9]50|[1-9]00)$/.test(v)) return `var(--color-${v})`;
+    return null;
+  }
+
+  const STATIC = {
+    block: [["display", "block"]],
+    "inline-block": [["display", "inline-block"]],
+    inline: [["display", "inline"]],
+    flex: [["display", "flex"]],
+    "inline-flex": [["display", "inline-flex"]],
+    grid: [["display", "grid"]],
+    "inline-grid": [["display", "inline-grid"]],
+    hidden: [["display", "none"]],
+    "flex-row": [["flex-direction", "row"]],
+    "flex-row-reverse": [["flex-direction", "row-reverse"]],
+    "flex-col": [["flex-direction", "column"]],
+    "flex-col-reverse": [["flex-direction", "column-reverse"]],
+    border: [["border-width", "1px"]],
+    rounded: [["border-radius", "var(--radius, 0.25rem)"]],
+    shadow: [["box-shadow", "var(--shadow, 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1))"]],
+    "shadow-none": [["box-shadow", "none"]],
+    "rounded-none": [["border-radius", "0"]],
+    "rounded-full": [["border-radius", "9999px"]],
+  };
+
+  const JUSTIFY = { start: "flex-start", end: "flex-end", center: "center", between: "space-between", around: "space-around", evenly: "space-evenly", stretch: "stretch" };
+  const ITEMS = { start: "flex-start", end: "flex-end", center: "center", baseline: "baseline", stretch: "stretch" };
+  const WEIGHTS = { thin: "100", extralight: "200", light: "300", normal: "400", medium: "500", semibold: "600", bold: "700", extrabold: "800", black: "900" };
+  const FONT_SIZES = { xs: ".75rem", sm: ".875rem", base: "1rem", lg: "1.125rem", xl: "1.25rem", "2xl": "1.5rem", "3xl": "1.875rem", "4xl": "2.25rem", "5xl": "3rem", "6xl": "3.75rem", "7xl": "4.5rem", "8xl": "6rem", "9xl": "8rem" };
+  const LINE_HEIGHTS = { xs: "1rem", sm: "1.25rem", base: "1.5rem", lg: "1.75rem", xl: "1.75rem", "2xl": "2rem", "3xl": "2.25rem", "4xl": "2.5rem" };
+  const RADII = { xs: ".125rem", sm: ".25rem", md: ".375rem", lg: ".5rem", xl: ".75rem", "2xl": "1rem", "3xl": "1.5rem", "4xl": "2rem" };
+  const SHADOWS = {
+    "2xs": "0 1px rgb(0 0 0 / 0.05)",
+    xs: "0 1px 2px 0 rgb(0 0 0 / 0.05)",
+    sm: "0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)",
+    md: "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)",
+    lg: "0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)",
+    xl: "0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)",
+    "2xl": "0 25px 50px -12px rgb(0 0 0 / 0.25)",
+    inner: "inset 0 2px 4px 0 rgb(0 0 0 / 0.05)",
+  };
+  const SPACING_SIDES = { "": ["top", "right", "bottom", "left"], t: ["top"], r: ["right"], b: ["bottom"], l: ["left"], x: ["left", "right"], y: ["top", "bottom"] };
+
+  function styleFor(token) {
+    if (STATIC[token]) return STATIC[token];
+    let m;
+    if ((m = token.match(/^(-?)([pm])(t|r|b|l|x|y)?-(.+)$/))) {
+      const base = m[2] === "p" ? "padding" : "margin";
+      const sides = SPACING_SIDES[m[3] ?? ""];
+      return spacingDecl(sides.map((s) => `${base}-${s}`), m[1] + m[4]);
+    }
+    if ((m = token.match(/^gap(-[xy])?-(.+)$/))) {
+      const prop = m[1] === "-x" ? "column-gap" : m[1] === "-y" ? "row-gap" : "gap";
+      return spacingDecl([prop], m[2]);
+    }
+    if ((m = token.match(/^(min-|max-)?([wh])-(.+)$/))) {
+      const dim = m[2] === "w" ? "width" : "height";
+      const prop = (m[1] ?? "") + dim;
+      const v = sizeValue(m[3], m[2] === "w" ? "x" : "y");
+      return v === null ? null : [[prop, v]];
+    }
+    if ((m = token.match(/^justify-(\w+)$/)) && JUSTIFY[m[1]]) {
+      return [["justify-content", JUSTIFY[m[1]]]];
+    }
+    if ((m = token.match(/^items-(\w+)$/)) && ITEMS[m[1]]) {
+      return [["align-items", ITEMS[m[1]]]];
+    }
+    if ((m = token.match(/^font-(\w+)$/)) && WEIGHTS[m[1]]) {
+      return [["font-weight", `var(--font-weight-${m[1]}, ${WEIGHTS[m[1]]})`]];
+    }
+    if ((m = token.match(/^text-(left|center|right|justify)$/))) {
+      return [["text-align", m[1]]];
+    }
+    if ((m = token.match(/^text-(.+)$/))) {
+      const size = FONT_SIZES[m[1]];
+      if (size) {
+        const decls = [["font-size", `var(--text-${m[1]}, ${size})`]];
+        if (LINE_HEIGHTS[m[1]]) {
+          decls.push(["line-height", `var(--text-${m[1]}--line-height, ${LINE_HEIGHTS[m[1]]})`]);
+        }
+        return decls;
+      }
+      if (/^\[(?!#|rgb|hsl|var|oklch)[^\]]+\]$/.test(m[1])) {
+        return [["font-size", m[1].slice(1, -1)]];
+      }
+      const color = colorValue(m[1]);
+      return color === null ? null : [["color", color]];
+    }
+    if ((m = token.match(/^bg-(.+)$/))) {
+      const color = colorValue(m[1]);
+      return color === null ? null : [["background-color", color]];
+    }
+    if ((m = token.match(/^border-(0|2|4|8)$/))) {
+      return [["border-width", `${m[1]}px`]];
+    }
+    if ((m = token.match(/^border-(.+)$/))) {
+      const color = colorValue(m[1]);
+      return color === null ? null : [["border-color", color]];
+    }
+    if ((m = token.match(/^rounded-(.+)$/))) {
+      if (RADII[m[1]]) {
+        return [["border-radius", `var(--radius-${m[1]}, ${RADII[m[1]]})`]];
+      }
+      if (/^\[.+\]$/.test(m[1])) return [["border-radius", m[1].slice(1, -1)]];
+      return null;
+    }
+    if ((m = token.match(/^shadow-(.+)$/)) && SHADOWS[m[1]]) {
+      return [["box-shadow", `var(--shadow-${m[1]}, ${SHADOWS[m[1]]})`]];
+    }
+    if ((m = token.match(/^leading-(.+)$/))) {
+      const named = { none: "1", tight: "1.25", snug: "1.375", normal: "1.5", relaxed: "1.625", loose: "2" }[m[1]];
+      if (named) return [["line-height", named]];
+      if (/^\d+(\.\d+)?$/.test(m[1])) return [["line-height", SPACE(m[1])]];
+      return null;
+    }
+    if ((m = token.match(/^tracking-(.+)$/))) {
+      const named = { tighter: "-0.05em", tight: "-0.025em", normal: "0", wide: "0.025em", wider: "0.05em", widest: "0.1em" }[m[1]];
+      return named ? [["letter-spacing", named]] : null;
+    }
+    return null;
   }
 
   function payload(el) {
@@ -175,16 +367,24 @@
       repaint();
     } else if (m.type === "reset-class") {
       stagedClasses.delete(m.id);
-      if (typeof m.className === "string") {
-        for (const el of document.querySelectorAll(
-          `[data-dedup-id="${CSS.escape(m.id)}"]`,
-        )) {
+      for (const el of document.querySelectorAll(
+        `[data-dedup-id="${CSS.escape(m.id)}"]`,
+      )) {
+        clearPreview(el);
+        if (typeof m.className === "string") {
           el.setAttribute("class", m.className);
         }
       }
       repaint();
     } else if (m.type === "clear-staged") {
       // After save the source equals the staged state; HMR owns it again.
+      for (const id of stagedClasses.keys()) {
+        for (const el of document.querySelectorAll(
+          `[data-dedup-id="${CSS.escape(id)}"]`,
+        )) {
+          clearPreview(el);
+        }
+      }
       stagedClasses.clear();
     }
   });
