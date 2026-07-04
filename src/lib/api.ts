@@ -7,11 +7,14 @@ import type {
   ExitEvent,
   Framework,
   GitStatus,
+  InstrumentationInfo,
   LogEvent,
   PackageManager,
   ProjectInfo,
   ReadyEvent,
   RecentProject,
+  ScanProgress,
+  ScanResult,
   StatusEvent,
 } from "./types";
 
@@ -71,6 +74,41 @@ export const writeClasses = (root: string, file: string, edits: ClassEdit[]) =>
     edits,
   });
 
+// --- Duplicate scan (FR-5.x) -----------------------------------------------
+
+/** `files` scopes clustering to the current canvas page; omit for project-wide. */
+export const scanProject = (root: string, files?: string[] | null) =>
+  invoke<ScanResult>("scan_project", { root, files: files ?? null });
+
+/** Last persisted scan for the project, or null when never scanned. */
+export const loadScanResult = (root: string) =>
+  invoke<ScanResult | null>("load_scan_result", { root });
+
+/** Is the Claude Code CLI installed? (preferred AI backend). */
+export const claudeCodeAvailable = () =>
+  invoke<boolean>("claude_code_available");
+
+/** One headless prompt through the user's Claude Code install. */
+export const claudeCodePrompt = (prompt: string) =>
+  invoke<string>("claude_code_prompt", { prompt });
+
+/** Cached AI category assignments (file#name → {hash, category}). */
+export const loadCategories = (root: string) =>
+  invoke<Record<string, { hash: string; category: string }> | null>(
+    "load_categories",
+    { root },
+  );
+
+export const saveCategories = (
+  root: string,
+  categories: Record<string, { hash: string; category: string }>,
+) => invoke<void>("save_categories", { root, categories });
+
+export const onScanProgress = (
+  cb: (e: ScanProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<ScanProgress>("scan://progress", (e) => cb(e.payload));
+
 /** Returns [branch, shortHash]. */
 export const commitSession = (root: string, message: string, paths: string[]) =>
   invoke<[string, string]>("commit_session", { root, message, paths });
@@ -113,3 +151,10 @@ export const onDevServerStatus = (
   cb: (e: StatusEvent) => void,
 ): Promise<UnlistenFn> =>
   listen<StatusEvent>("devserver://status", (e) => cb(e.payload));
+
+export const onInstrumentation = (
+  cb: (e: InstrumentationInfo) => void,
+): Promise<UnlistenFn> =>
+  listen<InstrumentationInfo>("devserver://instrumentation", (e) =>
+    cb(e.payload),
+  );

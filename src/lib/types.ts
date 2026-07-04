@@ -53,6 +53,19 @@ export interface StatusEvent {
   status: "starting" | "stopping" | "stopped";
 }
 
+/** Page identity reported by the overlay — the canvas frame's label. */
+export interface PageMeta {
+  title: string;
+  path: string;
+}
+
+/** Whether element tagging is active for the session, and why not when off. */
+export interface InstrumentationInfo {
+  active: boolean;
+  mode: "tagged" | "custom" | "framework" | "script" | "error";
+  detail: string | null;
+}
+
 export type DevServerStatus =
   | "idle"
   | "starting"
@@ -111,6 +124,74 @@ export function parseDedupId(
   if (!m) return null;
   return { file: m[1], line: Number(m[2]), col: Number(m[3]) };
 }
+
+// --- Duplicate scan (FR-5.1, FR-5.2, FR-5.3) --------------------------------
+
+export interface ScanMember {
+  name: string;
+  file: string;
+  line: number;
+  col: number;
+  exportKind: "default" | "named" | "local";
+  props: string[];
+  nodeCount: number;
+  /** Name-based `<Name` usage count across the project (approximate). */
+  callSites: number;
+  classTokens: string[];
+  /** Indented tag/class outline of the component's JSX, for the diff view. */
+  skeleton: string;
+}
+
+export interface ScanCluster {
+  /** Stable hash of the member set — dismissals key off this. */
+  id: string;
+  confidence: number;
+  totalCallSites: number;
+  members: ScanMember[];
+}
+
+/** A component that qualifies for a rendered artboard on the canvas. */
+export interface GalleryEntry {
+  name: string;
+  file: string;
+  line: number;
+  col: number;
+  exportKind: "default" | "named" | "local";
+  props: string[];
+  nodeCount: number;
+  callSites: number;
+  clusterId: string | null;
+  /** Capped structural outline — AI categorization input + change hash. */
+  skeleton: string;
+}
+
+/** Bump alongside scan.mjs's `schema` whenever the result shape changes. */
+export const SCAN_SCHEMA = 2;
+
+export interface ScanResult {
+  ok: boolean;
+  /** Persisted-result schema version; restores require an exact match. */
+  schema?: number;
+  error?: string;
+  files: number;
+  skipped: number;
+  components: number;
+  /** File count when scoped to the current canvas page; null = whole project. */
+  scopedFiles: number | null;
+  clusters: ScanCluster[];
+  gallery: GalleryEntry[];
+  durationMs: number;
+  /** Epoch ms when the scan ran — restored results show their age. */
+  scannedAt?: number;
+}
+
+export interface ScanProgress {
+  stage: "inventory" | "similarity";
+  done: number;
+  total: number;
+}
+
+export type SidebarTab = "pages" | "layers" | "duplicates";
 
 // Canvas viewport presets (FR-1.4).
 export interface Viewport {

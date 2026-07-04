@@ -95,6 +95,11 @@ pub fn detect(root: &str) -> ProjectInfo {
     if framework == Framework::Unknown {
         warnings.push("Couldn't detect Vite or Next.js. Only these are supported in the MVP.".into());
     }
+    if framework == Framework::Next {
+        warnings.push(
+            "Next.js: canvas preview and duplicate scan work, but element inspection is Vite-only until Phase 5.".into(),
+        );
+    }
     if !has_tailwind {
         warnings.push("Tailwind CSS not detected. The inspector edits Tailwind classes only.".into());
     }
@@ -110,7 +115,8 @@ pub fn detect(root: &str) -> ProjectInfo {
 
     let support = if pkg.is_none() || framework == Framework::Unknown || dev_script.is_none() {
         SupportLevel::Unsupported
-    } else if !has_tailwind || !has_typescript || !has_git {
+    } else if !has_tailwind || !has_typescript || !has_git || framework == Framework::Next {
+        // Next.js runs (canvas + scan) but without element inspection — Phase 5.
         SupportLevel::Partial
     } else {
         SupportLevel::Full

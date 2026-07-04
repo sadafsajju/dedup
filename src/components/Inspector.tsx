@@ -3,9 +3,27 @@ import { parseDedupId } from "../lib/types";
 import { ChevronIcon, WarnIcon } from "./icons";
 import { StylePanel } from "./StylePanel";
 
+/** Human explanation for why inspection is off (FR-1.6 honesty). */
+function noInspectionReason(
+  mode: "custom" | "framework" | "script" | "error",
+  detail: string | null,
+): string {
+  switch (mode) {
+    case "framework":
+      return `${detail ?? "This framework"} isn't instrumented yet — element inspection is Vite-only until Phase 5. The canvas preview and duplicate Scan still work.`;
+    case "custom":
+      return "The custom dev command runs without dedup's tagging plugin, so element inspection is off. Use the project's plain `vite` dev script to inspect.";
+    case "script":
+      return "The dev script isn't a plain `vite` invocation, so dedup couldn't inject its tagging plugin — element inspection is off.";
+    case "error":
+      return `Tagging setup failed (${detail ?? "unknown error"}) — element inspection is off.`;
+  }
+}
+
 export function Inspector() {
   const project = useStore((s) => s.project);
   const selected = useStore((s) => s.selected);
+  const instrumentation = useStore((s) => s.instrumentation);
   const selectById = useStore((s) => s.selectById);
   const sourceInfo = useStore((s) => s.sourceInfo);
   const staged = useStore((s) => s.staged);
@@ -113,6 +131,19 @@ export function Inspector() {
               )}
             </div>
           )}
+        </div>
+      ) : instrumentation && !instrumentation.active ? (
+        <div className="flex-1 flex flex-col items-center justify-center px-6 text-center gap-2">
+          <WarnIcon size={16} className="text-warn" />
+          <div className="text-2xs text-ink-dim leading-relaxed">
+            {noInspectionReason(
+              instrumentation.mode as Exclude<
+                typeof instrumentation.mode,
+                "tagged"
+              >,
+              instrumentation.detail,
+            )}
+          </div>
         </div>
       ) : (
         <div className="flex-1 flex flex-col items-center justify-center px-6 text-center gap-2">

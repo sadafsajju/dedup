@@ -77,6 +77,27 @@ test("returns null on unparseable garbage instead of throwing", () => {
   assert.equal(tagCode(`const = <<<>>;;;`, "src/bad.tsx"), null);
 });
 
+test("appends a virtual export for file-local components when asked", () => {
+  const out = tagCode(
+    `function LocalCard() { return <div className="p-4">x</div>; }
+export function Page() { return <LocalCard />; }\n`,
+    "src/Page.tsx",
+    "LocalCard",
+  );
+  assert.ok(out);
+  assert.match(out.code, /export \{ LocalCard \};/);
+});
+
+test("rejects unsafe virtual export names", () => {
+  const out = tagCode(
+    `export const A = () => <p>x</p>;\n`,
+    "src/A.tssx".replace("tssx", "tsx"),
+    "x; alert(1)",
+  );
+  assert.ok(out); // still tags the JSX
+  assert.doesNotMatch(out.code, /alert/);
+});
+
 test("produces a sourcemap", () => {
   const out = tagCode(`const A = () => <p>x</p>;\n`, "src/A.tsx");
   assert.ok(out.map && out.map.mappings.length > 0);

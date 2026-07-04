@@ -8,11 +8,13 @@
     "build": "tsc && vite build",
     "build:plugin": "node plugin-src/build.mjs",
     "test:plugin": "node plugin-src/smoke.mjs",
+    "test:scan": "node plugin-src/scan.test.mjs",
     "test:tw": "node --experimental-strip-types plugin-src/tailwind.test.mts",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",

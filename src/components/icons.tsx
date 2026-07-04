@@ -103,3 +103,22 @@ export const GitBranchIcon = (p: IconProps) => (
     <path d="M6 8.5v7M18 10.5c0 4-6 1.5-6 5.5" />
   </svg>
 );
+
+export const CursorIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M5 3l7.5 18 2.2-7.3L22 11.5z" />
+  </svg>
+);
+
+export const HandIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M8 12V5.5a1.5 1.5 0 0 1 3 0V11m0-6.5v-1a1.5 1.5 0 0 1 3 0V11m0-5.5a1.5 1.5 0 0 1 3 0V13m0-4a1.5 1.5 0 0 1 3 0v5.5A6.5 6.5 0 0 1 13.5 21h-1.2a6 6 0 0 1-4.8-2.4L4.6 14.7a1.6 1.6 0 0 1 2.5-2L8 14" />
+  </svg>
+);
+
+export const BrowseIcon = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z" />
+    <path d="M3.5 9h17M3.5 15h17M12 3c-2.5 2.6-3.8 5.7-3.8 9s1.3 6.4 3.8 9c2.5-2.6 3.8-5.7 3.8-9S14.5 5.6 12 3z" />
+  </svg>
+);

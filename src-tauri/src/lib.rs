@@ -1,12 +1,14 @@
 //! dedup — Tauri core. Phase 0 surface: project detection, dev-server child
 //! process management, git-state probe, and the recent-projects list.
 
+mod ai;
 mod devserver;
 mod git;
 mod instrument;
 mod project;
 mod proxy;
 mod recents;
+mod scan;
 mod sidecar;
 
 use devserver::{DevServerState, ExecSpec};
@@ -23,6 +25,17 @@ fn git_status(root: String) -> git::GitStatus {
     git::status(&root)
 }
 
+/// Whether (and why not) element tagging is active for this session, so the
+/// UI can say "inspection is off because X" instead of degrading silently.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstrumentationEvent {
+    active: bool,
+    /// "tagged" | "custom" | "framework" | "script" | "error"
+    mode: &'static str,
+    detail: Option<String>,
+}
+
 #[tauri::command]
 fn start_dev_server(
     app: AppHandle,
@@ -33,16 +46,25 @@ fn start_dev_server(
     dev_script: Option<String>,
     custom_command: Option<String>,
 ) -> Result<(), String> {
-    let exec = if let Some(cmd) = custom_command {
+    let (exec, instr_info) = if let Some(cmd) = custom_command {
         // The user's explicit command wins; no rewriting on top of it.
-        ExecSpec::Shell(cmd)
+        (
+            ExecSpec::Shell(cmd),
+            InstrumentationEvent { active: false, mode: "custom", detail: None },
+        )
     } else if framework == Framework::Vite {
         match instrument::setup(&root, dev_script.as_deref()) {
-            Ok(Some(instr)) => ExecSpec::Direct {
-                program: instr.program,
-                args: instr.args,
-            },
-            Ok(None) => ExecSpec::Script(package_manager),
+            Ok(Some(instr)) => (
+                ExecSpec::Direct {
+                    program: instr.program,
+                    args: instr.args,
+                },
+                InstrumentationEvent { active: true, mode: "tagged", detail: None },
+            ),
+            Ok(None) => (
+                ExecSpec::Script(package_manager),
+                InstrumentationEvent { active: false, mode: "script", detail: None },
+            ),
             Err(e) => {
                 // Instrumentation is an enhancement, not a requirement — run
                 // plain and tell the user why inspection is unavailable.
@@ -53,13 +75,28 @@ fn start_dev_server(
                         "line": format!("dedup: tagging setup failed ({e}) — inspection disabled"),
                     }),
                 );
-                ExecSpec::Script(package_manager)
+                (
+                    ExecSpec::Script(package_manager),
+                    InstrumentationEvent { active: false, mode: "error", detail: Some(e) },
+                )
             }
         }
     } else {
-        ExecSpec::Script(package_manager)
+        let fw = if framework == Framework::Next { "Next.js" } else { "this framework" };
+        (
+            ExecSpec::Script(package_manager),
+            InstrumentationEvent {
+                active: false,
+                mode: "framework",
+                detail: Some(fw.to_string()),
+            },
+        )
     };
-    devserver::start(&app, &state, &root, exec)
+    let result = devserver::start(&app, &state, &root, exec);
+    if result.is_ok() {
+        let _ = app.emit("devserver://instrumentation", instr_info);
+    }
+    result
 }
 
 #[tauri::command]
@@ -91,6 +128,54 @@ fn write_classes(
     edits: Vec<sidecar::ClassEdit>,
 ) -> Result<serde_json::Value, String> {
     sidecar::write(&root, &file, &edits)
+}
+
+/// Duplicate scan (FR-5.1/5.2): inventory + structural clustering. `files`
+/// (relative paths) scopes clustering to the current canvas page; None scans
+/// the whole project. Progress arrives as `scan://progress` events; the
+/// return value is the full result. Async so the (potentially long) sidecar
+/// run never blocks the main thread.
+#[tauri::command]
+async fn scan_project(
+    app: AppHandle,
+    root: String,
+    files: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || scan::run(&app, &root, files))
+        .await
+        .map_err(|e| format!("scan task failed: {e}"))?
+}
+
+/// Last persisted scan for the project (None when never scanned).
+#[tauri::command]
+fn load_scan_result(root: String) -> Option<serde_json::Value> {
+    scan::load_saved(&root)
+}
+
+/// Is the Claude Code CLI installed? (Preferred AI backend — uses the
+/// user's existing subscription; API key is the fallback.)
+#[tauri::command]
+fn claude_code_available() -> bool {
+    ai::available()
+}
+
+/// One headless prompt through the user's Claude Code install.
+#[tauri::command]
+async fn claude_code_prompt(prompt: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ai::prompt(&prompt))
+        .await
+        .map_err(|e| format!("claude task failed: {e}"))?
+}
+
+/// Cached AI category assignments for the project's components.
+#[tauri::command]
+fn load_categories(root: String) -> Option<serde_json::Value> {
+    scan::load_categories(&root)
+}
+
+#[tauri::command]
+fn save_categories(root: String, categories: serde_json::Value) -> Result<(), String> {
+    scan::save_categories(&root, &categories)
 }
 
 /// First-write branch guarantee + commit-per-save (FR-4.5, FR-4.6).
@@ -135,6 +220,12 @@ pub fn run() {
             dev_server_running,
             inspect_element,
             write_classes,
+            scan_project,
+            load_scan_result,
+            load_categories,
+            save_categories,
+            claude_code_available,
+            claude_code_prompt,
             commit_session,
             get_recent_projects,
             add_recent_project,

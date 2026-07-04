@@ -5,12 +5,18 @@
   "use strict";
   if (window.__dedupOverlay) return;
   window.__dedupOverlay = true;
+  // Harness pages get the overlay via the shared HTML transform, but they're
+  // static previews — hover/select/page reports would fight the real canvas.
+  if (location.pathname.startsWith("/__dedup/harness")) return;
 
   const ACCENT = "#4c7fff";
   const Z = 2147483646;
 
   let hoverEl = null;
   let selectedEl = null;
+  // "inspect" swallows clicks to select; "browse" hands the page back to the
+  // user (links/buttons work) until the editor switches tools again.
+  let mode = "inspect";
   // Staged (unsaved) class patches by dedupId — reapplied after HMR swaps
   // the DOM out from under us, so live edits survive until save/discard.
   const stagedClasses = new Map();
@@ -376,6 +382,24 @@
         }
       }
       repaint();
+    } else if (m.type === "set-mode") {
+      mode = m.mode === "browse" ? "browse" : "inspect";
+      if (mode === "browse") {
+        hoverEl = null;
+        selectedEl = null;
+        repaint();
+      }
+    } else if (m.type === "list-files") {
+      // Source files behind everything currently rendered (FR-5.1 canvas
+      // scope). dedupId is "file:line:col" — strip the two position segments.
+      const files = new Set();
+      for (const el of document.querySelectorAll("[data-dedup-id]")) {
+        const match = el
+          .getAttribute("data-dedup-id")
+          .match(/^(.*):\d+:\d+$/);
+        if (match) files.add(match[1]);
+      }
+      post("files", { files: [...files] });
     } else if (m.type === "clear-staged") {
       // After save the source equals the staged state; HMR owns it again.
       for (const id of stagedClasses.keys()) {
@@ -400,6 +424,7 @@
   document.addEventListener(
     "mousemove",
     (e) => {
+      if (mode === "browse") return;
       const el = tagged(e.target);
       if (el !== hoverEl) {
         hoverEl = el;
@@ -419,10 +444,12 @@
   );
 
   // Inspect-don't-activate: swallow clicks and select instead (design-tool
-  // semantics; links/buttons in the user's app don't fire).
+  // semantics; links/buttons in the user's app don't fire). Browse mode
+  // steps aside entirely so the app is navigable.
   document.addEventListener(
     "click",
     (e) => {
+      if (mode === "browse") return;
       e.preventDefault();
       e.stopImmediatePropagation();
       const el = tagged(e.target);
@@ -437,6 +464,7 @@
   // grow → re-measure → grow feedback loop: resizing the frame mutates
   // nothing, so no re-report happens.
   let lastReportedHeight = 0;
+  let lastMeta = "";
   let heightTimer = null;
   function reportHeight() {
     if (heightTimer) return;
@@ -446,6 +474,12 @@
       if (Math.abs(h - lastReportedHeight) > 8) {
         lastReportedHeight = h;
         post("page-size", { height: h });
+      }
+      // Frame label (Figma artboard name): the page's own title + route.
+      const meta = `${document.title} ${location.pathname}`;
+      if (meta !== lastMeta) {
+        lastMeta = meta;
+        post("page-meta", { title: document.title, path: location.pathname });
       }
     }, 200);
   }
@@ -464,6 +498,54 @@
   window.addEventListener("load", reportHeight);
   // Images/fonts finishing change height without DOM mutations.
   document.addEventListener("load", reportHeight, true);
+
+  // --- canvas pan/zoom forwarding (FR-6.1) -----------------------------------
+  // The iframe swallows wheel events, so the editor can't pan while the
+  // cursor is over the page. Forward them — unless an inner scrollable
+  // element can actually consume the scroll (nested panels keep working).
+
+  function scrollableAncestor(el, dx, dy) {
+    while (el && el !== document.documentElement && el.nodeType === 1) {
+      const cs = getComputedStyle(el);
+      if (
+        dy !== 0 &&
+        (cs.overflowY === "auto" || cs.overflowY === "scroll") &&
+        el.scrollHeight > el.clientHeight &&
+        ((dy < 0 && el.scrollTop > 0) ||
+          (dy > 0 && el.scrollTop + el.clientHeight < el.scrollHeight - 1))
+      ) {
+        return el;
+      }
+      if (
+        dx !== 0 &&
+        (cs.overflowX === "auto" || cs.overflowX === "scroll") &&
+        el.scrollWidth > el.clientWidth &&
+        ((dx < 0 && el.scrollLeft > 0) ||
+          (dx > 0 && el.scrollLeft + el.clientWidth < el.scrollWidth - 1))
+      ) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  window.addEventListener(
+    "wheel",
+    (e) => {
+      if (scrollableAncestor(e.target, e.deltaX, e.deltaY)) return;
+      e.preventDefault();
+      post("wheel", {
+        dx: e.deltaX,
+        dy: e.deltaY,
+        // Pinch gestures arrive as ctrlKey wheels; ⌘+scroll is explicit zoom.
+        zoomMod: e.ctrlKey || e.metaKey,
+        x: e.clientX,
+        y: e.clientY,
+      });
+    },
+    { passive: false, capture: true },
+  );
 
   window.addEventListener("scroll", repaint, true);
   window.addEventListener("resize", repaint, true);

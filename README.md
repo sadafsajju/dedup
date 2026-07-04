@@ -9,9 +9,10 @@ See [`dedup-mvp-prd.md`](./dedup-mvp-prd.md) for the full product spec.
 
 ## Status
 
-**Phases 0–2 complete** — project open, dev-server management, element↔source
+**Phases 0–3 complete** — project open, dev-server management, element↔source
 tagging, Figma-style Tailwind inspector with live preview, AST write-back on a
-git session branch. Next: Phase 3 (duplicate scan).
+git session branch, and the duplicate scan: component inventory, deterministic
+structural similarity, cluster review UI. Next: Phase 4 (guarded merge).
 
 Full per-phase log against the PRD's requirements — including decisions,
 deviations, and known limitations — lives in **[PROGRESS.md](./PROGRESS.md)**.

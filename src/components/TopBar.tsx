@@ -5,6 +5,7 @@ import { VIEWPORTS } from "../lib/types";
 import type { DevServerStatus } from "../lib/types";
 import { ChevronIcon, GitBranchIcon, DuplicatesIcon } from "./icons";
 import { ReviewPanel } from "./ReviewPanel";
+import { AiSwitch } from "./AiSwitch";
 
 const STATUS_META: Record<DevServerStatus, { label: string; dot: string }> = {
   idle: { label: "Idle", dot: "bg-ink-faint" },
@@ -22,14 +23,15 @@ export function TopBar() {
   const devPort = useStore((s) => s.devPort);
   const viewportId = useStore((s) => s.viewportId);
   const setViewport = useStore((s) => s.setViewport);
-  const zoom = useStore((s) => s.zoom);
-  const setZoom = useStore((s) => s.setZoom);
   const backToLaunch = useStore((s) => s.backToLaunch);
   const staged = useStore((s) => s.staged);
   const saving = useStore((s) => s.saving);
   const saveError = useStore((s) => s.saveError);
   const lastSave = useStore((s) => s.lastSave);
   const saveAll = useStore((s) => s.saveAll);
+  const scanning = useStore((s) => s.scanning);
+  const categorizing = useStore((s) => s.categorizing);
+  const runScan = useStore((s) => s.runScan);
   const dirtyCount = Object.values(staged).filter(
     (e) => e.current !== e.original,
   ).length;
@@ -87,24 +89,6 @@ export function TopBar() {
         ))}
       </div>
 
-      <div className="flex items-center gap-1 text-2xs text-ink-dim">
-        <button
-          onClick={() => setZoom(zoom - 0.1)}
-          className="w-5 h-5 rounded hover:bg-surface-2"
-        >
-          −
-        </button>
-        <span className="w-9 text-center tabular-nums">
-          {Math.round(zoom * 100)}%
-        </span>
-        <button
-          onClick={() => setZoom(zoom + 0.1)}
-          className="w-5 h-5 rounded hover:bg-surface-2"
-        >
-          +
-        </button>
-      </div>
-
       {/* Dev-server status */}
       <div className="flex items-center gap-1.5 text-2xs text-ink-dim px-2">
         <span className={`h-2 w-2 rounded-full ${status.dot}`} />
@@ -157,12 +141,23 @@ export function TopBar() {
         {reviewOpen && <ReviewPanel onClose={() => setReviewOpen(false)} />}
       </div>
 
+      <AiSwitch />
+
       <button
-        disabled
-        className="inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-2xs bg-surface-2 text-ink-faint cursor-not-allowed"
-        title="Duplicate scan — Phase 3"
+        onClick={runScan}
+        disabled={scanning || categorizing}
+        className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-2xs ${
+          scanning || categorizing
+            ? "bg-surface-2 text-ink-faint cursor-wait"
+            : "bg-surface-2 text-ink-dim hover:text-ink"
+        }`}
+        title="Find duplicate components and auto-organize the canvas"
       >
-        <DuplicatesIcon size={13} /> Scan
+        <DuplicatesIcon
+          size={13}
+          className={scanning || categorizing ? "animate-pulse" : ""}
+        />
+        {scanning ? "Scanning…" : categorizing ? "Organizing…" : "Scan"}
       </button>
     </header>
   );

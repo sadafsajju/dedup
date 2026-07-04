@@ -85,25 +85,29 @@ fn run(root: &str, request: serde_json::Value) -> Result<serde_json::Value, Stri
         .map_err(|e| format!("bad sidecar response: {e}: {}", String::from_utf8_lossy(&out.stdout)))
 }
 
-/// The bundle lives in node_modules/.dedup like the tagger; write it if the
-/// project doesn't have this build yet.
 fn ensure_bundle(root: &str) -> Result<PathBuf, String> {
+    ensure_named_bundle(root, "dedup-writeback.mjs", WRITEBACK_BUNDLE)
+}
+
+/// Bundles live in node_modules/.dedup like the tagger; write one if the
+/// project doesn't have this build yet.
+pub fn ensure_named_bundle(root: &str, name: &str, content: &str) -> Result<PathBuf, String> {
     let dir = Path::new(root).join("node_modules/.dedup");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create .dedup dir: {e}"))?;
-    let path = dir.join("dedup-writeback.mjs");
+    let path = dir.join(name);
     let stale = match std::fs::read_to_string(&path) {
-        Ok(existing) => existing != WRITEBACK_BUNDLE,
+        Ok(existing) => existing != content,
         Err(_) => true,
     };
     if stale {
-        std::fs::write(&path, WRITEBACK_BUNDLE).map_err(|e| format!("write sidecar: {e}"))?;
+        std::fs::write(&path, content).map_err(|e| format!("write sidecar: {e}"))?;
     }
     Ok(path)
 }
 
 /// `node` from PATH, with the usual macOS install locations as fallbacks
 /// (GUI-launched apps get a minimal PATH).
-fn find_node() -> Result<PathBuf, String> {
+pub fn find_node() -> Result<PathBuf, String> {
     if let Ok(out) = Command::new("node").arg("--version").output() {
         if out.status.success() {
             return Ok(PathBuf::from("node"));
