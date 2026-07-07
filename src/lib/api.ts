@@ -74,6 +74,20 @@ export const writeClasses = (root: string, file: string, edits: ClassEdit[]) =>
     edits,
   });
 
+// --- AI chat edits (Inspector chat tab) --------------------------------------
+
+/** Read one project source file (path resolved inside the project root). */
+export const readSource = (root: string, file: string) =>
+  invoke<string>("read_source", { root, file });
+
+/** Replace one source file; the sidecar re-parses before writing. */
+export const writeSource = (root: string, file: string, content: string) =>
+  invoke<{ ok: boolean; changed?: boolean; error?: string }>("write_source", {
+    root,
+    file,
+    content,
+  });
+
 // --- Duplicate scan (FR-5.x) -----------------------------------------------
 
 /** `files` scopes clustering to the current canvas page; omit for project-wide. */
@@ -88,9 +102,10 @@ export const loadScanResult = (root: string) =>
 export const claudeCodeAvailable = () =>
   invoke<boolean>("claude_code_available");
 
-/** One headless prompt through the user's Claude Code install. */
-export const claudeCodePrompt = (prompt: string) =>
-  invoke<string>("claude_code_prompt", { prompt });
+/** One headless prompt through the user's Claude Code install.
+ *  `model` is a CLI alias or full id; null/omitted uses the CLI default. */
+export const claudeCodePrompt = (prompt: string, model?: string | null) =>
+  invoke<string>("claude_code_prompt", { prompt, model: model ?? null });
 
 /** Cached AI category assignments (file#name → {hash, category}). */
 export const loadCategories = (root: string) =>

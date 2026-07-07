@@ -12,6 +12,8 @@ export function AiSwitch() {
   const anthropicKey = useStore((s) => s.anthropicKey);
   const setAnthropicKey = useStore((s) => s.setAnthropicKey);
   const setAiPref = useStore((s) => s.setAiPref);
+  const ccModel = useStore((s) => s.ccModel);
+  const setCcModel = useStore((s) => s.setCcModel);
   const connectClaudeCode = useStore((s) => s.connectClaudeCode);
   const active = useStore((s) => s.activeAiBackend());
 
@@ -88,6 +90,22 @@ export function AiSwitch() {
               Runs the local <span className="font-mono">claude</span> CLI on
               your plan — no API key. Connecting sends one test prompt to
               verify your login.
+            </div>
+            <div className="mt-1.5 flex items-center gap-2">
+              <label className="text-2xs text-ink-faint" htmlFor="cc-model">
+                Model
+              </label>
+              <select
+                id="cc-model"
+                value={ccModel ?? ""}
+                onChange={(e) => setCcModel(e.target.value || null)}
+                className="rounded bg-surface-2 px-1.5 py-0.5 text-2xs text-ink outline-none focus:ring-1 focus:ring-accent"
+              >
+                <option value="">CLI default</option>
+                <option value="haiku">Haiku (fastest)</option>
+                <option value="sonnet">Sonnet</option>
+                <option value="opus">Opus (most capable)</option>
+              </select>
             </div>
             {ccError && (
               <div className="mt-1.5 text-2xs text-danger break-words">

@@ -1,5 +1,6 @@
 import { useStore } from "../lib/store";
 import { parseDedupId } from "../lib/types";
+import { ChatPanel } from "./ChatPanel";
 import { ChevronIcon, WarnIcon } from "./icons";
 import { StylePanel } from "./StylePanel";
 
@@ -27,6 +28,8 @@ export function Inspector() {
   const selectById = useStore((s) => s.selectById);
   const sourceInfo = useStore((s) => s.sourceInfo);
   const staged = useStore((s) => s.staged);
+  const tab = useStore((s) => s.inspectorTab);
+  const setTab = useStore((s) => s.setInspectorTab);
   const effective = selected
     ? (staged[selected.dedupId]?.current ?? sourceInfo?.className ?? null)
     : null;
@@ -37,13 +40,25 @@ export function Inspector() {
 
   return (
     <aside className="w-64 shrink-0 flex flex-col border-l border-line bg-surface-1">
-      <div className="h-9 shrink-0 flex items-center px-3 border-b border-line">
-        <span className="text-2xs uppercase tracking-wider text-ink-faint">
-          Inspector
-        </span>
+      <div className="h-9 shrink-0 flex items-center gap-1 px-3 border-b border-line">
+        {(["design", "chat"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`rounded px-1.5 py-0.5 text-2xs uppercase tracking-wider ${
+              tab === t
+                ? "text-ink bg-surface-2"
+                : "text-ink-faint hover:text-ink"
+            }`}
+          >
+            {t === "design" ? "Design" : "Chat"}
+          </button>
+        ))}
       </div>
 
-      {selected ? (
+      {tab === "chat" ? (
+        <ChatPanel />
+      ) : selected ? (
         <div className="flex-1 overflow-y-auto">
           {/* Selection header (FR-3.1 seed) */}
           <div className="px-3 py-3 border-b border-line">

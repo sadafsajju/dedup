@@ -3,9 +3,14 @@
 //! Claude Code install and subscription instead of a raw API key. One-shot
 //! headless invocation: prompt on stdin, JSON envelope on stdout.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Generous ceiling for one prompt (big files on a slow model are legitimate);
+/// the point is that the UI can never hang forever.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// `claude` from PATH, with the usual install locations as fallbacks
 /// (GUI-launched apps get a minimal PATH).
@@ -34,35 +39,93 @@ pub fn available() -> bool {
 }
 
 /// Run one headless prompt through Claude Code and return the result text.
-pub fn prompt(text: &str) -> Result<String, String> {
+/// `model` is a CLI alias or full id ("sonnet", "opus", …); None keeps the
+/// user's CLI default.
+///
+/// The invocation is deliberately stripped down: no settings/CLAUDE.md, no
+/// MCP servers, no tools, no session files, no skills. dedup only wants a
+/// text completion — everything else is startup cost and, worse, a hang
+/// surface (an MCP server that blocks stalls the whole prompt). A hard
+/// timeout kills the child so the UI can never wait forever.
+pub fn prompt(text: &str, model: Option<&str>) -> Result<String, String> {
     let claude = find_claude().ok_or("Claude Code CLI not found")?;
 
-    let mut child = Command::new(claude)
-        .args(["-p", "--output-format", "json"])
+    let mut cmd = Command::new(claude);
+    cmd.args([
+        "-p",
+        "--output-format",
+        "json",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--mcp-config",
+        r#"{"mcpServers":{}}"#,
+        "--setting-sources",
+        "",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+    ]);
+    if let Some(model) = model {
+        cmd.args(["--model", model]);
+    }
+    let mut child = cmd
+        // Neutral cwd — never load project context from wherever dedup runs.
+        .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to start claude: {e}"))?;
 
-    child
-        .stdin
-        .take()
-        .ok_or("claude stdin unavailable")?
-        .write_all(text.as_bytes())
-        .map_err(|e| format!("claude stdin write: {e}"))?;
+    // Feed stdin and drain stdout/stderr on their own threads: a prompt
+    // larger than the pipe buffer would otherwise deadlock against a child
+    // that's already producing output.
+    let mut stdin = child.stdin.take().ok_or("claude stdin unavailable")?;
+    let prompt_text = text.to_string();
+    let stdin_thread = std::thread::spawn(move || {
+        let _ = stdin.write_all(prompt_text.as_bytes());
+    });
+    let mut stdout_pipe = child.stdout.take().ok_or("claude stdout unavailable")?;
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout_pipe.read_to_string(&mut buf);
+        buf
+    });
+    let mut stderr_pipe = child.stderr.take().ok_or("claude stderr unavailable")?;
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
 
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("claude wait: {e}"))?;
-    if !out.status.success() {
+    let deadline = Instant::now() + PROMPT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(format!(
+                    "claude took longer than {}s and was stopped — try again, or pick a faster model in the AI switch",
+                    PROMPT_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(150)),
+            Err(e) => return Err(format!("claude wait: {e}")),
+        }
+    };
+
+    stdin_thread.join().ok();
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
         return Err(format!(
             "claude exited with {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
+            status.code(),
+            stderr.trim()
         ));
     }
-    parse_result_envelope(&String::from_utf8_lossy(&out.stdout))
+    parse_result_envelope(&stdout)
 }
 
 /// `--output-format json` wraps the answer in an envelope; the text lives in

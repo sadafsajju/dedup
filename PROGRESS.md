@@ -264,25 +264,76 @@ component rendering — its prerequisite — now exists.
 - Dismissal keys on the member set — if a cluster gains/loses a member on a
   later scan it resurfaces (arguably correct: new evidence).
 
+**Addendum (2026-07-07): Inspector chat tab + Claude Code model picker**
+- The AI switch's Claude Code card gained a model picker (CLI default / Haiku /
+  Sonnet / Opus) — persisted, passed as `--model` on every headless invocation
+  including the connect test.
+- New Inspector **Chat** tab: select an element, type an instruction, the AI
+  edits the code. The model gets the whole source file with the selection
+  marked (line + tag/component + ×N instance note) and replies with
+  SEARCH/REPLACE edit blocks (full-file fence accepted as fallback; prose =
+  answer, no write). Blocks are applied locally with exact-unique matching —
+  a misquoted or ambiguous SEARCH aborts with a reason, nothing half-applies.
+  Works with both backends (Claude Code CLI honoring the model pick, or API
+  key). First cut asked for the complete updated file back — Opus streaming a
+  whole file took minutes and read as a hang; block edits land in ~8 s.
+- Headless CLI hardening (the "stuck in Working…" fixes): the one-shot
+  `claude -p` now runs stripped (`--tools "" --strict-mcp-config
+  --setting-sources "" --no-session-persistence --disable-slash-commands`,
+  neutral cwd) — a bare invocation loads the user's whole Claude Code
+  environment and MCP servers, which stalled for minutes before any API call.
+  Hard 300 s timeout kills the child (the UI can never spin forever), and
+  stdin/stdout/stderr are pumped on separate threads (a >64 KB prompt could
+  deadlock both processes on full pipes).
+- Safety model unchanged and load-bearing: the reply is written via a new
+  sidecar `writeFile` command that **strict-parses (no error recovery) before
+  writing** — unparseable model output is refused with the file untouched;
+  `resolve_in_root` gates the path; each applied edit is its own commit on the
+  `dedup/session-*` branch (`dedup: <model summary>`). Chat edits are blocked
+  for a file with unsaved staged class edits (a rewrite would strand their
+  line/col positions) — save or discard first.
+- This is the one AI feature that sends **source code** to the backend (scan
+  categorization still sends outlines only); the composer states it inline.
+- Chats are sessions, persisted per project (localStorage, most recent 20,
+  same pattern as dismissed clusters) and restored on reopen. The panel has a
+  session switcher + new/delete; a new chat materializes on its first message.
+  Each turn carries conversation memory: the last 12 message texts go back to
+  the model (real message turns on the API backend, inline transcript for the
+  headless CLI) — never past file snapshots; the current file is always sent
+  fresh.
+- Stale selections are guarded, not guessed: commits shift line numbers, and
+  a stale line made the model edit the *wrong* button in dogfooding. Before
+  prompting, the selected line in the just-read source must still contain the
+  selected tag (else: "re-select and try again"); the prompt also quotes the
+  line's text so the model targets by content, not position. After an applied
+  edit the canvas is told to `location.reload()` (new overlay `reload`
+  command) — never trust HMR sockets to be alive — and the selection is
+  cleared because every position in the file may have shifted.
+
 Then Phase 4 (guarded merge), Phase 5 (harden + Next.js).
 
 ---
 
 ## Verification inventory
 
-- `cargo test` (src-tauri): 27 — URL/ANSI parsing, project detection,
+- `cargo test` (src-tauri): 28 — URL/ANSI parsing, project detection,
   instrumentation, tunnel (real TLS upstream, IPv6-only), sidecar (real node
-  spawn E2E), git branch/commit isolation, Next stale-lock parsing, scan
-  persist/restore round-trip, Claude Code result-envelope parsing.
-- `pnpm test:plugin`: 16 — tagger transform (fragments, generics, sourcemaps,
+  spawn E2E incl. the full-file parse gate), git branch/commit isolation, Next
+  stale-lock parsing, scan persist/restore round-trip, Claude Code
+  result-envelope parsing.
+- `pnpm test:plugin`: 19 — tagger transform (fragments, generics, sourcemaps,
   virtual-export for file-local components + unsafe-name rejection) +
-  write-back program E2E via child process (inspect/write/insert/batch/reject).
+  write-back program E2E via child process (inspect/write/insert/batch/reject
+  + full-file replace: parse-gated, empty refused, no-op reported).
 - `pnpm test:scan`: 10 — scan bundle E2E via child process: near-dup clustering
   + unrelated separation, canvas-scope filtering (project-wide call sites),
   knob-value equivalence, trivial-component exclusion, node_modules/garbage
   resilience, memo/forwardRef, progress stream, gallery filter (structural +
   interactive; text/icons/app-shells excluded), gallery cluster-id + schema.
 - `pnpm test:tw`: 10 — class⇄knob mapping, spacing precedence + regeneration.
+- `pnpm test:chat`: 8 — chat edit-block parse/apply: single/multi block,
+  deletion, non-match + ambiguous + malformed all throw (no half-applies),
+  full-file fallback, prose passthrough.
 - Manual E2E: wrapper config against a real Vite app (tags + overlay + harness
   served); Claude Code CLI envelope round-trip; dogfooded on mintWash.
 - Not yet auto-covered: in-app artboard render, AI categorization/mock-props

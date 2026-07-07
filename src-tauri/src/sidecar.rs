@@ -42,6 +42,13 @@ pub fn inspect(root: &str, rel_file: &str, line: u32, col: u32) -> Result<serde_
     )
 }
 
+/// Full-file replacement (AI chat edits) — the sidecar re-parses `content`
+/// strictly and refuses anything that doesn't parse (PRD §safety).
+pub fn write_file(root: &str, rel_file: &str, content: &str) -> Result<serde_json::Value, String> {
+    let file = resolve_in_root(root, rel_file)?;
+    run(root, json!({ "cmd": "writeFile", "file": file, "content": content }))
+}
+
 pub fn write(root: &str, rel_file: &str, edits: &[ClassEdit]) -> Result<serde_json::Value, String> {
     let file = resolve_in_root(root, rel_file)?;
     let edits: Vec<_> = edits
@@ -168,6 +175,27 @@ mod tests {
         assert_eq!(res["ok"], true, "write failed: {res}");
         let after = std::fs::read_to_string(root.join("App.tsx")).unwrap();
         assert!(after.contains("className=\"p-6 flex\""), "got: {after}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_file_gates_on_parse() {
+        let root = std::env::temp_dir().join(format!("dedup-scwf-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let before = "export const App = () => <div>x</div>;\n";
+        std::fs::write(root.join("App.tsx"), before).unwrap();
+        let root_str = root.to_str().unwrap();
+
+        let bad = write_file(root_str, "App.tsx", "export const App = () => <div>x</div;\n");
+        let bad = bad.unwrap();
+        assert_eq!(bad["ok"], false, "broken JSX must be refused: {bad}");
+        assert_eq!(std::fs::read_to_string(root.join("App.tsx")).unwrap(), before);
+
+        let good = "export const App = () => <div className=\"p-2\">y</div>;\n";
+        let ok = write_file(root_str, "App.tsx", good).unwrap();
+        assert_eq!(ok["ok"], true, "valid content must land: {ok}");
+        assert_eq!(ok["changed"], true);
+        assert_eq!(std::fs::read_to_string(root.join("App.tsx")).unwrap(), good);
         std::fs::remove_dir_all(&root).ok();
     }
 }

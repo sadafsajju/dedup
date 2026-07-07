@@ -7,10 +7,14 @@ import {
   inspectElement,
   loadCategories,
   loadScanResult,
+  readSource,
   saveCategories,
   scanProject,
   writeClasses,
+  writeSource,
 } from "./api";
+import { buildEditPrompt, runChatPrompt } from "./chat";
+import { applyEditBlocks, parseChatReply } from "./chatEdits";
 import {
   categorizeComponents,
   needingCategorization,
@@ -21,6 +25,8 @@ import {
 import { requestCanvasFiles, sendToOverlay } from "./bridge";
 import { parseDedupId, SCAN_SCHEMA } from "./types";
 import type {
+  ChatMessage,
+  ChatSession,
   DevServerStatus,
   GitStatus,
   InstrumentationInfo,
@@ -94,6 +100,14 @@ interface AppState {
 
   sidebarTab: SidebarTab;
 
+  // Inspector chat (AI edits on the selected element). Sessions persist per
+  // project; the active one is what the panel shows. null active id = a new
+  // chat that materializes on the first message.
+  inspectorTab: "design" | "chat";
+  chatSessions: ChatSession[];
+  activeChatId: string | null;
+  chatBusy: boolean;
+
   // Duplicate scan (FR-5.x).
   scanning: boolean;
   scanProgress: ScanProgress | null;
@@ -124,6 +138,8 @@ interface AppState {
   ccConsent: boolean;
   ccConnecting: boolean;
   ccError: string | null;
+  /** Claude Code model alias ("sonnet", "opus", …). null = CLI default. */
+  ccModel: string | null;
 
   // actions
   enterEditor: (
@@ -165,6 +181,14 @@ interface AppState {
   saveAll: () => Promise<void>;
 
   setSidebarTab: (tab: SidebarTab) => void;
+  setInspectorTab: (tab: "design" | "chat") => void;
+  /** Chat instruction for the selected element → AI edit → gated write +
+   * commit on the session branch. */
+  sendChat: (instruction: string) => Promise<void>;
+  /** Start a fresh chat (created for real on the first message). */
+  newChatSession: () => void;
+  selectChatSession: (id: string | null) => void;
+  deleteChatSession: (id: string) => void;
   /** Run the duplicate scan and land on the Duplicates tab (FR-5.1/5.2). */
   runScan: () => Promise<void>;
   /** Load the last persisted scan for the open project, if any. */
@@ -181,6 +205,7 @@ interface AppState {
   detectClaudeCode: () => Promise<void>;
   /** Pick the AI backend (persisted). */
   setAiPref: (pref: "claude-code" | "api" | null) => void;
+  setCcModel: (model: string | null) => void;
   /** Consent + live test: verifies Claude Code login and enables it. */
   connectClaudeCode: () => Promise<void>;
   /** The backend categorize() will actually use right now, if any. */
@@ -194,6 +219,7 @@ interface AppState {
 const KEY_STORAGE = "dedup:anthropic-key";
 const AI_PREF_STORAGE = "dedup:ai-pref";
 const CC_CONSENT_STORAGE = "dedup:claude-code-consent";
+const CC_MODEL_STORAGE = "dedup:claude-code-model";
 
 /** Cache entries that still match their component's current skeleton. */
 function validAssignments(
@@ -246,6 +272,32 @@ function loadDismissed(root: string): Record<string, true> {
 function saveDismissed(root: string, dismissed: Record<string, true>) {
   try {
     localStorage.setItem(dismissedKey(root), JSON.stringify(Object.keys(dismissed)));
+  } catch {
+    // Persistence is best-effort; the session still works without it.
+  }
+}
+
+const chatsKey = (root: string) => `dedup:chats:${root}`;
+/** Keep the most recent N sessions per project — localStorage isn't a vault. */
+const MAX_CHAT_SESSIONS = 20;
+
+function loadChatSessions(root: string): ChatSession[] {
+  try {
+    const raw = localStorage.getItem(chatsKey(root));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as ChatSession[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveChatSessions(root: string, sessions: ChatSession[]) {
+  try {
+    localStorage.setItem(
+      chatsKey(root),
+      JSON.stringify(sessions.slice(-MAX_CHAT_SESSIONS)),
+    );
   } catch {
     // Persistence is best-effort; the session still works without it.
   }
@@ -305,6 +357,10 @@ export const useStore = create<AppState>((set, get) => ({
   saveError: null,
 
   sidebarTab: "layers",
+  inspectorTab: "design",
+  chatSessions: [],
+  activeChatId: null,
+  chatBusy: false,
   scanning: false,
   scanProgress: null,
   scanResult: null,
@@ -327,10 +383,17 @@ export const useStore = create<AppState>((set, get) => ({
   ccConsent: localStorage.getItem(CC_CONSENT_STORAGE) === "yes",
   ccConnecting: false,
   ccError: null,
+  ccModel: localStorage.getItem(CC_MODEL_STORAGE),
 
-  enterEditor: (project, git, customCommand = null) =>
+  enterEditor: (project, git, customCommand = null) => {
+    // Past chats come back with the project; land on the most recent one.
+    const chatSessions = loadChatSessions(project.root);
     set({
       sidebarTab: "layers",
+      inspectorTab: "design",
+      chatSessions,
+      activeChatId: chatSessions[chatSessions.length - 1]?.id ?? null,
+      chatBusy: false,
       scanning: false,
       scanProgress: null,
       scanResult: null,
@@ -361,11 +424,15 @@ export const useStore = create<AppState>((set, get) => ({
       redoStack: [],
       lastSave: null,
       saveError: null,
-    }),
+    });
+  },
 
   backToLaunch: () =>
     set({
       sidebarTab: "layers",
+      chatSessions: [],
+      activeChatId: null,
+      chatBusy: false,
       scanning: false,
       scanProgress: null,
       scanResult: null,
@@ -623,6 +690,170 @@ export const useStore = create<AppState>((set, get) => ({
 
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
 
+  setInspectorTab: (inspectorTab) => set({ inspectorTab }),
+
+  sendChat: async (instruction) => {
+    const { project, selected, chatBusy } = get();
+    const text = instruction.trim();
+    if (!project || !selected || !text || chatBusy) return;
+    const src = parseDedupId(selected.dedupId);
+    if (!src) return;
+
+    // Append to the active session, materializing a new one on first use.
+    const push = (m: Omit<ChatMessage, "id">) =>
+      set((s) => {
+        let sessions = s.chatSessions;
+        let id = s.activeChatId;
+        if (!id || !sessions.some((x) => x.id === id)) {
+          id = crypto.randomUUID();
+          sessions = [
+            ...sessions,
+            { id, title: text.slice(0, 48), createdAt: Date.now(), messages: [] },
+          ];
+        }
+        sessions = sessions.map((x) =>
+          x.id === id
+            ? { ...x, messages: [...x.messages, { id: crypto.randomUUID(), ...m }] }
+            : x,
+        );
+        if (s.project) saveChatSessions(s.project.root, sessions);
+        return { chatSessions: sessions, activeChatId: id };
+      });
+
+    // Conversation memory: prior turns of this session (texts only — the
+    // file always goes in fresh), captured before this message lands.
+    const active = get().chatSessions.find((x) => x.id === get().activeChatId);
+    const history = (active?.messages ?? [])
+      .filter((m) => !m.error)
+      .slice(-12)
+      .map((m) => ({ role: m.role, text: m.text }));
+
+    push({
+      role: "user",
+      text,
+      target: { label: selected.component ?? selected.tag, file: src.file },
+    });
+
+    // A full-file rewrite would strand unsaved class edits in this file
+    // (their line/col positions go stale) — make the user land them first.
+    const stagedHere = Object.values(get().staged).some(
+      (e) => e.file === src.file && e.current !== e.original,
+    );
+    if (stagedHere) {
+      push({
+        role: "assistant",
+        error: true,
+        text: `This file has unsaved style edits. Save (⌘S) or discard them first — a chat edit would invalidate their positions.`,
+      });
+      return;
+    }
+
+    const kind = get().activeAiBackend();
+    const backend =
+      kind === "claude-code"
+        ? {
+            kind: "claude-code" as const,
+            run: (p: string) => claudeCodePrompt(p, get().ccModel),
+          }
+        : kind === "api"
+          ? { kind: "api" as const, apiKey: get().anthropicKey }
+          : null;
+    if (!backend) {
+      push({
+        role: "assistant",
+        error: true,
+        text: "No AI backend connected — choose one in the AI switch (top bar).",
+      });
+      return;
+    }
+
+    set({ chatBusy: true });
+    try {
+      const source = await readSource(project.root, src.file);
+      // Stale-selection guard: commits since selection shift line numbers,
+      // and a wrong line makes the model edit the wrong element. The tag at
+      // the selected position must still be there.
+      const lineText = source.split("\n")[src.line - 1] ?? "";
+      if (!lineText.toLowerCase().includes(`<${selected.tag.toLowerCase()}`)) {
+        push({
+          role: "assistant",
+          error: true,
+          text: "The file changed since you selected this element, so the selection is out of date. Re-select it on the canvas and try again.",
+        });
+        return;
+      }
+      const reply = parseChatReply(
+        await runChatPrompt(
+          backend,
+          buildEditPrompt(src, selected, source, text),
+          history,
+        ),
+      );
+
+      if (reply.kind === "answer") {
+        push({ role: "assistant", text: reply.text });
+        return;
+      }
+      const next =
+        reply.kind === "blocks"
+          ? applyEditBlocks(source, reply.blocks)
+          : reply.content;
+
+      // Trust gate: the sidecar re-parses the model's output and refuses
+      // anything that doesn't parse; the write never lands on a user branch.
+      const res = await writeSource(project.root, src.file, next);
+      if (!res.ok) throw new Error(res.error ?? `write failed for ${src.file}`);
+      if (!res.changed) {
+        push({
+          role: "assistant",
+          text: "No change needed — the file already matches that instruction.",
+        });
+        return;
+      }
+
+      const [branch, hash] = await commitSession(
+        project.root,
+        `dedup: ${reply.summary}`,
+        [src.file],
+      );
+      push({ role: "assistant", text: reply.summary, commit: hash });
+      set({ lastSave: { branch, hash } });
+      gitStatus(project.root)
+        .then((g) => set({ git: g }))
+        .catch(() => {});
+      // Reload the canvas rather than trusting HMR (its socket can wedge),
+      // and drop the selection — the edit may have shifted every position in
+      // the file, so the old id can't be trusted for a follow-up.
+      sendToOverlay({ type: "reload" });
+      set({ selected: null, sourceInfo: null });
+    } catch (e) {
+      push({
+        role: "assistant",
+        error: true,
+        text: String(e instanceof Error ? e.message : e),
+      });
+    } finally {
+      set({ chatBusy: false });
+    }
+  },
+
+  newChatSession: () => set({ activeChatId: null }),
+
+  selectChatSession: (activeChatId) => set({ activeChatId }),
+
+  deleteChatSession: (id) => {
+    const { chatSessions, activeChatId, project } = get();
+    const remaining = chatSessions.filter((x) => x.id !== id);
+    if (project) saveChatSessions(project.root, remaining);
+    set({
+      chatSessions: remaining,
+      activeChatId:
+        activeChatId === id
+          ? (remaining[remaining.length - 1]?.id ?? null)
+          : activeChatId,
+    });
+  },
+
   runScan: async () => {
     const { project, scanning, devStatus } = get();
     if (!project || scanning) return;
@@ -729,6 +960,16 @@ export const useStore = create<AppState>((set, get) => ({
     set({ aiPref });
   },
 
+  setCcModel: (ccModel) => {
+    try {
+      if (ccModel) localStorage.setItem(CC_MODEL_STORAGE, ccModel);
+      else localStorage.removeItem(CC_MODEL_STORAGE);
+    } catch {
+      // In-memory choice still applies this session.
+    }
+    set({ ccModel });
+  },
+
   connectClaudeCode: async () => {
     if (get().ccConnecting) return;
     set({ ccConnecting: true, ccError: null });
@@ -741,7 +982,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       // Live round-trip proves the login works and is the explicit consent
       // moment — dedup never uses the subscription before this succeeds.
-      const reply = await claudeCodePrompt("Reply with exactly: ok");
+      const reply = await claudeCodePrompt("Reply with exactly: ok", get().ccModel);
       if (!/ok/i.test(reply)) {
         throw new Error(`unexpected reply from Claude Code: ${reply.slice(0, 80)}`);
       }
@@ -782,7 +1023,7 @@ export const useStore = create<AppState>((set, get) => ({
     const kind = get().activeAiBackend();
     const backend: AiBackend | null =
       kind === "claude-code"
-        ? { kind: "claude-code", run: claudeCodePrompt }
+        ? { kind: "claude-code", run: (p) => claudeCodePrompt(p, get().ccModel) }
         : kind === "api"
           ? { kind: "api", apiKey: anthropicKey }
           : null;

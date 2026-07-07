@@ -10,6 +10,7 @@
     "test:plugin": "node plugin-src/smoke.mjs",
     "test:scan": "node plugin-src/scan.test.mjs",
     "test:tw": "node --experimental-strip-types plugin-src/tailwind.test.mts",
+    "test:chat": "node --experimental-strip-types plugin-src/chatedits.test.mts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

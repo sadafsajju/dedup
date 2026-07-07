@@ -8,7 +8,8 @@ type OverlayCommand =
   | { type: "reset-class"; id: string; className?: string }
   | { type: "clear-staged" }
   | { type: "list-files" }
-  | { type: "set-mode"; mode: "inspect" | "browse" };
+  | { type: "set-mode"; mode: "inspect" | "browse" }
+  | { type: "reload" };
 
 let iframe: HTMLIFrameElement | null = null;
 

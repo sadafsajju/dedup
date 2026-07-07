@@ -116,6 +116,27 @@ export interface SelectedElement extends ElementRef {
   ancestry: ElementRef[];
 }
 
+/** One chat conversation, persisted per project (localStorage). */
+export interface ChatSession {
+  id: string;
+  /** First instruction, truncated — the label in the session switcher. */
+  title: string;
+  createdAt: number;
+  messages: ChatMessage[];
+}
+
+/** One inspector-chat message (AI edits). */
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  /** The element the instruction targeted (on user messages). */
+  target?: { label: string; file: string };
+  /** Short commit hash when this reply applied an edit. */
+  commit?: string;
+  error?: boolean;
+}
+
 /** Parse a dedupId back into its parts. */
 export function parseDedupId(
   id: string,

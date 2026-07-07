@@ -222,4 +222,37 @@ test("wb: refuses unsafe class strings and dynamic targets", () => {
   assert.match(fs.readFileSync(file, "utf8"), /className=\{c\}/);
 });
 
+test("wb: writeFile replaces the whole file when content parses", () => {
+  const file = fixture(
+    "G.tsx",
+    `export const G = () => <div>old</div>;\n`,
+  );
+  const next = `export const G = () => (\n  <div className="p-4">new</div>\n);\n`;
+  const r = runWb({ cmd: "writeFile", file, content: next });
+  assert.deepEqual({ ok: r.ok, changed: r.changed }, { ok: true, changed: true });
+  assert.equal(fs.readFileSync(file, "utf8"), next);
+});
+
+test("wb: writeFile refuses content that does not parse", () => {
+  const before = `export const H = () => <div>x</div>;\n`;
+  const file = fixture("H.tsx", before);
+  const r = runWb({
+    cmd: "writeFile",
+    file,
+    content: `export const H = () => <div>x</div;\n`, // broken JSX
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /does not parse/);
+  assert.equal(fs.readFileSync(file, "utf8"), before); // untouched
+});
+
+test("wb: writeFile refuses empty content and reports no-op writes", () => {
+  const before = `export const I = () => <p>x</p>;\n`;
+  const file = fixture("I.tsx", before);
+  const empty = runWb({ cmd: "writeFile", file, content: "  \n" });
+  assert.equal(empty.ok, false);
+  const same = runWb({ cmd: "writeFile", file, content: before });
+  assert.deepEqual({ ok: same.ok, changed: same.changed }, { ok: true, changed: false });
+});
+
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

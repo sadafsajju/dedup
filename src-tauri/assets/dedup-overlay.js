@@ -410,6 +410,11 @@
         }
       }
       stagedClasses.clear();
+    } else if (m.type === "reload") {
+      // Full-page refresh after an AI chat edit: guarantees the canvas shows
+      // the committed source (HMR sockets can wedge) and re-stamps every
+      // data-dedup-id, since positions may have shifted.
+      location.reload();
     }
   });
 

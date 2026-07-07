@@ -143,6 +143,29 @@ function inspect({ file, line, col }) {
   };
 }
 
+// Full-file replacement (AI chat edits). The content is model output, so the
+// gate is strict: parse WITHOUT error recovery — any syntax error aborts the
+// write. The old content is returned so the caller can diff/undo.
+function writeFile({ file, content }) {
+  if (typeof content !== "string" || content.trim() === "") {
+    return { ok: false, error: "refusing to write empty content" };
+  }
+  try {
+    parse(content, {
+      sourceType: "module",
+      plugins: ["jsx", "typescript", "decorators-legacy"],
+    });
+  } catch (e) {
+    return { ok: false, error: `new content does not parse, aborted: ${e.message}` };
+  }
+  const previous = fs.readFileSync(file, "utf8");
+  if (previous === content) {
+    return { ok: true, changed: false };
+  }
+  fs.writeFileSync(file, content);
+  return { ok: true, changed: true };
+}
+
 function write({ file, edits }) {
   const code = fs.readFileSync(file, "utf8");
   const ast = parseSource(code);
@@ -201,6 +224,7 @@ process.stdin.on("end", () => {
     const req = JSON.parse(input);
     if (req.cmd === "inspect") result = inspect(req);
     else if (req.cmd === "write") result = write(req);
+    else if (req.cmd === "writeFile") result = writeFile(req);
     else result = { ok: false, error: `unknown cmd: ${req.cmd}` };
   } catch (e) {
     result = { ok: false, error: String(e?.message ?? e) };

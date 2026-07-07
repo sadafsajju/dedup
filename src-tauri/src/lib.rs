@@ -130,6 +130,28 @@ fn write_classes(
     sidecar::write(&root, &file, &edits)
 }
 
+/// Read one project source file (AI chat context). Path is resolved inside
+/// the project root — anything escaping it is refused.
+#[tauri::command]
+fn read_source(root: String, file: String) -> Result<String, String> {
+    let path = sidecar::resolve_in_root(&root, &file)?;
+    std::fs::read_to_string(&path).map_err(|e| format!("read {file}: {e}"))
+}
+
+/// Replace one source file with AI-produced content. The sidecar re-parses
+/// the content and refuses anything that doesn't parse — same trust gate as
+/// class write-back. Returns `{ ok, changed }`.
+#[tauri::command]
+async fn write_source(
+    root: String,
+    file: String,
+    content: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || sidecar::write_file(&root, &file, &content))
+        .await
+        .map_err(|e| format!("write task failed: {e}"))?
+}
+
 /// Duplicate scan (FR-5.1/5.2): inventory + structural clustering. `files`
 /// (relative paths) scopes clustering to the current canvas page; None scans
 /// the whole project. Progress arrives as `scan://progress` events; the
@@ -159,10 +181,11 @@ fn claude_code_available() -> bool {
     ai::available()
 }
 
-/// One headless prompt through the user's Claude Code install.
+/// One headless prompt through the user's Claude Code install. `model` picks
+/// the CLI model ("sonnet", "opus", …); None uses the CLI default.
 #[tauri::command]
-async fn claude_code_prompt(prompt: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || ai::prompt(&prompt))
+async fn claude_code_prompt(prompt: String, model: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ai::prompt(&prompt, model.as_deref()))
         .await
         .map_err(|e| format!("claude task failed: {e}"))?
 }
@@ -220,6 +243,8 @@ pub fn run() {
             dev_server_running,
             inspect_element,
             write_classes,
+            read_source,
+            write_source,
             scan_project,
             load_scan_result,
             load_categories,
