@@ -209,6 +209,83 @@ pub enum NextStatus {
     Unavailable { reason: String },
 }
 
+/// How to start this Next project's dev server under webpack.
+///
+/// Forwarding `--webpack` through the package manager (`yarn dev --webpack`)
+/// only works when the script sets no bundler flag of its own. A script that
+/// already says `--turbopack` gets *both*, and Next refuses to start:
+/// "Multiple bundler flags set". The flag has to replace theirs, and it can't
+/// do that from the outside — so dedup runs `next` itself.
+///
+/// Only a script it can read confidently: optional `KEY=value` prefixes, then
+/// `next dev`, then flags. That covers the real-world shape (a `NODE_OPTIONS`
+/// heap bump in front of `next dev --turbopack`) and refuses anything with
+/// shell operators rather than rewriting a command it does not understand —
+/// the same conservatism the Vite path uses.
+pub struct NextLaunch {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    /// Env assignments lifted off the front of the script, so whatever it set
+    /// up (a heap limit a big app needs to not OOM) still applies.
+    pub env: Vec<(String, String)>,
+}
+
+const BUNDLER_FLAGS: [&str; 3] = ["--turbopack", "--turbo", "--webpack"];
+
+pub fn next_webpack_launch(root: &str, dev_script: Option<&str>) -> Option<NextLaunch> {
+    let script = dev_script?.trim();
+    // Anything that chains, pipes or substitutes is a command we cannot claim
+    // to understand well enough to rewrite.
+    if ["&&", "||", ";", "|", "$(", "`", ">", "<"]
+        .iter()
+        .any(|op| script.contains(op))
+    {
+        return None;
+    }
+
+    let bin = Path::new(root).join("node_modules/.bin/next");
+    if !bin.exists() {
+        return None;
+    }
+
+    let mut env = Vec::new();
+    let mut tokens = script.split_whitespace().peekable();
+    while let Some(token) = tokens.peek() {
+        // `KEY=value` before the command is an env assignment, not an argument.
+        let Some((key, value)) = token.split_once('=') else { break };
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || key.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            break;
+        }
+        env.push((key.to_string(), value.trim_matches(['"', '\'']).to_string()));
+        tokens.next();
+    }
+
+    // The command itself must be `next` (possibly `npx next`, which we skip).
+    let mut command = tokens.next()?;
+    if command == "npx" || command == "bunx" {
+        command = tokens.next()?;
+    }
+    if !(command == "next" || command.ends_with("/next")) {
+        return None;
+    }
+
+    let mut args: Vec<String> = vec!["dev".into()];
+    for token in tokens {
+        if token == "dev" || BUNDLER_FLAGS.contains(&token) {
+            continue; // their bundler choice is the thing being replaced
+        }
+        args.push(token.to_string());
+    }
+    args.push("--webpack".into());
+
+    Some(NextLaunch { program: bin, args, env })
+}
+
 /// Why this project's dev server won't run dedup's webpack hook, or None.
 ///
 /// Two ways a project ends up on Turbopack: the flag on its dev script, and
@@ -475,6 +552,59 @@ mod next_tests {
         match inspect_next_config(root) {
             NextStatus::Wired { needs_webpack, .. } => assert!(needs_webpack),
             other => panic!("expected Wired, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: appending `--webpack` to a script that already says
+    /// `--turbopack` makes Next refuse to start ("Multiple bundler flags
+    /// set"). The flag must replace theirs, which means running `next`
+    /// ourselves — while keeping the env their script set up.
+    #[test]
+    fn webpack_launch_replaces_their_bundler_flag_and_keeps_env() {
+        let dir = std::env::temp_dir().join(format!("dedup-nextlaunch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("node_modules/.bin")).unwrap();
+        std::fs::write(dir.join("node_modules/.bin/next"), "#!/bin/sh\n").unwrap();
+        let root = dir.to_str().unwrap();
+
+        // The real script from the project this was found on.
+        let launch = next_webpack_launch(
+            root,
+            Some("NODE_OPTIONS=--max-old-space-size=8192 next dev --turbopack"),
+        )
+        .expect("should rewrite");
+        assert!(launch.program.ends_with("node_modules/.bin/next"));
+        assert_eq!(
+            launch.args,
+            vec!["dev", "--webpack"],
+            "their --turbopack must be dropped, not joined"
+        );
+        assert_eq!(
+            launch.env,
+            vec![("NODE_OPTIONS".to_string(), "--max-old-space-size=8192".to_string())],
+            "dropping the heap bump would reintroduce the OOM it was added for"
+        );
+
+        // Other flags on the script survive.
+        let ported = next_webpack_launch(root, Some("next dev --port 4000 --turbo")).unwrap();
+        assert_eq!(ported.args, vec!["dev", "--port", "4000", "--webpack"]);
+
+        // No flag of their own: still a clean single --webpack.
+        let plain = next_webpack_launch(root, Some("next dev")).unwrap();
+        assert_eq!(plain.args, vec!["dev", "--webpack"]);
+
+        // Scripts dedup can't confidently read are refused, not mangled.
+        for script in [
+            "rm -rf .next && next dev",
+            "next dev | tee log",
+            "node server.js",
+            "concurrently \"next dev\" \"tsc -w\"",
+        ] {
+            assert!(
+                next_webpack_launch(root, Some(script)).is_none(),
+                "should refuse: {script}"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

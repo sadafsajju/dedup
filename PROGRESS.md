@@ -1055,6 +1055,18 @@ project's own script rather than replacing it — that project's script carries
 `NODE_OPTIONS=--max-old-space-size=8192` for a documented OOM, and a direct
 `next dev` would have dropped it.
 
+**Correction, from first real use: appending the flag doesn't work either.**
+Forwarding `--webpack` through the package manager only works when the script
+sets no bundler flag of its own. This one says `--turbopack`, so Next received
+both and refused to start — "Multiple bundler flags set". The flag has to
+*replace* theirs, which cannot be done from outside the script, so dedup now
+runs `next` itself: it reads the script's leading `KEY=value` assignments into
+the child's env, drops any bundler flag, keeps every other argument, and adds
+`--webpack`. A script with shell operators (`&&`, a pipe, a wrapper like
+`concurrently`) is refused rather than rewritten, and dedup says tagging is off
+instead of starting a server that tags nothing — the same conservatism the Vite
+launch rewrite uses. The regression test drives the exact failing script.
+
 **What the run proved.** With the wrapper in place: dev server ready in 930ms,
 **346 tagged elements** in the SSR HTML with correct `file@ordinal` ids,
 component names, and the capability markers the overlay gates gestures on (17

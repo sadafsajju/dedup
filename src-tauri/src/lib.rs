@@ -94,26 +94,56 @@ fn start_dev_server(
         // is inert without DEDUP_TAGGING, so setting it here is what turns
         // tagging on for dedup's dev server and nobody else's.
         match instrument::next_status(&root) {
-            instrument::NextStatus::Wired { needs_webpack, .. } => (
-                devserver::Launch {
-                    // Turbopack never runs the webpack hook dedup tags
-                    // through, so a Turbopack project is launched under
-                    // webpack. The flag goes *through* the project's own dev
-                    // script rather than replacing it, so whatever the script
-                    // sets up (NODE_OPTIONS for a big app's heap, env files)
-                    // still applies.
-                    exec: ExecSpec::Script(
-                        package_manager,
-                        if needs_webpack { vec!["--webpack".into()] } else { Vec::new() },
+            instrument::NextStatus::Wired { needs_webpack, .. } => {
+                // Turbopack never runs the webpack hook dedup tags through, so
+                // a Turbopack project is launched under webpack. The flag has
+                // to *replace* the script's own bundler flag, not join it —
+                // Next refuses to start with both — so dedup runs `next`
+                // directly, carrying the env the script set up.
+                let direct = needs_webpack
+                    .then(|| instrument::next_webpack_launch(&root, dev_script.as_deref()))
+                    .flatten();
+                match direct {
+                    Some(launch) => (
+                        devserver::Launch {
+                            exec: ExecSpec::Direct {
+                                program: launch.program,
+                                args: launch.args,
+                            },
+                            env: launch
+                                .env
+                                .into_iter()
+                                .chain([("DEDUP_TAGGING".to_string(), "1".to_string())])
+                                .collect(),
+                        },
+                        InstrumentationEvent {
+                            active: true,
+                            mode: "tagged",
+                            detail: Some("webpack".to_string()),
+                        },
                     ),
-                    env: vec![("DEDUP_TAGGING".into(), "1".into())],
-                },
-                InstrumentationEvent {
-                    active: true,
-                    mode: "tagged",
-                    detail: needs_webpack.then(|| "webpack".to_string()),
-                },
-            ),
+                    // Needs webpack but the dev script is too custom to
+                    // rewrite: run it as written and say inspection is off,
+                    // rather than start a server that tags nothing.
+                    None if needs_webpack => (
+                        ExecSpec::Script(package_manager, Vec::new()).into(),
+                        InstrumentationEvent {
+                            active: false,
+                            mode: "framework",
+                            detail: Some(
+                                "Next.js on Turbopack — dedup couldn't rewrite this dev script to run webpack, so element tagging is off. Set a custom dev command with `--webpack`".into(),
+                            ),
+                        },
+                    ),
+                    None => (
+                        devserver::Launch {
+                            exec: ExecSpec::Script(package_manager, Vec::new()),
+                            env: vec![("DEDUP_TAGGING".into(), "1".into())],
+                        },
+                        InstrumentationEvent { active: true, mode: "tagged", detail: None },
+                    ),
+                }
+            }
             instrument::NextStatus::Offered { config, .. } => (
                 ExecSpec::Script(package_manager, Vec::new()).into(),
                 InstrumentationEvent {

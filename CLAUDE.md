@@ -137,8 +137,11 @@ cargo test              # from src-tauri/ — all Rust tests
   Next has no `--config` flag. Two things that only showed up on a real app —
   a TypeScript config under `strict` needs the shipped `next.d.mts` or dedup's
   own line fails dedup's typecheck gate, and Turbopack never runs `webpack()`,
-  so dedup launches the dev server with `--webpack` *through* the project's
-  own script (replacing the script would drop whatever env it sets). That is offered with its diff, committed on the
+  so dedup runs `next` directly under `--webpack`. It cannot *append* the flag
+  through the package manager: a script that already says `--turbopack` then
+  gets both and Next refuses to start. The rewrite lifts the script's
+  `KEY=value` prefixes into the child env (dropping them reintroduces the OOM
+  a heap bump was added for) and refuses any script with shell operators. That is offered with its diff, committed on the
   session branch and undoable — and the wrapper is inert without
   `DEDUP_TAGGING=1`, so it changes nothing about the user's own `next dev`,
   CI or production build. The convention forbids *silent* mutation; this is
