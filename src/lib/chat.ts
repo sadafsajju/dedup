@@ -31,8 +31,9 @@ the replacement lines
 
 export interface ChatEditTarget {
   file: string;
+  /** Live line of the element's opening tag, from the write-back's inspect
+   * (0 when unknown — the prompt just omits the line hint then). */
   line: number;
-  col: number;
 }
 
 export function buildEditPrompt(
@@ -44,10 +45,13 @@ export function buildEditPrompt(
   const name = selected.component
     ? `<${selected.tag}> inside component ${selected.component}`
     : `<${selected.tag}>`;
-  const lineText = source.split("\n")[target.line - 1]?.trim() ?? "";
+  const lineText =
+    target.line > 0 ? (source.split("\n")[target.line - 1]?.trim() ?? "") : "";
   return [
     `File: ${target.file}`,
-    `Selected element: ${name}, at line ${target.line} (the JSX opening tag starts there).`,
+    target.line > 0
+      ? `Selected element: ${name}, at line ${target.line} (the JSX opening tag starts there).`
+      : `Selected element: ${name}.`,
     lineText ? `That line reads: ${lineText}` : null,
     selected.instanceCount > 1
       ? `Note: this source element renders ${selected.instanceCount} DOM instances (e.g. a .map() loop) — the edit affects all of them.`

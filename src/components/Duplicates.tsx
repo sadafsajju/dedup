@@ -3,8 +3,13 @@
 // JSX skeletons with per-line agreement highlighting and the class-token diff.
 import { useMemo } from "react";
 import { rankClusters, useStore } from "../lib/store";
+import { combinedConfidence, visualNote } from "../lib/visualPass";
 import type { ScanCluster, ScanMember } from "../lib/types";
-import { DuplicatesIcon, WarnIcon, XIcon } from "./icons";
+import {
+  CopyIcon,
+  Cross2Icon,
+  ExclamationTriangleIcon,
+} from "@radix-ui/react-icons";
 
 /** AI status strip: categorization runs automatically as part of Scan;
  * the backend is chosen in the TopBar AI switch. Status + retry only. */
@@ -52,6 +57,102 @@ function CategorizeControls() {
   );
 }
 
+/**
+ * Starts the guarded merge (FR-5.4). Disabled without an AI backend, because
+ * designing the canonical component is the one part of a merge that is not
+ * mechanical — and saying so beats a button that fails when pressed.
+ */
+function MergeButton({ clusterId }: { clusterId: string }) {
+  const startMerge = useStore((s) => s.startMerge);
+  const backend = useStore((s) => s.activeAiBackend());
+  const busy = useStore((s) => s.merge !== null);
+  const disabled = !backend || busy;
+  return (
+    <button
+      disabled={disabled}
+      onClick={() => void startMerge(clusterId)}
+      className={`rounded-md px-2.5 py-1 text-2xs ${
+        disabled
+          ? "bg-surface-2 text-ink-faint cursor-not-allowed"
+          : "bg-accent text-white hover:brightness-110"
+      }`}
+      title={
+        !backend
+          ? "A merge proposal needs an AI backend — connect one via the AI switch in the top bar"
+          : busy
+            ? "Finish the merge already in progress first"
+            : "Propose a canonical component, review the diff, then merge behind the safety gates"
+      }
+    >
+      Merge…
+    </button>
+  );
+}
+
+/**
+ * The visual signal is opt-in per scan, and says so. It has to render every
+ * cluster member in isolation and screenshot it, which takes seconds and needs
+ * the Components tab on screen — so it runs when asked, not behind the user's
+ * back during a scan.
+ */
+function VisualPassControls() {
+  const run = useStore((s) => s.runVisualPass);
+  const cancel = useStore((s) => s.cancelVisualPass);
+  const progress = useStore((s) => s.visualPass);
+  const scored = useStore((s) => Object.keys(s.visualScores).length);
+  const dismissed = useStore((s) => s.dismissed);
+  const result = useStore((s) => s.scanResult);
+  const clusterCount = useMemo(
+    () => rankClusters(result, dismissed).length,
+    [result, dismissed],
+  );
+
+  if (clusterCount === 0) return null;
+
+  return (
+    <div className="px-3 py-1.5 border-b border-line flex items-center gap-2 text-2xs">
+      {progress ? (
+        <>
+          <span className="text-accent">
+            Rendering previews {progress.done}/{progress.total || "…"}
+          </span>
+          <span className="flex-1" />
+          <button onClick={cancel} className="text-ink-dim hover:text-ink">
+            Stop
+          </button>
+        </>
+      ) : scored > 0 ? (
+        <>
+          <span className="text-ink-faint">
+            Visual signal on {scored} cluster{scored === 1 ? "" : "s"}
+          </span>
+          <span className="flex-1" />
+          <button
+            onClick={() => void run()}
+            className="text-accent hover:underline"
+          >
+            Re-check
+          </button>
+        </>
+      ) : (
+        <>
+          <span className="text-ink-dim">
+            Confidence is structural so far.
+          </span>
+          <span className="flex-1" />
+          <button
+            onClick={() => void run()}
+            className="text-accent hover:underline"
+            title="Render each member in isolation and compare the pixels — opens the Components tab"
+          >
+            Compare renders
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function confidencePct(c: number) {
   return `${Math.round(c * 100)}%`;
 }
@@ -75,9 +176,10 @@ export function DuplicatesTab() {
   const runScan = useStore((s) => s.runScan);
   const openCluster = useStore((s) => s.openCluster);
   const dismissed = useStore((s) => s.dismissed);
+  const visualScores = useStore((s) => s.visualScores);
   const clusters = useMemo(
-    () => rankClusters(result, dismissed),
-    [result, dismissed],
+    () => rankClusters(result, dismissed, visualScores),
+    [result, dismissed, visualScores],
   );
   const dismissedCount = result
     ? result.clusters.length - clusters.length
@@ -90,7 +192,7 @@ export function DuplicatesTab() {
         : null;
     return (
       <div className="flex-1 flex flex-col items-center justify-center px-6 text-center gap-2">
-        <DuplicatesIcon size={22} className="text-ink-faint animate-pulse" />
+        <CopyIcon width={22} height={22} className="text-ink-faint animate-pulse" />
         <div className="text-2xs text-ink-dim">
           {progress?.stage === "similarity" ? "Comparing components" : "Reading components"}
           {pct !== null && ` · ${pct}%`}
@@ -102,7 +204,7 @@ export function DuplicatesTab() {
   if (error) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center px-6 text-center gap-2">
-        <WarnIcon size={20} className="text-danger" />
+        <ExclamationTriangleIcon width={20} height={20} className="text-danger" />
         <div className="text-2xs text-ink-dim break-all">{error}</div>
         <button
           onClick={runScan}
@@ -117,10 +219,10 @@ export function DuplicatesTab() {
   if (!result) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center px-6 text-center gap-2">
-        <DuplicatesIcon size={22} className="text-ink-faint" />
+        <CopyIcon width={22} height={22} className="text-ink-faint" />
         <div className="text-2xs text-ink-dim">
-          Scan finds near-duplicates among the components on the current
-          canvas page.
+          Select an artboard on the canvas (click its name), then scan it for
+          near-duplicate components.
         </div>
         <button
           onClick={runScan}
@@ -137,7 +239,7 @@ export function DuplicatesTab() {
       <div className="px-3 py-2 text-2xs text-ink-faint border-b border-line">
         <span className="text-ink-dim">
           {result.scopedFiles !== null
-            ? `Current page · ${result.scopedFiles} file${result.scopedFiles === 1 ? "" : "s"}`
+            ? `Selected artboard · ${result.scopedFiles} file${result.scopedFiles === 1 ? "" : "s"}`
             : "Whole project"}
         </span>
         {" · "}
@@ -147,6 +249,7 @@ export function DuplicatesTab() {
         {age(result.scannedAt) && ` · ${age(result.scannedAt)}`}
       </div>
       <CategorizeControls />
+      <VisualPassControls />
       {clusters.length === 0 ? (
         <div className="flex-1 flex items-center justify-center px-6 text-center text-2xs text-ink-dim">
           No duplicate clusters found.
@@ -163,8 +266,15 @@ export function DuplicatesTab() {
                 <span className="text-2xs text-ink truncate flex-1">
                   {c.members.map((m) => m.name).join(" · ")}
                 </span>
-                <span className="text-2xs text-positive tabular-nums shrink-0">
-                  {confidencePct(c.confidence)}
+                <span
+                  className="text-2xs text-positive tabular-nums shrink-0"
+                  title={
+                    visualScores[c.id]
+                      ? "Structural, class and visual signals combined"
+                      : "Structural and class signals (run the visual pass for the third)"
+                  }
+                >
+                  {confidencePct(combinedConfidence(c.confidence, visualScores[c.id]))}
                 </span>
               </div>
               <div className="text-2xs text-ink-faint mt-0.5">
@@ -219,7 +329,7 @@ function MemberCard({
           className="text-ink-faint hover:text-ink"
           title="Remove from cluster"
         >
-          <XIcon size={12} />
+          <Cross2Icon width={12} height={12} />
         </button>
       </div>
       <div className="px-3 py-1.5 text-2xs font-mono text-ink-faint truncate border-b border-line">
@@ -263,7 +373,11 @@ export function ClusterReview() {
   const cluster = useStore((s) =>
     s.scanResult?.clusters.find((c) => c.id === s.openClusterId),
   );
+  const visual = useStore((s) =>
+    s.openClusterId ? s.visualScores[s.openClusterId] : undefined,
+  );
   if (!openClusterId || !cluster) return null;
+  const note = visualNote(visual);
 
   const shared = commonLines(cluster.members);
   const sharedClasses = new Set(
@@ -274,20 +388,20 @@ export function ClusterReview() {
 
   return (
     <div
-      className="absolute inset-0 z-40 flex items-center justify-center bg-black/50 p-8"
+      className="absolute inset-0 z-40 flex items-center justify-center bg-black/45 backdrop-blur-[2px] p-8"
       onClick={() => openCluster(null)}
     >
       <div
-        className="w-full max-w-5xl max-h-full flex flex-col rounded-xl border border-line bg-surface-0 shadow-2xl"
+        className="panel w-full max-w-5xl max-h-full flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-3 px-4 py-3 border-b border-line">
-          <DuplicatesIcon size={16} className="text-ink-dim" />
+          <CopyIcon width={16} height={16} className="text-ink-dim" />
           <span className="text-sm font-medium truncate">
             {cluster.members.map((m) => m.name).join(" · ")}
           </span>
           <span className="text-2xs text-positive tabular-nums">
-            {confidencePct(cluster.confidence)} match
+            {confidencePct(combinedConfidence(cluster.confidence, visual))} match
           </span>
           <span className="text-2xs text-ink-faint">
             {cluster.totalCallSites} call site
@@ -301,21 +415,28 @@ export function ClusterReview() {
           >
             Not duplicates
           </button>
-          <button
-            disabled
-            className="rounded-md px-2.5 py-1 text-2xs bg-surface-2 text-ink-faint cursor-not-allowed"
-            title="Guarded merge — Phase 4"
-          >
-            Merge…
-          </button>
+          <MergeButton clusterId={cluster.id} />
           <button
             onClick={() => openCluster(null)}
             className="text-ink-faint hover:text-ink ml-1"
           >
-            <XIcon size={14} />
+            <Cross2Icon width={14} height={14} />
           </button>
         </div>
         <div className="flex-1 min-h-0 overflow-auto p-4">
+          {/* The visual signal is allowed to disagree with the structural one,
+              and when it does the reviewer hears it before merging. */}
+          {note && (
+            <div
+              className={`mb-3 rounded-lg border px-3 py-2 text-2xs ${
+                visual?.score !== null && visual?.score !== undefined && visual.score < 0.75
+                  ? "border-warn/40 bg-warn/10 text-warn"
+                  : "border-line bg-surface-2 text-ink-dim"
+              }`}
+            >
+              {note}
+            </div>
+          )}
           <div className="flex gap-3 items-start">
             {cluster.members.map((m, i) => (
               <MemberCard
@@ -330,8 +451,7 @@ export function ClusterReview() {
           </div>
           <div className="mt-3 text-2xs text-ink-faint">
             <span className="text-warn">Amber</span> lines and classes differ
-            between members — the knobs a merge would turn into props. Rendered
-            previews land with the visual pass in Phase 5.
+            between members — the knobs a merge turns into props.
           </div>
         </div>
       </div>

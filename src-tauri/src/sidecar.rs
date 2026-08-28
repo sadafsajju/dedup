@@ -2,7 +2,6 @@
 //! Spawns `node node_modules/.dedup/dedup-writeback.mjs` with a JSON request
 //! on stdin and reads a JSON response from stdout.
 
-use serde::Deserialize;
 use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,13 +9,10 @@ use std::process::{Command, Stdio};
 
 const WRITEBACK_BUNDLE: &str = include_str!("../assets/dedup-writeback.mjs");
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClassEdit {
-    pub line: u32,
-    pub col: u32,
-    #[serde(rename = "className")]
-    pub class_name: String,
-}
+/// One operation in an edit program. The shape is validated on the JS side
+/// (it owns the AST); Rust passes it through untouched so a new op type needs
+/// no change here. Serde keeps it opaque on purpose.
+pub type EditOp = serde_json::Value;
 
 /// Resolve a dedupId's relative file path against the project root, refusing
 /// anything that escapes it.
@@ -34,12 +30,11 @@ pub fn resolve_in_root(root: &str, rel_file: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-pub fn inspect(root: &str, rel_file: &str, line: u32, col: u32) -> Result<serde_json::Value, String> {
+/// Node report for the element at ordinal `index` in `rel_file`: className
+/// editability, live line/col, and which structural edits it admits.
+pub fn inspect(root: &str, rel_file: &str, index: u32) -> Result<serde_json::Value, String> {
     let file = resolve_in_root(root, rel_file)?;
-    run(
-        root,
-        json!({ "cmd": "inspect", "file": file, "line": line, "col": col }),
-    )
+    run(root, json!({ "cmd": "inspect", "file": file, "index": index }))
 }
 
 /// Full-file replacement (AI chat edits) — the sidecar re-parses `content`
@@ -49,20 +44,19 @@ pub fn write_file(root: &str, rel_file: &str, content: &str) -> Result<serde_jso
     run(root, json!({ "cmd": "writeFile", "file": file, "content": content }))
 }
 
-pub fn write(root: &str, rel_file: &str, edits: &[ClassEdit]) -> Result<serde_json::Value, String> {
+/// Apply one file's edit program (class / text / insert / remove / move).
+/// All ops resolve against a single parse and land as one write, or none of
+/// them do — partial application of a program is never observable.
+pub fn apply(root: &str, rel_file: &str, ops: &[EditOp]) -> Result<serde_json::Value, String> {
     let file = resolve_in_root(root, rel_file)?;
-    let edits: Vec<_> = edits
-        .iter()
-        .map(|e| json!({ "line": e.line, "col": e.col, "className": e.class_name }))
-        .collect();
-    run(root, json!({ "cmd": "write", "file": file, "edits": edits }))
+    run(root, json!({ "cmd": "apply", "file": file, "ops": ops }))
 }
 
 fn run(root: &str, request: serde_json::Value) -> Result<serde_json::Value, String> {
     let script = ensure_bundle(root)?;
     let node = find_node()?;
 
-    let mut child = Command::new(node)
+    let mut child = crate::toolpath::apply(&mut Command::new(node))
         .arg(&script)
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -115,17 +109,8 @@ pub fn ensure_named_bundle(root: &str, name: &str, content: &str) -> Result<Path
 /// `node` from PATH, with the usual macOS install locations as fallbacks
 /// (GUI-launched apps get a minimal PATH).
 pub fn find_node() -> Result<PathBuf, String> {
-    if let Ok(out) = Command::new("node").arg("--version").output() {
-        if out.status.success() {
-            return Ok(PathBuf::from("node"));
-        }
-    }
-    for candidate in ["/opt/homebrew/bin/node", "/usr/local/bin/node"] {
-        if Path::new(candidate).exists() {
-            return Ok(PathBuf::from(candidate));
-        }
-    }
-    Err("node not found — dedup needs Node.js to edit source files".into())
+    crate::toolpath::which("node")
+        .ok_or_else(|| "node not found — dedup needs Node.js to edit source files".into())
 }
 
 #[cfg(test)]
@@ -157,24 +142,79 @@ mod tests {
         .unwrap();
         let root_str = root.to_str().unwrap();
 
-        let ins = inspect(root_str, "App.tsx", 1, 25).unwrap();
+        // Ordinal 0 is the first JSX element in the file — no position needed.
+        let ins = inspect(root_str, "App.tsx", 0).unwrap();
         assert_eq!(ins["ok"], true);
         assert_eq!(ins["editable"], true);
         assert_eq!(ins["className"], "p-4");
+        assert_eq!(ins["line"], 1, "inspect reports the live position");
+        assert_eq!(ins["core"], "root");
+        assert_eq!(ins["canRemove"], false, "a component root is not removable");
 
-        let res = write(
+        let res = apply(
             root_str,
             "App.tsx",
-            &[ClassEdit {
-                line: 1,
-                col: 25,
-                class_name: "p-6 flex".into(),
-            }],
+            &[json!({ "op": "class", "index": 0, "className": "p-6 flex" })],
         )
         .unwrap();
         assert_eq!(res["ok"], true, "write failed: {res}");
         let after = std::fs::read_to_string(root.join("App.tsx")).unwrap();
         assert!(after.contains("className=\"p-6 flex\""), "got: {after}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A structural program lands as one write, and a program with any
+    /// refused op writes nothing at all (PRD §6: no partial application).
+    #[test]
+    fn edit_program_is_all_or_nothing() {
+        let root = std::env::temp_dir().join(format!("dedup-scprog-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let before = concat!(
+            "export function App() {\n",
+            "  return (\n",
+            "    <div>\n",
+            "      <a className=\"one\">A</a>\n",
+            "      <b className=\"two\">B</b>\n",
+            "    </div>\n",
+            "  );\n",
+            "}\n"
+        );
+        std::fs::write(root.join("App.tsx"), before).unwrap();
+        let root_str = root.to_str().unwrap();
+
+        // <a> (#1) moves inside <b> (#2), and gets a class edit in the same
+        // program — the edit must travel with the moved subtree.
+        let ok = apply(
+            root_str,
+            "App.tsx",
+            &[
+                json!({ "op": "move", "index": 1, "target": 2, "position": "inside" }),
+                json!({ "op": "class", "index": 1, "className": "one moved" }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(ok["ok"], true, "program failed: {ok}");
+        let after = std::fs::read_to_string(root.join("App.tsx")).unwrap();
+        assert!(after.contains("<b className=\"two\">"), "got: {after}");
+        assert!(after.contains("<a className=\"one moved\">A</a>"), "got: {after}");
+        assert!(
+            after.find("<a").unwrap() > after.find("<b").unwrap(),
+            "the <a> should now live inside the <b>: {after}"
+        );
+
+        // A program containing one refused op writes nothing.
+        let snapshot = after.clone();
+        let refused = apply(
+            root_str,
+            "App.tsx",
+            &[
+                json!({ "op": "class", "index": 1, "className": "harmless" }),
+                json!({ "op": "remove", "index": 0 }), // component root
+            ],
+        )
+        .unwrap();
+        assert_eq!(refused["ok"], false, "root removal must be refused");
+        assert_eq!(std::fs::read_to_string(root.join("App.tsx")).unwrap(), snapshot);
         std::fs::remove_dir_all(&root).ok();
     }
 

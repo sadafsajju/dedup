@@ -28,8 +28,22 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
 native-tls = "0.2"
 tokio-native-tls = "0.3"
 
+# Launch-screen thumbnails are base64 data URLs over the IPC boundary.
+base64 = "0.22"
+# Decoding our own WKWebView snapshots for the visual gate + similarity pass
+# (see visual.rs) — pure Rust, so the comparison is testable off a real screen.
+png = "0.17"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# WKWebView self-snapshot for project thumbnails (see thumbs.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSDictionary", "NSError", "NSGeometry", "NSString", "NSValue"] }
+objc2-app-kit = { version = "0.3", features = ["NSBitmapImageRep", "NSGraphics", "NSImage", "NSImageRep"] }
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKSnapshotConfiguration", "block2", "objc2-app-kit"] }
 
 [dev-dependencies]
 rcgen = "0.13"

@@ -1,12 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { startDevServer, stopDevServer } from "../lib/api";
-import { registerCanvasIframe, sendToOverlay } from "../lib/bridge";
+import {
+  registerCanvasIframe,
+  routeOfWindow,
+  sendToFrame,
+  sendToOverlay,
+} from "../lib/bridge";
 import { Toolbar } from "./Toolbar";
-import { Artboards, FIELD_OFFSET } from "./Artboards";
-import { useStore } from "../lib/store";
+import { PAGE_GAP, useStore } from "../lib/store";
+
+/** Inset from a floating panel's outer edge to the artboards: the panel's own
+ * 12px margin plus a little air. */
+const CHROME_GUTTER = 24;
+/** Clears the floating top bar *and* the artboard's label above the frame. */
+const CHROME_TOP = 120;
+import { frameUrl, resolveOrigin } from "../lib/origins";
+import { PALETTE } from "../lib/palette";
 import { VIEWPORTS } from "../lib/types";
-import type { SelectedElement } from "../lib/types";
-import { RefreshIcon } from "./icons";
+import type { DropPosition, LayerNode, SelectedElement } from "../lib/types";
+import { ReloadIcon } from "@radix-ui/react-icons";
 
 /** Zoom about a point given in canvas-container coordinates, keeping the
  * point visually fixed (Figma semantics). */
@@ -21,6 +33,26 @@ function zoomAt(cx: number, cy: number, factor: number) {
   });
 }
 
+/**
+ * What the armed gesture is waiting for. Without it, "insert" mode is a lit
+ * toolbar button and nothing else — the canvas gives no sign that it is now
+ * waiting for a click, or that Esc backs out.
+ */
+function GestureHint() {
+  const draggingId = useStore((s) => s.draggingId);
+  const insertKind = useStore((s) => s.insertKind);
+  if (!draggingId && !insertKind) return null;
+  const label = draggingId
+    ? "Drop to move — release inside an element to re-parent it"
+    : `Click where the ${PALETTE[insertKind!].label.toLowerCase()} should go`;
+  return (
+    <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-30 rounded-full border border-line bg-surface-1/95 backdrop-blur px-3 py-1 text-2xs text-ink-dim shadow-lg select-none">
+      {label}
+      <span className="text-ink-faint"> · Esc to cancel</span>
+    </div>
+  );
+}
+
 export function Canvas() {
   const project = useStore((s) => s.project);
   const devStatus = useStore((s) => s.devStatus);
@@ -33,17 +65,31 @@ export function Canvas() {
   const toggleConsole = useStore((s) => s.toggleConsole);
   const setDevStatus = useStore((s) => s.setDevStatus);
 
-  const iframeRef = useRef<HTMLIFrameElement>(null);
   const viewport = VIEWPORTS.find((v) => v.id === viewportId)!;
-  const contentHeight = useStore((s) => s.contentHeight);
+  const routes = useStore((s) => s.routes);
+  const pageHeights = useStore((s) => s.pageHeights);
+  const pagePaths = useStore((s) => s.pagePaths);
+  const devAltUrl = useStore((s) => s.devAltUrl);
+  const frameOrigins = useStore((s) => s.frameOrigins);
+  const sessionModes = useStore((s) => s.sessionModes);
+  const heldRoutes = useStore((s) => s.heldRoutes);
 
-  // Frame shows the full page (Figma-style): at least the device height,
-  // grown to the page's natural height, sanity-capped for runaway layouts.
+  // Every discovered route is its own page artboard, Figma-style, in a row.
+  // Each frame shows its full page: at least the device height, grown to the
+  // page's reported natural height, sanity-capped for runaway layouts.
   const minHeight = viewport.height ?? 800;
-  const frameHeight = Math.min(Math.max(minHeight, contentHeight ?? 0), 12000);
+  const heightFor = (route: string) =>
+    Math.min(Math.max(minHeight, pageHeights[route] ?? 0), 12000);
+  const pageStep = viewport.width + PAGE_GAP;
+  // De-dupe cross-frame selection sync: broadcast each dedupId once.
+  const lastSelectRef = useRef<string | null>(null);
 
   const pageMeta = useStore((s) => s.pageMeta);
+  const mockSession = useStore((s) => s.sessionSeed?.enabled ?? false);
   const tool = useStore((s) => s.tool);
+  const editorTab = useStore((s) => s.editorTab);
+  const selectedRoute = useStore((s) => s.selectedRoute);
+  const setSelectedRoute = useStore((s) => s.setSelectedRoute);
   const containerRef = useRef<HTMLDivElement>(null);
   // Space-held hand tool + active drag (space-drag or middle-drag).
   const [spaceHeld, setSpaceHeld] = useState(false);
@@ -60,28 +106,137 @@ export function Canvas() {
       const m = e.data;
       if (!m || m.__dedup !== true) return;
       if (m.type === "selected") {
-        useStore.getState().setSelected(m.payload as SelectedElement);
+        const sel = m.payload as SelectedElement;
+        useStore.getState().setSelected(sel);
+        // Same source element can exist on several page artboards; broadcast
+        // so the holder frames highlight it and the rest drop stale boxes.
+        if (sel && sel.dedupId !== lastSelectRef.current) {
+          lastSelectRef.current = sel.dedupId;
+          sendToOverlay({ type: "select-id", id: sel.dedupId });
+        }
       } else if (m.type === "page-size") {
-        useStore.getState().setContentHeight(m.height as number);
+        // Height belongs to the frame that measured it, keyed by its route.
+        const route = routeOfWindow(e.source) ?? (m.path as string) ?? "/";
+        useStore.getState().setPageHeight(route, m.height as number);
+      } else if (m.type === "page-log") {
+        // Runtime output from inside the canvas iframe. Tagged so it reads as
+        // the app talking rather than the dev server, and so the build-error
+        // parser (which watches for vite/tsc patterns) leaves it alone.
+        const where = (m.path as string) || "/";
+        useStore
+          .getState()
+          .appendPageLog(`[page ${where}] ${m.text as string}`);
+      } else if (m.type === "layers") {
+        // Layer tree belongs to the frame that walked it, keyed by its route.
+        const route = routeOfWindow(e.source) ?? "/";
+        useStore.getState().setLayers(route, (m.layers as LayerNode[]) ?? []);
       } else if (m.type === "page-meta") {
-        useStore.getState().setPageMeta({
-          title: (m.title as string) ?? "",
-          path: (m.path as string) ?? "/",
-        });
+        const route = routeOfWindow(e.source);
+        const path = (m.path as string) ?? "/";
+        if (!route) return;
+        const s = useStore.getState();
+        // Live path per frame — labels show drift (auth-guard redirects).
+        s.setPagePath(route, path);
+        if (route === "/") {
+          s.setPageMeta({ title: (m.title as string) ?? "", path });
+        }
+        // Browse mode is the user driving their own app, so dedup stops
+        // steering: both reactions below would wreck a multi-step flow. A
+        // login wizard (phone → OTP), a checkout, any form that advances in
+        // steps navigates on its own schedule — and the gesture window below
+        // is 1.5s, far shorter than an SMS round-trip, so the step change
+        // reads as an app redirect and flips the frame to the guest origin.
+        // That swaps the iframe's src, which is a full reload, and anything
+        // the flow held in memory (Firebase's ConfirmationResult, for one) is
+        // gone — the user lands back on step one. The path is still tracked
+        // above, so labels stay honest; nothing here touches the frame.
+        if (s.tool === "browse") return;
+        // App-initiated redirect off a pinned route (auth guard): retry the
+        // frame on the guest origin — logged out there, so public pages the
+        // app guards against signed-in users render again. If the guest
+        // origin redirects too (the page truly needs auth), stay on the
+        // shared origin with the drift label and stop flipping.
+        if (path !== route && m.gesture !== true && route !== "/") {
+          const cur = s.frameOrigins[route] ?? "shared";
+          if (cur === "shared" && s.devAltUrl) s.setFrameOrigin(route, "alt");
+          else if (cur === "alt") s.setFrameOrigin(route, "stuck");
+        }
+        // User navigation to somewhere new: pin the destination as its own
+        // artboard and snap this frame back to its route. Redirects (no
+        // gesture) stay put — an auth guard would spawn/snap-back forever.
+        if (path !== route && m.gesture === true) {
+          const isNew = !s.routes.includes(path);
+          sendToFrame(route, { type: "navigate", path: route });
+          // Pin the destination as its own artboard and bring it into view
+          // (it lands at the row's end) — same path as a Pages-tab click.
+          if (isNew) s.focusRoute(path);
+        }
+      } else if (m.type === "drop") {
+        // A canvas drag finished on a valid target — stage the move.
+        const s = useStore.getState();
+        s.setDragging(null);
+        s.moveElement(
+          m.id as string,
+          m.to as string,
+          m.position as DropPosition,
+        );
+      } else if (m.type === "insert-at") {
+        const s = useStore.getState();
+        if (s.insertKind) {
+          s.insertElement(s.insertKind, m.id as string, m.position as DropPosition);
+        }
+      } else if (m.type === "text-edit-request") {
+        useStore.getState().requestTextEdit(m.id as string);
+      } else if (m.type === "text-input") {
+        // Typed on the canvas — staged exactly like a Content-field edit.
+        const s = useStore.getState();
+        if (s.selected?.dedupId === m.id) s.applyTextEdit(m.text as string);
+      } else if (m.type === "drag-start") {
+        useStore.getState().setDragging(m.id as string);
+      } else if (m.type === "drag-end") {
+        useStore.getState().setDragging(null);
+      } else if (m.type === "key") {
+        // The iframe has focus, so the editor's own window never saw this
+        // keystroke. Replay it as a real event and let the one keyboard
+        // handler in Editor decide what it means.
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: m.key as string,
+            metaKey: m.meta === true,
+            shiftKey: m.shift === true,
+            bubbles: true,
+          }),
+        );
       } else if (m.type === "overlay-ready") {
         // Fresh overlay (first load or full-reload HMR) defaults to inspect —
-        // re-assert the currently selected tool.
-        const { tool } = useStore.getState();
+        // re-assert the currently selected tool and re-apply staged edits it
+        // knows nothing about yet.
+        const { tool, viewportId, actions, insertKind } = useStore.getState();
         sendToOverlay({
           type: "set-mode",
           mode: tool === "browse" ? "browse" : "inspect",
         });
+        sendToOverlay({
+          type: "set-edit-mode",
+          drag: tool === "select",
+          insert: insertKind !== null,
+        });
+        if (actions.length > 0) useStore.getState().resyncCanvas();
+        // Device viewport height for the overlay's vh-freeze: after an HMR
+        // reload inside an already-grown frame, the overlay can't infer it
+        // from window.innerHeight.
+        const vp = VIEWPORTS.find((v) => v.id === viewportId)!;
+        sendToOverlay({ type: "set-viewport", height: vp.height ?? 800 });
       } else if (m.type === "wheel") {
         const s = useStore.getState();
         if (m.zoomMod) {
-          // Iframe-local coords → container coords: frame origin is at pan.
+          // Iframe-local coords → container coords: offset by the sending
+          // frame's slot in the pages row, then by pan.
+          const vp = VIEWPORTS.find((v) => v.id === s.viewportId)!;
+          const idx = Math.max(0, s.routes.indexOf(routeOfWindow(e.source) ?? "/"));
+          const frameX = idx * (vp.width + PAGE_GAP);
           zoomAt(
-            s.pan.x + (m.x as number) * s.zoom,
+            s.pan.x + (frameX + (m.x as number)) * s.zoom,
             s.pan.y + (m.y as number) * s.zoom,
             Math.exp(-(m.dy as number) * 0.01),
           );
@@ -163,26 +318,65 @@ export function Canvas() {
     };
   }, []);
 
+  // Probe for an alternate loopback origin to the same dev server ([::1] vs
+  // localhost vs 127.0.0.1). A different host spelling is a different origin —
+  // separate localStorage — so frames there stay logged out. That's what lets
+  // a public page pinned as an artboard survive the app's "already logged in"
+  // redirect after the user signs in on the shared origin.
+  useEffect(() => {
+    if (!devUrl) return;
+    let dead = false;
+    const base = new URL(devUrl);
+    const candidates = ["[::1]", "127.0.0.1"].filter((h) => h !== base.hostname);
+    (async () => {
+      for (const host of candidates) {
+        const alt = new URL(devUrl);
+        alt.hostname = host;
+        try {
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 1500);
+          await fetch(new URL("/__dedup/routes", alt), { signal: ctl.signal });
+          clearTimeout(timer);
+          if (!dead) useStore.getState().setDevAltUrl(alt.origin);
+          return;
+        } catch {
+          // unreachable on this loopback — try the next spelling
+        }
+      }
+    })();
+    return () => {
+      dead = true;
+    };
+  }, [devUrl]);
+
+  // Keep the overlay's vh-freeze in sync with the selected device viewport.
+  useEffect(() => {
+    if (!devUrl) return;
+    sendToOverlay({ type: "set-viewport", height: viewport.height ?? 800 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [devUrl, viewportId]);
+
   // Center the frame when the canvas first shows or the viewport changes.
+  //
+  // "Centre" means centred in the space the user can actually see: the canvas
+  // is full-bleed and the chrome floats on top of it, so centring on the raw
+  // container would park the artboard's label under the top bar and its left
+  // edge under the sidebar.
   useEffect(() => {
     const el = containerRef.current;
     if (!el || !devUrl) return;
     const { width } = el.getBoundingClientRect();
     const z = useStore.getState().zoom;
-    setPan({ x: Math.max((width - viewport.width * z) / 2, 24), y: 40 });
+    const { sidebar, inspector } = useStore.getState().panelWidths;
+    const left = sidebar + CHROME_GUTTER;
+    const right = inspector + CHROME_GUTTER;
+    const free = Math.max(width - left - right, 0);
+    setPan({
+      x: Math.max(left + (free - viewport.width * z) / 2, left),
+      y: CHROME_TOP,
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [devUrl, viewportId]);
-
-  // A FRESH scan just landed → bring the artboard field into view. Restored
-  // scans (project reopen) render in place without yanking the canvas.
-  const scanSeq = useStore((s) => s.scanSeq);
-  useEffect(() => {
-    if (scanSeq === 0) return;
-    const s = useStore.getState();
-    if (!s.scanResult || s.scanResult.gallery.length === 0) return;
-    setPan({ x: -(viewport.width + FIELD_OFFSET) * s.zoom + 80, y: 64 });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scanSeq]);
 
   function startDrag(e: React.PointerEvent<HTMLElement>) {
     dragRef.current = { x: e.clientX, y: e.clientY };
@@ -241,7 +435,12 @@ export function Canvas() {
   return (
     <div
       ref={containerRef}
-      className="flex-1 min-w-0 relative overflow-hidden bg-surface-0"
+      data-canvas-root
+      // Hidden (not unmounted) on the Components tab: unmounting would
+      // reload the app frames and drop live state + staged class previews.
+      className={`flex-1 min-w-0 relative overflow-hidden bg-surface-0 ${
+        editorTab === "canvas" ? "" : "hidden"
+      }`}
       style={{
         backgroundImage:
           "radial-gradient(circle, var(--color-line) 1px, transparent 1px)",
@@ -279,7 +478,7 @@ export function Canvas() {
               onClick={restart}
               className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-2xs bg-accent text-white hover:brightness-110"
             >
-              <RefreshIcon size={13} /> Restart
+              <ReloadIcon width={13} height={13} /> Restart
             </button>
           </div>
         </CenteredPanel>
@@ -317,29 +516,86 @@ export function Canvas() {
               a custom dev command that serves plain HTTP.
             </div>
           )}
-          {/* Frame label (Figma artboard name): pans with the frame but keeps
-              constant size — positioned in container space, not scaled. */}
-          <div
-            className="absolute flex items-baseline gap-1.5 text-2xs select-none pointer-events-none"
-            style={{
-              left: pan.x,
-              top: pan.y - 22,
-              maxWidth: Math.max(viewport.width * zoom, 160),
-            }}
-          >
-            <span className="text-ink-dim truncate">
-              {pageMeta?.title || project?.name || "Page"}
-            </span>
-            {pageMeta && pageMeta.path !== "/" && (
-              <span className="text-ink-faint font-mono truncate shrink-0">
-                {pageMeta.path}
+          {/* Frame labels (Figma artboard names): pan with their frame but
+              keep constant size — positioned in container space, not scaled.
+              Clicking one selects the artboard — the scan's scope. */}
+          {routes.map((route, i) => (
+            <div
+              key={route}
+              className="absolute flex items-baseline gap-1.5 text-2xs select-none cursor-pointer"
+              style={{
+                left: pan.x + i * pageStep * zoom,
+                top: pan.y - 22,
+                maxWidth: Math.max(viewport.width * zoom, 160),
+              }}
+              onClick={() =>
+                setSelectedRoute(selectedRoute === route ? null : route)
+              }
+              title={
+                selectedRoute === route
+                  ? "Selected — Scan targets this artboard"
+                  : "Select this artboard to scan it"
+              }
+            >
+              <span
+                className={`truncate ${
+                  selectedRoute === route
+                    ? "text-accent font-medium"
+                    : "text-ink-dim hover:text-ink"
+                }`}
+              >
+                {route === "/"
+                  ? pageMeta?.title || project?.name || "Page"
+                  : route}
               </span>
-            )}
-            <span className="text-ink-faint shrink-0">
-              {viewport.label} · {viewport.width}
-            </span>
-          </div>
-          {/* Pannable surface: frame origin lives at `pan`, scaled by zoom. */}
+              {route === "/" && pageMeta && pageMeta.path !== "/" && (
+                <span className="text-ink-faint font-mono truncate shrink-0">
+                  {pageMeta.path}
+                </span>
+              )}
+              {/* Honesty over magic: a frame its app redirected away (auth
+                  guard) says where it actually landed. */}
+              {route !== "/" && pagePaths[route] && pagePaths[route] !== route && (
+                <span className="text-warn font-mono truncate shrink-0">
+                  → {pagePaths[route]}
+                </span>
+              )}
+              {/* Which session this artboard renders under, whenever it
+                  isn't the live one — the label must never let the user
+                  wonder why two frames of the same app disagree. */}
+              {(sessionModes[route] === "out" ||
+                (sessionModes[route] !== "in" &&
+                  frameOrigins[route] === "alt")) && (
+                <span className="text-ink-faint shrink-0">signed out</span>
+              )}
+              {sessionModes[route] === "in" && (
+                <span className="text-ink-faint shrink-0">signed in</span>
+              )}
+              {/* A held frame is deliberately not showing what the app would
+                  do on its own — that has to be visible on the artboard. */}
+              {heldRoutes[route] && (
+                <span className="rounded bg-accent/15 px-1 text-accent shrink-0">
+                  held
+                </span>
+              )}
+              {i === 0 && (
+                <span className="text-ink-faint shrink-0">
+                  {viewport.label} · {viewport.width}
+                </span>
+              )}
+              {/* Honesty over magic: pages rendered under a seeded session
+                  say so — the app believes a login that never happened. */}
+              {i === 0 && mockSession && (
+                <span className="rounded bg-warn/15 px-1 text-warn shrink-0">
+                  mock session
+                </span>
+              )}
+            </div>
+          ))}
+          {/* Pannable surface: pages-row origin lives at `pan`, scaled by
+              zoom. One frame per route; the root frame stays mounted (it's
+              the live, navigable app), off-screen siblings unmount so a
+              route-heavy project doesn't run 20 live copies of itself. */}
           <div
             className="absolute top-0 left-0 will-change-transform"
             style={{
@@ -347,22 +603,56 @@ export function Canvas() {
               transformOrigin: "0 0",
             }}
           >
-            <div
-              className="shadow-2xl bg-white rounded-md overflow-hidden"
-              style={{ width: viewport.width, height: frameHeight }}
-            >
-              <iframe
-                ref={(el) => {
-                  iframeRef.current = el;
-                  registerCanvasIframe(el);
-                }}
-                src={devUrl}
-                title="app-canvas"
-                className="w-full h-full border-0 bg-white"
-              />
-            </div>
-            {/* Rendered component artboards from the last scan (FR-5.3). */}
-            <Artboards />
+            {routes.map((route, i) => {
+              const x = i * pageStep;
+              const h = heightFor(route);
+              const view = {
+                left: -pan.x / zoom - 400,
+                right: (-pan.x + window.innerWidth) / zoom + 400,
+                top: -pan.y / zoom - 400,
+                bottom: (-pan.y + window.innerHeight) / zoom + 400,
+              };
+              const near =
+                x < view.right && x + viewport.width > view.left &&
+                0 < view.bottom && h > view.top;
+              return (
+                <div
+                  key={route}
+                  // The visual regression gate finds its capture regions by
+                  // this attribute — an artboard has to be addressable from
+                  // outside the canvas for a before/after to mean anything.
+                  data-artboard={route}
+                  className={`absolute shadow-2xl bg-white rounded-md overflow-hidden ${
+                    selectedRoute === route ? "ring-2 ring-accent" : ""
+                  }`}
+                  style={{ left: x, top: 0, width: viewport.width, height: h }}
+                >
+                  {route === "/" || near ? (
+                    <iframe
+                      ref={(el) => registerCanvasIframe(el, route)}
+                      // Built from subscribed values, so switching an
+                      // artboard's session or holding it re-points the frame
+                      // immediately — and for a hold, that reload is exactly
+                      // what arms it (the flag must be there before boot).
+                      src={frameUrl(
+                        route,
+                        resolveOrigin(route, {
+                          sessionModes,
+                          frameOrigins,
+                          devUrl,
+                          devAltUrl,
+                        }) ?? devUrl,
+                        !!heldRoutes[route],
+                      )}
+                      title={`page ${route}`}
+                      className="w-full h-full border-0 bg-white"
+                    />
+                  ) : (
+                    <div className="h-full bg-white" />
+                  )}
+                </div>
+              );
+            })}
           </div>
           {/* Space-held hand tool: catches drags everywhere, including over
               the iframe (which would otherwise swallow pointer events). */}
@@ -378,6 +668,7 @@ export function Canvas() {
               onPointerCancel={endDrag}
             />
           )}
+          <GestureHint />
           <Toolbar />
         </>
       )}

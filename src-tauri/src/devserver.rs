@@ -14,6 +14,7 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::project::PackageManager;
+use crate::toolpath;
 
 /// Events emitted to the webview. Kept as string constants so the TS side can
 /// import matching literals.
@@ -69,6 +70,23 @@ struct StatusEvent {
     status: &'static str,
 }
 
+/// How to launch the dev server, plus any environment the instrumentation
+/// needs. `env` is how the Next.js integration is switched on: the wrapper the
+/// user adds to their `next.config` is inert unless `DEDUP_TAGGING=1` is set,
+/// so their own `next dev`, their CI and their production build are untouched
+/// by having it there.
+#[derive(Clone, Default)]
+pub struct Launch {
+    pub exec: ExecSpec,
+    pub env: Vec<(String, String)>,
+}
+
+impl From<ExecSpec> for Launch {
+    fn from(exec: ExecSpec) -> Self {
+        Launch { exec, env: Vec::new() }
+    }
+}
+
 /// How to launch the dev server.
 #[derive(Clone)]
 pub enum ExecSpec {
@@ -82,6 +100,12 @@ pub enum ExecSpec {
         program: std::path::PathBuf,
         args: Vec<String>,
     },
+}
+
+impl Default for ExecSpec {
+    fn default() -> Self {
+        ExecSpec::Script(PackageManager::Unknown)
+    }
 }
 
 /// Next.js refuses to start when a previous dev server for the same project
@@ -144,19 +168,20 @@ pub fn start(
     app: &AppHandle,
     state: &DevServerState,
     root: &str,
-    exec: ExecSpec,
+    launch: impl Into<Launch>,
 ) -> Result<(), String> {
     // One automatic stale-lock cleanup per start request — never a kill loop.
-    start_with_retry(app, state, root, exec, 1)
+    start_with_retry(app, state, root, launch.into(), 1)
 }
 
 fn start_with_retry(
     app: &AppHandle,
     state: &DevServerState,
     root: &str,
-    exec: ExecSpec,
+    launch: Launch,
     retries_left: u32,
 ) -> Result<(), String> {
+    let exec = launch.exec.clone();
     {
         let guard = state.0.lock().map_err(|_| "state lock poisoned")?;
         if guard.is_some() {
@@ -175,6 +200,9 @@ fn start_with_retry(
     }
 
     let mut cmd = build_command(root, &exec);
+    for (key, value) in &launch.env {
+        cmd.env(key, value);
+    }
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -182,6 +210,9 @@ fn start_with_retry(
         .env("NO_COLOR", "1")
         .env("FORCE_COLOR", "0")
         .env("BROWSER", "none"); // stop CRA/Next from opening a system browser
+    // A GUI-launched bundle inherits launchd's minimal PATH; without this the
+    // `#!/usr/bin/env node` shims in node_modules/.bin die with exit 127.
+    toolpath::apply(&mut cmd);
 
     #[cfg(unix)]
     {
@@ -221,7 +252,7 @@ fn start_with_retry(
     // to the process group, so this thread owning `child` doesn't block stop().
     let app_wait = app.clone();
     let root_owned = root.to_string();
-    let exec_retry = exec.clone();
+    let launch_retry = launch.clone();
     thread::spawn(move || {
         let status = child.wait();
         let code = status.ok().and_then(|s| s.code());
@@ -256,7 +287,7 @@ fn start_with_retry(
                         &app_wait,
                         &st,
                         &root_owned,
-                        exec_retry,
+                        launch_retry,
                         retries_left - 1,
                     ) {
                         Ok(()) => return, // recovery underway — no crash event
@@ -264,6 +295,19 @@ fn start_with_retry(
                     }
                 }
             }
+        }
+
+        // 127 from a `node_modules/.bin` shim means the shebang couldn't find
+        // node — say so, instead of leaving the user with a bare exit code.
+        if !requested && code == Some(127) {
+            let _ = app_wait.emit(
+                EVT_LOG,
+                LogEvent {
+                    stream: "stderr",
+                    line: "dedup: the dev server couldn't find Node.js on PATH. Install Node (or make it visible to your login shell) and try again."
+                        .into(),
+                },
+            );
         }
 
         let _ = app_wait.emit(EVT_EXIT, ExitEvent { code, requested });
@@ -383,6 +427,9 @@ fn build_command(root: &str, exec: &ExecSpec) -> Command {
                 PackageManager::Npm | PackageManager::Unknown => "npm",
             };
             // `run dev` works uniformly across pnpm/npm/bun; yarn allows `yarn dev`.
+            // Resolve the binary ourselves — Command's own lookup uses the
+            // *parent's* PATH, which is the useless one in a bundle.
+            let bin = toolpath::which(bin).unwrap_or_else(|| bin.into());
             let mut c = Command::new(bin);
             match pm {
                 PackageManager::Yarn => {

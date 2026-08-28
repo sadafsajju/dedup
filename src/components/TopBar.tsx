@@ -1,11 +1,28 @@
 import { useEffect, useState } from "react";
-import { stopDevServer } from "../lib/api";
+import { captureCanvasThumbnail, stopDevServer } from "../lib/api";
 import { useStore } from "../lib/store";
+import { isValueAction } from "../lib/types";
 import { VIEWPORTS } from "../lib/types";
 import type { DevServerStatus } from "../lib/types";
-import { ChevronIcon, GitBranchIcon, DuplicatesIcon } from "./icons";
+import {
+  ChevronLeftIcon,
+  CopyIcon,
+  DesktopIcon,
+  LaptopIcon,
+  MobileIcon,
+  Share2Icon,
+} from "@radix-ui/react-icons";
 import { ReviewPanel } from "./ReviewPanel";
 import { AiSwitch } from "./AiSwitch";
+import { HistoryButton } from "./History";
+import type { IconType } from "./ui";
+
+/** Device glyph per viewport preset (FR-1.4). */
+const VIEWPORT_ICON: Record<string, IconType> = {
+  mobile: MobileIcon,
+  tablet: LaptopIcon,
+  desktop: DesktopIcon,
+};
 
 const STATUS_META: Record<DevServerStatus, { label: string; dot: string }> = {
   idle: { label: "Idle", dot: "bg-ink-faint" },
@@ -24,7 +41,7 @@ export function TopBar() {
   const viewportId = useStore((s) => s.viewportId);
   const setViewport = useStore((s) => s.setViewport);
   const backToLaunch = useStore((s) => s.backToLaunch);
-  const staged = useStore((s) => s.staged);
+  const actions = useStore((s) => s.actions);
   const saving = useStore((s) => s.saving);
   const saveError = useStore((s) => s.saveError);
   const lastSave = useStore((s) => s.lastSave);
@@ -32,8 +49,18 @@ export function TopBar() {
   const scanning = useStore((s) => s.scanning);
   const categorizing = useStore((s) => s.categorizing);
   const runScan = useStore((s) => s.runScan);
-  const dirtyCount = Object.values(staged).filter(
-    (e) => e.current !== e.original,
+  const editorTab = useStore((s) => s.editorTab);
+  const setEditorTab = useStore((s) => s.setEditorTab);
+  const selectedRoute = useStore((s) => s.selectedRoute);
+  const instrumentation = useStore((s) => s.instrumentation);
+  const galleryCount = useStore((s) => s.scanResult?.gallery.length ?? 0);
+  // A live, tagged canvas scans one artboard at a time — Scan waits for the
+  // user to pick one (click its name). Untagged sessions keep the honest
+  // whole-project fallback, so no selection is demanded there.
+  const needsArtboard =
+    devStatus === "ready" && !!instrumentation?.active && !selectedRoute;
+  const dirtyCount = actions.filter(
+    (a) => !isValueAction(a) || a.before !== a.after,
   ).length;
   const [reviewOpen, setReviewOpen] = useState(false);
 
@@ -43,6 +70,9 @@ export function TopBar() {
   }, [dirtyCount]);
 
   async function goBack() {
+    // Snapshot the canvas first — it's the launch grid's card image, and it
+    // has to happen while the project is still rendered.
+    if (project) await captureCanvasThumbnail(project.root);
     await stopDevServer();
     backToLaunch();
   }
@@ -50,20 +80,22 @@ export function TopBar() {
   const status = STATUS_META[devStatus];
 
   return (
-    <header className="h-11 shrink-0 flex items-center gap-3 px-3 border-b border-line bg-surface-1 select-none">
+    // Floating chrome: the canvas runs under it, so the bar carries its own
+    // blur and hairline instead of a hard divider against a column layout.
+    <header className="panel absolute top-3 left-3 right-3 z-30 h-11 flex items-center gap-3 px-2.5 select-none">
       <button
         onClick={goBack}
         className="flex items-center gap-1 text-ink-dim hover:text-ink text-2xs px-1.5 py-1 rounded hover:bg-surface-2"
         title="Close project"
       >
-        <ChevronIcon size={14} className="rotate-180" />
+        <ChevronLeftIcon width={15} height={15} />
       </button>
 
       <div className="flex items-center gap-2 min-w-0">
         <span className="text-[13px] font-medium truncate">{project?.name}</span>
         {git?.isRepo && (
           <span className="inline-flex items-center gap-1 text-2xs text-ink-dim bg-surface-2 rounded px-1.5 py-0.5 shrink-0">
-            <GitBranchIcon size={11} />
+            <Share2Icon width={11} height={11} />
             <span className="font-mono">{git.branch ?? "?"}</span>
           </span>
         )}
@@ -71,22 +103,54 @@ export function TopBar() {
 
       <div className="flex-1" />
 
-      {/* Viewport switcher (FR-1.4, FR-6.4 ⌘1/2/3) */}
-      <div className="flex items-center gap-0.5 bg-surface-2 rounded-md p-0.5">
-        {VIEWPORTS.map((v) => (
+      {/* Top-level view switch: live canvas vs. scanned component gallery. */}
+      <div className="flex items-center gap-0.5 bg-surface-2 rounded-[10px] p-0.5">
+        {(
+          [
+            ["canvas", "Canvas"],
+            ["components", "Components"],
+          ] as const
+        ).map(([id, label]) => (
           <button
-            key={v.id}
-            onClick={() => setViewport(v.id)}
-            className={`text-2xs px-2 py-1 rounded ${
-              viewportId === v.id
+            key={id}
+            onClick={() => setEditorTab(id)}
+            className={`h-6 px-2.5 rounded-lg text-2xs ${
+              editorTab === id
                 ? "bg-surface-3 text-ink"
                 : "text-ink-dim hover:text-ink"
             }`}
-            title={`${v.label} · ${v.width}px`}
           >
-            {v.label}
+            {label}
+            {id === "components" && galleryCount > 0 && (
+              <span className="ml-1 text-ink-faint tabular-nums">
+                {galleryCount}
+              </span>
+            )}
           </button>
         ))}
+      </div>
+
+      <div className="flex-1" />
+
+      {/* Viewport switcher (FR-1.4, FR-6.4 ⌘1/2/3) */}
+      <div className="flex items-center gap-0.5 bg-surface-2 rounded-[10px] p-0.5">
+        {VIEWPORTS.map((v) => {
+          const Icon = VIEWPORT_ICON[v.id];
+          return (
+            <button
+              key={v.id}
+              onClick={() => setViewport(v.id)}
+              className={`flex h-6 w-7 items-center justify-center rounded-lg ${
+                viewportId === v.id
+                  ? "bg-surface-3 text-ink"
+                  : "text-ink-dim hover:text-ink"
+              }`}
+              title={`${v.label} · ${v.width}px`}
+            >
+              <Icon width={13} height={13} />
+            </button>
+          );
+        })}
       </div>
 
       {/* Dev-server status */}
@@ -103,7 +167,7 @@ export function TopBar() {
         {saveError ? (
           <button
             onClick={saveAll}
-            className="rounded-md px-2.5 py-1 text-2xs bg-danger/15 text-danger hover:bg-danger/25"
+            className="rounded-lg px-2.5 py-1 text-2xs bg-danger/15 text-danger hover:bg-danger/25"
             title={saveError}
           >
             Save failed — retry
@@ -112,7 +176,7 @@ export function TopBar() {
           <>
             <button
               onClick={() => setReviewOpen((v) => !v)}
-              className={`rounded-md px-2 py-1 text-2xs ${
+              className={`rounded-lg px-2 py-1 text-2xs ${
                 reviewOpen
                   ? "bg-surface-3 text-ink"
                   : "bg-surface-2 text-ink-dim hover:text-ink"
@@ -124,7 +188,7 @@ export function TopBar() {
             <button
               onClick={saveAll}
               disabled={saving}
-              className="rounded-md px-2.5 py-1 text-2xs font-medium bg-accent text-white hover:brightness-110 disabled:opacity-60"
+              className="rounded-lg px-2.5 py-1 text-2xs font-medium bg-accent text-white hover:brightness-110 disabled:opacity-60"
               title="⌘S"
             >
               {saving ? "Saving…" : "Save ⌘S"}
@@ -141,20 +205,29 @@ export function TopBar() {
         {reviewOpen && <ReviewPanel onClose={() => setReviewOpen(false)} />}
       </div>
 
+      <HistoryButton />
+
       <AiSwitch />
 
       <button
         onClick={runScan}
-        disabled={scanning || categorizing}
+        disabled={scanning || categorizing || needsArtboard}
         className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-2xs ${
           scanning || categorizing
             ? "bg-surface-2 text-ink-faint cursor-wait"
-            : "bg-surface-2 text-ink-dim hover:text-ink"
+            : needsArtboard
+              ? "bg-surface-2 text-ink-faint cursor-not-allowed"
+              : "bg-surface-2 text-ink-dim hover:text-ink"
         }`}
-        title="Find duplicate components and auto-organize the canvas"
+        title={
+          needsArtboard
+            ? "Select an artboard first — click its name above the frame"
+            : "Scan the selected artboard for duplicate components"
+        }
       >
-        <DuplicatesIcon
-          size={13}
+        <CopyIcon
+          width={13}
+          height={13}
           className={scanning || categorizing ? "animate-pulse" : ""}
         />
         {scanning ? "Scanning…" : categorizing ? "Organizing…" : "Scan"}

@@ -1,6 +1,10 @@
 import { useState } from "react";
 import type { GitStatus, ProjectInfo } from "../lib/types";
-import { CheckIcon, WarnIcon, XIcon } from "./icons";
+import {
+  CheckIcon,
+  Cross2Icon,
+  ExclamationTriangleIcon,
+} from "@radix-ui/react-icons";
 
 interface Props {
   info: ProjectInfo;
@@ -24,7 +28,11 @@ function Badge({ ok, label }: { ok: boolean; label: string }) {
       className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-2xs font-medium
         ${ok ? "bg-surface-3 text-ink" : "bg-surface-2 text-ink-faint line-through"}`}
     >
-      {ok ? <CheckIcon size={11} /> : <XIcon size={11} />}
+      {ok ? (
+        <CheckIcon width={12} height={12} />
+      ) : (
+        <Cross2Icon width={12} height={12} />
+      )}
       {label}
     </span>
   );
@@ -83,7 +91,11 @@ export function CompatCard({ info, git, onCancel, onConfirm }: Props) {
           <ul className="px-5 py-3 border-t border-line flex flex-col gap-2">
             {info.warnings.map((w, i) => (
               <li key={i} className="flex gap-2 text-2xs text-ink-dim">
-                <WarnIcon size={13} className="text-warn shrink-0 mt-px" />
+                <ExclamationTriangleIcon
+                  width={13}
+                  height={13}
+                  className="text-warn shrink-0 mt-px"
+                />
                 <span>{w}</span>
               </li>
             ))}

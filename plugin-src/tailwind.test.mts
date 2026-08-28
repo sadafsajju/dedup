@@ -10,6 +10,8 @@ import {
   writeSpacing,
   KNOBS,
   stepSpacing,
+  cssColor,
+  mergeClasses,
 } from "../src/lib/tailwind.ts";
 
 let passed = 0;
@@ -107,6 +109,54 @@ test("stepSpacing walks the scale and clamps", () => {
   assert.equal(stepSpacing("0", -1), "0");
   assert.equal(stepSpacing(null, 1), "1");
   assert.equal(stepSpacing("[13px]", 1), "[13px]");
+});
+
+test("cssColor resolves palette tokens through theme vars", () => {
+  assert.equal(cssColor("zinc-400"), "var(--color-zinc-400, transparent)");
+  assert.equal(cssColor("red-50"), "var(--color-red-50, transparent)");
+  assert.equal(cssColor("black"), "black");
+  assert.equal(cssColor("transparent"), "transparent");
+});
+
+test("cssColor passes through arbitrary colour values", () => {
+  assert.equal(cssColor("[#ff0055]"), "#ff0055");
+  assert.equal(cssColor("[rgb(1_2_3)]"), "rgb(1 2 3)");
+  assert.equal(cssColor("[oklch(0.7_0.1_200)]"), "oklch(0.7 0.1 200)");
+});
+
+test("cssColor refuses what it cannot resolve", () => {
+  assert.equal(cssColor(null), null);
+  assert.equal(cssColor(""), null);
+  assert.equal(cssColor("brand"), null); // project-defined token, not ours
+  assert.equal(cssColor("zinc-425"), null); // off-scale shade
+  assert.equal(cssColor("[--my-var]"), null);
+});
+
+// --- mergeClasses (conflict resolution for whole class strings) -------------
+
+test("mergeClasses keeps the last of each conflicting utility", () => {
+  assert.equal(mergeClasses("p-4 p-6"), "p-6");
+  assert.equal(mergeClasses("flex grid"), "grid");
+  assert.equal(mergeClasses("text-sm text-lg"), "text-lg");
+  assert.equal(mergeClasses("px-2 p-4"), "p-4");
+});
+
+test("mergeClasses treats background properties as independent", () => {
+  // The reason for the extra pass over tailwind-merge: these are different
+  // CSS properties that merely share the `bg-` prefix.
+  const out = mergeClasses("bg-red-500 bg-cover bg-no-repeat bg-center");
+  for (const token of ["bg-red-500", "bg-cover", "bg-no-repeat", "bg-center"]) {
+    assert.ok(out.split(" ").includes(token), `${token} missing from "${out}"`);
+  }
+  // Same property still collapses.
+  assert.equal(mergeClasses("bg-red-500 bg-blue-500"), "bg-blue-500");
+  assert.equal(mergeClasses("bg-cover bg-contain"), "bg-contain");
+});
+
+test("mergeClasses leaves variants and unknown classes alone", () => {
+  assert.equal(mergeClasses("p-2 hover:p-4"), "p-2 hover:p-4");
+  assert.equal(mergeClasses("my-own-class p-2"), "my-own-class p-2");
+  assert.equal(mergeClasses(""), "");
 });
 
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

@@ -2,6 +2,8 @@
 // (unprefixed) classes only — variant-prefixed tokens (hover:, dark:, md:…)
 // pass through untouched, preserving their original positions.
 
+import { twMerge } from "tailwind-merge";
+
 export type Tokens = string[];
 
 export const toTokens = (className: string): Tokens =>
@@ -39,6 +41,54 @@ export function setKnob(tokens: Tokens, re: RegExp, next: string | null): Tokens
   }
   if (!placed && next !== null) out.push(next);
   return out;
+}
+
+/**
+ * Resolve conflicting utilities in a class string, keeping the last one of
+ * each group — what Tailwind's own generated CSS effectively does, but visible
+ * in the source instead of hidden in specificity.
+ *
+ * The knob controls above don't need this (each knob owns its regex and edits
+ * in place); it is for class strings that arrive whole: the raw Classes field,
+ * text pasted from elsewhere, and markup produced by the AI chat.
+ *
+ * `bg-*` gets a second pass because tailwind-merge treats background colour,
+ * size, position, repeat and attachment as one group — so `bg-cover` would
+ * eat `bg-red-500`. They are independent properties; only same-property
+ * duplicates should collapse.
+ */
+export function mergeClasses(...parts: string[]): string {
+  const merged = twMerge(...parts);
+  const groups: Record<string, string[]> = {};
+  const out: string[] = [];
+  for (const token of merged.split(/\s+/).filter(Boolean)) {
+    const group = bgGroupOf(token);
+    if (!group) {
+      out.push(token);
+      continue;
+    }
+    (groups[group] ??= []).push(token);
+  }
+  // Last of each background group wins, in first-appearance order.
+  for (const list of Object.values(groups)) out.push(list[list.length - 1]);
+  return twMerge(out.join(" "));
+}
+
+const BG_GROUPS: Record<string, RegExp> = {
+  repeat: /^bg-(?:repeat|no-repeat|repeat-x|repeat-y|repeat-round|repeat-space)$/,
+  size: /^bg-(?:auto|cover|contain)$/,
+  position: /^bg-(?:bottom|center|left|right|top|left-bottom|left-top|right-bottom|right-top)$/,
+  attachment: /^bg-(?:fixed|local|scroll)$/,
+  // Anything else `bg-*` is a colour (named, arbitrary, or a theme token).
+  color: /^bg-\S+$/,
+};
+
+function bgGroupOf(token: string): string | null {
+  if (!token.startsWith("bg-")) return null;
+  for (const [group, re] of Object.entries(BG_GROUPS)) {
+    if (re.test(token)) return group;
+  }
+  return null;
 }
 
 // --- spacing (padding / margin) ---------------------------------------------
@@ -168,4 +218,22 @@ export function stepSpacing(value: string | null, dir: 1 | -1): string {
   if (i === -1) return value; // arbitrary — let the user type
   const next = Math.min(SPACING_SCALE.length - 1, Math.max(0, i + dir));
   return SPACING_SCALE[next];
+}
+
+/** Resolve a Tailwind colour token (the part after `bg-`/`text-`/`border-`) to
+ * something CSS can paint, for the inspector's swatches. Palette names ride the
+ * app's own `--color-*` theme vars (styles.css imports the theme `static` so
+ * they all exist); arbitrary values pass through. Returns null when the token
+ * isn't a colour we can resolve — callers render that state honestly rather
+ * than guessing. */
+export function cssColor(value: string | null): string | null {
+  if (!value) return null;
+  const v = value.trim();
+  if (v.startsWith("[") && v.endsWith("]")) {
+    const inner = v.slice(1, -1).replace(/_/g, " ");
+    return /^(#|rgb|hsl|oklch|lab|color\()/i.test(inner) ? inner : null;
+  }
+  if (v === "transparent" || v === "black" || v === "white") return v;
+  if (/^[a-z]+-(?:50|[1-9]00|950)$/.test(v)) return `var(--color-${v}, transparent)`;
+  return null;
 }

@@ -13,6 +13,20 @@ const FILE_NAME: &str = "recents.json";
 pub struct RecentProject {
     pub path: String,
     pub name: String,
+    /// Cached at open time so the launch grid can label cards without
+    /// re-detecting eight projects on mount. Absent in pre-grid files.
+    #[serde(default)]
+    pub framework: Option<String>,
+    /// Unix millis of the last open — drives the "3d ago" card subtitle.
+    #[serde(default)]
+    pub last_opened: Option<u64>,
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn store_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -35,7 +49,7 @@ pub fn load(app: &AppHandle) -> Vec<RecentProject> {
     }
 }
 
-pub fn add(app: &AppHandle, path: &str, name: &str) -> Vec<RecentProject> {
+pub fn add(app: &AppHandle, path: &str, name: &str, framework: Option<String>) -> Vec<RecentProject> {
     let mut list = load(app);
     list.retain(|r| r.path != path);
     list.insert(
@@ -43,6 +57,8 @@ pub fn add(app: &AppHandle, path: &str, name: &str) -> Vec<RecentProject> {
         RecentProject {
             path: path.to_string(),
             name: name.to_string(),
+            framework,
+            last_opened: Some(now_millis()),
         },
     );
     list.truncate(MAX_RECENTS);

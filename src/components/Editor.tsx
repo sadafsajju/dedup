@@ -14,9 +14,13 @@ import { useStore } from "../lib/store";
 import { TopBar } from "./TopBar";
 import { Sidebar } from "./Sidebar";
 import { Canvas } from "./Canvas";
+import { ComponentsView } from "./ComponentsView";
 import { Inspector } from "./Inspector";
 import { ConsoleDrawer } from "./ConsoleDrawer";
+import { SessionModal } from "./SessionModal";
 import { ClusterReview } from "./Duplicates";
+import { MergeReview } from "./MergeReview";
+import { HistoryPanel } from "./History";
 
 export function Editor() {
   const project = useStore((s) => s.project);
@@ -85,6 +89,12 @@ export function Editor() {
       // a rescan every time the project is reopened.
       void useStore.getState().restoreScan();
       void useStore.getState().detectClaudeCode();
+      void useStore.getState().loadSessionSeed();
+      // The history panel is the session branch read back, and the trash tray
+      // may hold files a previous session staged — both are project state, so
+      // they load with the project rather than on first open.
+      void useStore.getState().loadHistory();
+      void useStore.getState().loadTrash();
       if (!startedRef.current) {
         startedRef.current = true;
         setDevStatus("starting");
@@ -110,7 +120,9 @@ export function Editor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.root]);
 
-  // Keyboard (FR-6.4): ⌘S save, ⌘Z/⇧⌘Z undo/redo, ⌘1/2/3 viewports, Esc.
+  // Keyboard (FR-6.4): ⌘S save, ⌘Z/⇧⌘Z undo/redo, ⌘1/2/3 viewports, Esc,
+  // ⌫ delete. Keystrokes inside the canvas iframe arrive here too — the
+  // overlay forwards them as synthetic events (see Canvas).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const inField =
@@ -130,9 +142,24 @@ export function Editor() {
         e.preventDefault();
       } else if (e.key === "Escape" && !inField) {
         const s = useStore.getState();
-        if (s.openClusterId) s.openCluster(null);
+        // A merge in flight owns Escape first — it is the modal on top, and
+        // dismissing something under it would leave it stranded.
+        if (s.merge) {
+          // Only when it is safe to walk away: mid-apply, closing would
+          // orphan a rollback the user still needs to see.
+          if (s.merge.stage !== "applying" && s.merge.stage !== "gating") {
+            s.cancelMerge();
+          }
+        } else if (s.historyOpen) s.toggleHistory(false);
+        else if (s.openClusterId) s.openCluster(null);
+        else if (s.insertKind) s.setInsertKind(null);
         else if (s.selected) s.clearSelection();
         else s.toggleConsole(false);
+      } else if ((e.key === "Delete" || e.key === "Backspace") && !inField) {
+        // Delete the selected element (staged like any other edit). Refused
+        // elements just do nothing — the inspector says why.
+        useStore.getState().removeSelected();
+        e.preventDefault();
       } else if (!inField) {
         // Tool shortcuts (FR-6.4), Figma-style: V select, H hand, B browse.
         const s = useStore.getState();
@@ -150,19 +177,25 @@ export function Editor() {
   if (!project) return null;
 
   return (
-    <div className="relative h-full flex flex-col bg-surface-0">
-      <TopBar />
-      <div className="flex-1 min-h-0 flex">
-        <Sidebar />
-        <div className="flex-1 min-w-0 flex flex-col">
-          <div className="flex-1 min-h-0 flex">
-            <Canvas />
-            <Inspector />
-          </div>
-          <ConsoleDrawer />
-        </div>
+    // Full-bleed canvas with the chrome floating over it, rather than docked
+    // columns squeezing it. The panels are `position: absolute` siblings, so
+    // the artboards keep the whole window and the app being designed is the
+    // thing at the centre of the screen.
+    <div className="relative h-full bg-surface-0 overflow-hidden">
+      <div className="absolute inset-0 flex">
+        {/* Canvas and ComponentsView both stay mounted (hidden via CSS) so
+            switching tabs never reloads the app or harness iframes. */}
+        <Canvas />
+        <ComponentsView />
       </div>
+      <TopBar />
+      <Sidebar />
+      <Inspector />
+      <ConsoleDrawer />
       <ClusterReview />
+      <MergeReview />
+      <HistoryPanel />
+      <SessionModal />
     </div>
   );
 }

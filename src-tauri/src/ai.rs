@@ -15,10 +15,8 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 /// `claude` from PATH, with the usual install locations as fallbacks
 /// (GUI-launched apps get a minimal PATH).
 pub fn find_claude() -> Option<PathBuf> {
-    if let Ok(out) = Command::new("claude").arg("--version").output() {
-        if out.status.success() {
-            return Some(PathBuf::from("claude"));
-        }
+    if let Some(found) = crate::toolpath::which("claude") {
+        return Some(found);
     }
     let home = std::env::var("HOME").unwrap_or_default();
     for candidate in [
@@ -51,6 +49,7 @@ pub fn prompt(text: &str, model: Option<&str>) -> Result<String, String> {
     let claude = find_claude().ok_or("Claude Code CLI not found")?;
 
     let mut cmd = Command::new(claude);
+    crate::toolpath::apply(&mut cmd);
     cmd.args([
         "-p",
         "--output-format",

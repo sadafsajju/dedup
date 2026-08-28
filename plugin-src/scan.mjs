@@ -7,74 +7,19 @@
 // trees plus Tailwind class comparison where `p-4` vs `p-6` counts as "same
 // knob, different value". No model involved — scores must be reproducible.
 
-import { parse } from "@babel/parser";
 import fs from "node:fs";
 import path from "node:path";
-
-// --- file discovery ---------------------------------------------------------
-
-const SKIP_DIRS = new Set([
-  "node_modules",
-  "dist",
-  "build",
-  "out",
-  "coverage",
-  "public",
-  ".dedup-trash",
-]);
-const COMPONENT_FILE_RE = /\.[jt]sx$/;
-const MAX_FILE_BYTES = 512 * 1024; // generated/vendored monsters aren't components
-const MAX_FILES = 5000;
-
-function discoverFiles(root) {
-  const files = [];
-  const stack = [root];
-  while (stack.length > 0 && files.length < MAX_FILES) {
-    const dir = stack.pop();
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (entry.name.startsWith(".")) continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) stack.push(full);
-      } else if (entry.isFile() && COMPONENT_FILE_RE.test(entry.name)) {
-        files.push(full);
-      }
-    }
-  }
-  return files.sort();
-}
+import {
+  COMPONENT_FILE_RE,
+  MAX_FILE_BYTES,
+  discoverFiles,
+  isMainModule,
+  parseSource,
+  relOf,
+  walk,
+} from "./files.mjs";
 
 // --- parsing + component extraction (FR-5.1) --------------------------------
-
-function parseSource(code) {
-  return parse(code, {
-    sourceType: "module",
-    errorRecovery: true,
-    plugins: ["jsx", "typescript", "decorators-legacy"],
-  });
-}
-
-const AST_SKIP_KEYS = new Set(["loc", "leadingComments", "trailingComments"]);
-
-function walk(node, visit) {
-  if (!node || typeof node.type !== "string") return;
-  if (visit(node) === false) return; // visitor may prune the subtree
-  for (const key of Object.keys(node)) {
-    if (AST_SKIP_KEYS.has(key)) continue;
-    const value = node[key];
-    if (Array.isArray(value)) {
-      for (const child of value) walk(child, visit);
-    } else if (value && typeof value.type === "string") {
-      walk(value, visit);
-    }
-  }
-}
 
 /** Unwrap memo(...)/forwardRef(...) wrappers down to the inner function. */
 function unwrapToFunction(node) {
@@ -593,7 +538,7 @@ function countCallSites(programs, names) {
  */
 export function scan(root, scopeFiles = null, emitProgress = () => {}) {
   const started = Date.now();
-  const files = discoverFiles(root);
+  const files = discoverFiles(root, COMPONENT_FILE_RE);
   const scope = scopeFiles ? new Set(scopeFiles) : null;
 
   const components = [];
@@ -608,7 +553,7 @@ export function scan(root, scopeFiles = null, emitProgress = () => {}) {
       }
       const program = parseSource(fs.readFileSync(file, "utf8")).program;
       programs.push(program);
-      const rel = path.relative(root, file).split(path.sep).join("/");
+      const rel = relOf(root, file);
       components.push(...extractComponents(program, rel));
     } catch {
       skipped++;
@@ -686,7 +631,7 @@ export function scan(root, scopeFiles = null, emitProgress = () => {}) {
 // --- entry --------------------------------------------------------------------
 
 // Only run the stdin loop when executed directly (tests import `scan`).
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (isMainModule(import.meta.url)) {
   let input = "";
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (d) => (input += d));

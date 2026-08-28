@@ -8,19 +8,27 @@
     "build": "tsc && vite build",
     "build:plugin": "node plugin-src/build.mjs",
     "test:plugin": "node plugin-src/smoke.mjs",
+    "test:overlay": "node plugin-src/overlay.test.mjs",
+    "test:actions": "node plugin-src/run-ts.mjs plugin-src/actions.test.mts",
     "test:scan": "node plugin-src/scan.test.mjs",
-    "test:tw": "node --experimental-strip-types plugin-src/tailwind.test.mts",
-    "test:chat": "node --experimental-strip-types plugin-src/chatedits.test.mts",
+    "test:tw": "node plugin-src/run-ts.mjs plugin-src/tailwind.test.mts",
+    "test:chat": "node plugin-src/run-ts.mjs plugin-src/chatedits.test.mts",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:errors": "node plugin-src/run-ts.mjs plugin-src/errors.test.mts",
+    "test:origins": "node plugin-src/run-ts.mjs plugin-src/origins.test.mts",
+    "test:merge": "node plugin-src/merge.test.mjs",
+    "test:proposal": "node plugin-src/run-ts.mjs plugin-src/merge.proposal.test.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
+    "@radix-ui/react-icons": "^1.3.2",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "tailwind-merge": "^3.6.0",
     "zustand": "^5.0.2"
   },
   "devDependencies": {

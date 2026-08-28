@@ -1,11 +1,56 @@
 // The Figma-style Tailwind controls (FR-3.2–3.6). Every control reads the
 // effective class string, edits tokens through the mapping layer, and commits
 // via applyClassEdit → staged + live canvas patch (FR-3.7).
+//
+// Presentation only. Layout follows Figma's UI3 right panel: bright section
+// titles with their actions on the right, grey captions above each control
+// group, 2-up fields. The sections themselves stay Tailwind's, not Figma's —
+// there is no "Position"/"Rotation" to map onto utility classes.
 import { useEffect, useState } from "react";
+import {
+  AlignBaselineIcon,
+  AlignBottomIcon,
+  AlignCenterHorizontallyIcon,
+  AlignCenterVerticallyIcon,
+  AlignLeftIcon,
+  AlignRightIcon,
+  AlignTopIcon,
+  ArrowDownIcon,
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  ArrowUpIcon,
+  BorderBottomIcon,
+  BorderLeftIcon,
+  BorderRightIcon,
+  BorderSplitIcon,
+  BorderTopIcon,
+  BorderWidthIcon,
+  BoxModelIcon,
+  ColumnSpacingIcon,
+  CornersIcon,
+  DotsHorizontalIcon,
+  FontBoldIcon,
+  FontSizeIcon,
+  HeightIcon,
+  RowSpacingIcon,
+  ShadowIcon,
+  SpaceBetweenHorizontallyIcon,
+  SpaceBetweenVerticallyIcon,
+  SpaceEvenlyHorizontallyIcon,
+  SpaceEvenlyVerticallyIcon,
+  StretchHorizontallyIcon,
+  StretchVerticallyIcon,
+  TextAlignCenterIcon,
+  TextAlignJustifyIcon,
+  TextAlignLeftIcon,
+  TextAlignRightIcon,
+  WidthIcon,
+} from "@radix-ui/react-icons";
 import { useStore } from "../lib/store";
 import {
   fromTokens,
   KNOBS,
+  mergeClasses,
   readKnob,
   readSpacing,
   setKnob,
@@ -16,11 +61,23 @@ import {
   type Sides,
   type Tokens,
 } from "../lib/tailwind";
+import {
+  Field,
+  Group,
+  IconButton,
+  Row,
+  Section,
+  Select,
+  Swatch,
+  ToggleGroup,
+  type IconType,
+} from "./ui";
 
 export function StylePanel({ className }: { className: string }) {
   const applyClassEdit = useStore((s) => s.applyClassEdit);
   const tokens = toTokens(className);
-  const commit = (next: Tokens) => applyClassEdit(fromTokens(next));
+  const commit = (next: Tokens, group?: string) =>
+    applyClassEdit(fromTokens(next), group);
 
   return (
     <>
@@ -29,378 +86,521 @@ export function StylePanel({ className }: { className: string }) {
       <SizeSection tokens={tokens} commit={commit} />
       <TypographySection tokens={tokens} commit={commit} />
       <FillSection tokens={tokens} commit={commit} />
-      <ClassesField className={className} onCommit={applyClassEdit} />
+      <ClassesSection className={className} onCommit={applyClassEdit} />
     </>
   );
 }
 
 interface SectionProps {
   tokens: Tokens;
-  commit: (next: Tokens) => void;
+  commit: (next: Tokens, group?: string) => void;
 }
 
-// --- primitives --------------------------------------------------------------
+type Axis = "row" | "col";
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="px-3 py-3 border-b border-line">
-      <div className="text-2xs uppercase tracking-wider text-ink-faint mb-2 select-none">
-        {title}
-      </div>
-      <div className="flex flex-col gap-1.5">{children}</div>
-    </div>
-  );
-}
+/** Main-axis (justify-*) icons, flipped to match the flex direction. */
+const MAIN_AXIS: Record<Axis, Array<{ v: string; icon: IconType }>> = {
+  row: [
+    { v: "start", icon: AlignLeftIcon },
+    { v: "center", icon: AlignCenterHorizontallyIcon },
+    { v: "end", icon: AlignRightIcon },
+    { v: "between", icon: SpaceBetweenHorizontallyIcon },
+    { v: "around", icon: ColumnSpacingIcon },
+    { v: "evenly", icon: SpaceEvenlyHorizontallyIcon },
+  ],
+  col: [
+    { v: "start", icon: AlignTopIcon },
+    { v: "center", icon: AlignCenterVerticallyIcon },
+    { v: "end", icon: AlignBottomIcon },
+    { v: "between", icon: SpaceBetweenVerticallyIcon },
+    { v: "around", icon: RowSpacingIcon },
+    { v: "evenly", icon: SpaceEvenlyVerticallyIcon },
+  ],
+};
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex items-center gap-2">
-      <span className="w-14 shrink-0 text-2xs text-ink-dim select-none">{label}</span>
-      <div className="flex-1 min-w-0 flex items-center gap-1">{children}</div>
-    </div>
-  );
-}
+/** Cross-axis (items-*) icons — perpendicular to the main axis. */
+const CROSS_AXIS: Record<Axis, Array<{ v: string; icon: IconType }>> = {
+  row: [
+    { v: "start", icon: AlignTopIcon },
+    { v: "center", icon: AlignCenterVerticallyIcon },
+    { v: "end", icon: AlignBottomIcon },
+    { v: "baseline", icon: AlignBaselineIcon },
+    { v: "stretch", icon: StretchVerticallyIcon },
+  ],
+  col: [
+    { v: "start", icon: AlignLeftIcon },
+    { v: "center", icon: AlignCenterHorizontallyIcon },
+    { v: "end", icon: AlignRightIcon },
+    { v: "baseline", icon: AlignBaselineIcon },
+    { v: "stretch", icon: StretchHorizontallyIcon },
+  ],
+};
 
-function Select({
-  value,
-  options,
-  onChange,
-  allowNone = true,
-}: {
-  value: string | null;
-  options: Array<{ v: string; label?: string }>;
-  onChange: (v: string | null) => void;
-  allowNone?: boolean;
-}) {
-  return (
-    <select
-      value={value ?? ""}
-      onChange={(e) => onChange(e.currentTarget.value || null)}
-      className="flex-1 min-w-0 bg-surface-2 border border-line rounded px-1.5 py-1 text-2xs text-ink focus:outline-none focus:border-accent appearance-none"
-    >
-      {allowNone && <option value="">—</option>}
-      {options.map((o) => (
-        <option key={o.v} value={o.v}>
-          {o.label ?? o.v}
-        </option>
-      ))}
-    </select>
-  );
-}
-
-/** Text input that commits on Enter/blur only (undo stays coarse-grained). */
-function CommitInput({
-  value,
-  onCommit,
-  placeholder,
-  width = "flex-1",
-  mono = true,
-}: {
-  value: string;
-  onCommit: (v: string) => void;
-  placeholder?: string;
-  width?: string;
-  mono?: boolean;
-}) {
-  const [draft, setDraft] = useState(value);
-  useEffect(() => setDraft(value), [value]);
-  const commit = () => {
-    if (draft !== value) onCommit(draft);
-  };
-  return (
-    <input
-      value={draft}
-      placeholder={placeholder}
-      spellCheck={false}
-      onChange={(e) => setDraft(e.currentTarget.value)}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") {
-          commit();
-          e.currentTarget.blur();
-        } else if (e.key === "Escape") {
-          setDraft(value);
-          e.currentTarget.blur();
-          e.stopPropagation();
-        }
-      }}
-      className={`${width} min-w-0 bg-surface-2 border border-line rounded px-1.5 py-1 text-2xs text-ink placeholder:text-ink-faint focus:outline-none focus:border-accent ${mono ? "font-mono" : ""}`}
-    />
-  );
-}
-
-// --- sections ---------------------------------------------------------------
+const DIRECTIONS: Array<{ v: string; icon: IconType; title: string }> = [
+  { v: "row", icon: ArrowRightIcon, title: "flex-row" },
+  { v: "col", icon: ArrowDownIcon, title: "flex-col" },
+  { v: "row-reverse", icon: ArrowLeftIcon, title: "flex-row-reverse" },
+  { v: "col-reverse", icon: ArrowUpIcon, title: "flex-col-reverse" },
+];
 
 function LayoutSection({ tokens, commit }: SectionProps) {
   const display = readKnob(tokens, KNOBS.display);
   const isFlex = display === "flex" || display === "inline-flex";
+  const direction = readKnob(tokens, KNOBS.flexDirection);
+  const axis: Axis = direction?.startsWith("col") ? "col" : "row";
+
   return (
     <Section title="Layout">
-      <Row label="Display">
-        <Select
-          value={display}
-          onChange={(v) => commit(setKnob(tokens, KNOBS.display, v))}
-          options={["block", "flex", "grid", "inline-block", "inline-flex", "inline-grid", "inline", "hidden"].map((v) => ({ v }))}
-        />
-      </Row>
+      <Group label="Display">
+        <Row>
+          <Select
+            icon={BoxModelIcon}
+            value={display}
+            title="display"
+            onChange={(v) => commit(setKnob(tokens, KNOBS.display, v))}
+            options={[
+              "block",
+              "flex",
+              "grid",
+              "inline-block",
+              "inline-flex",
+              "inline-grid",
+              "inline",
+              "hidden",
+            ].map((v) => ({ v }))}
+          />
+        </Row>
+      </Group>
+
       {isFlex && (
         <>
-          <Row label="Direction">
-            <Select
-              value={readKnob(tokens, KNOBS.flexDirection)}
-              onChange={(v) =>
-                commit(setKnob(tokens, KNOBS.flexDirection, v && `flex-${v}`))
-              }
-              options={[
-                { v: "row" },
-                { v: "col", label: "column" },
-                { v: "row-reverse" },
-                { v: "col-reverse", label: "column-reverse" },
-              ]}
-            />
-          </Row>
-          <Row label="Justify">
-            <Select
-              value={readKnob(tokens, KNOBS.justify)}
-              onChange={(v) => commit(setKnob(tokens, KNOBS.justify, v && `justify-${v}`))}
-              options={["start", "center", "end", "between", "around", "evenly"].map((v) => ({ v }))}
-            />
-          </Row>
-          <Row label="Align">
-            <Select
-              value={readKnob(tokens, KNOBS.items)}
-              onChange={(v) => commit(setKnob(tokens, KNOBS.items, v && `items-${v}`))}
-              options={["start", "center", "end", "baseline", "stretch"].map((v) => ({ v }))}
-            />
-          </Row>
-          <Row label="Gap">
-            <SteppableValue
-              value={readKnob(tokens, KNOBS.gap)}
-              onCommit={(v) => commit(setKnob(tokens, KNOBS.gap, v && `gap-${v}`))}
-            />
-          </Row>
+          <Group label="Direction">
+            <Row>
+              <ToggleGroup
+                value={direction}
+                options={DIRECTIONS}
+                onChange={(v) =>
+                  commit(setKnob(tokens, KNOBS.flexDirection, v && `flex-${v}`))
+                }
+              />
+            </Row>
+          </Group>
+
+          <Group label="Alignment">
+            <Row>
+              <ToggleGroup
+                value={readKnob(tokens, KNOBS.justify)}
+                options={MAIN_AXIS[axis].map((o) => ({
+                  ...o,
+                  title: `justify-${o.v}`,
+                }))}
+                onChange={(v) =>
+                  commit(setKnob(tokens, KNOBS.justify, v && `justify-${v}`))
+                }
+              />
+            </Row>
+            <Row>
+              <ToggleGroup
+                value={readKnob(tokens, KNOBS.items)}
+                options={CROSS_AXIS[axis].map((o) => ({
+                  ...o,
+                  title: `items-${o.v}`,
+                }))}
+                onChange={(v) =>
+                  commit(setKnob(tokens, KNOBS.items, v && `items-${v}`))
+                }
+              />
+            </Row>
+          </Group>
+
+          <Group label="Gap">
+            <Row>
+              <ScaleField
+                icon={axis === "col" ? RowSpacingIcon : ColumnSpacingIcon}
+                title="gap-* — drag the icon to step the spacing scale"
+                value={readKnob(tokens, KNOBS.gap)}
+                onCommit={(v, group) =>
+                  commit(setKnob(tokens, KNOBS.gap, v && `gap-${v}`), group)
+                }
+              />
+              <span className="flex-1" />
+            </Row>
+          </Group>
         </>
       )}
     </Section>
   );
 }
 
-/** Value input with scale steppers, for spacing-scale knobs. */
-function SteppableValue({
+/** Field bound to Tailwind's spacing scale, with drag-to-scrub on the icon. */
+function ScaleField({
+  icon,
   value,
   onCommit,
+  title,
 }: {
+  icon: IconType;
   value: string | null;
-  onCommit: (v: string | null) => void;
+  onCommit: (v: string | null, group?: string) => void;
+  title?: string;
 }) {
   return (
-    <>
-      <button
-        onClick={() => onCommit(stepSpacing(value, -1))}
-        className="w-5 h-6 shrink-0 rounded bg-surface-2 text-ink-dim hover:text-ink text-2xs"
-      >
-        −
-      </button>
-      <CommitInput
-        value={value ?? ""}
-        placeholder="—"
-        onCommit={(v) => onCommit(v.trim() || null)}
-      />
-      <button
-        onClick={() => onCommit(stepSpacing(value, 1))}
-        className="w-5 h-6 shrink-0 rounded bg-surface-2 text-ink-dim hover:text-ink text-2xs"
-      >
-        +
-      </button>
-    </>
+    <Field
+      icon={icon}
+      title={title}
+      value={value ?? ""}
+      onCommit={(v) => onCommit(v.trim() || null)}
+      onScrub={(dir, group) => onCommit(stepSpacing(value, dir), group)}
+    />
   );
 }
 
 function SpacingSection({ tokens, commit }: SectionProps) {
   return (
     <Section title="Spacing">
-      <FourWay
+      <SpacingControl
         label="Padding"
+        prefix="p"
         sides={readSpacing(tokens, "p")}
-        onCommit={(s) => commit(writeSpacing(tokens, "p", s))}
+        onCommit={(s, group) => commit(writeSpacing(tokens, "p", s), group)}
       />
-      <FourWay
+      <SpacingControl
         label="Margin"
+        prefix="m"
         sides={readSpacing(tokens, "m")}
-        onCommit={(s) => commit(writeSpacing(tokens, "m", s))}
+        onCommit={(s, group) => commit(writeSpacing(tokens, "m", s), group)}
       />
     </Section>
   );
 }
 
-/** Figma-style four-way input (T / R / B / L). */
-function FourWay({
+/** Figma's padding control: axis pair by default, four sides when split.
+ * Per-side values that can't be expressed as a pair force the split open. */
+function SpacingControl({
   label,
+  prefix,
   sides,
   onCommit,
 }: {
   label: string;
+  prefix: "p" | "m";
   sides: Sides;
-  onCommit: (s: Sides) => void;
+  onCommit: (s: Sides, group?: string) => void;
 }) {
-  const set = (k: keyof Sides, v: string) =>
-    onCommit({ ...sides, [k]: v.trim() || null });
-  const cell = (k: keyof Sides, title: string) => (
-    <CommitInput
+  const [split, setSplit] = useState(false);
+  const paired = sides.t === sides.b && sides.l === sides.r;
+  const open = split || !paired;
+
+  const setSides = (patch: Partial<Sides>, group?: string) =>
+    onCommit({ ...sides, ...patch }, group);
+  const side = (k: keyof Sides, sideIcon: IconType, suffix: string) => (
+    <Field
+      icon={sideIcon}
+      title={`${prefix}${suffix}-*`}
       value={sides[k] ?? ""}
-      placeholder={title}
-      onCommit={(v) => set(k, v)}
-      width="w-full"
+      onCommit={(v) => setSides({ [k]: v.trim() || null })}
+      onScrub={(dir, group) => setSides({ [k]: stepSpacing(sides[k], dir) }, group)}
     />
   );
+
   return (
-    <div>
-      <div className="text-2xs text-ink-dim mb-1 select-none">{label}</div>
-      <div className="grid grid-cols-4 gap-1">
-        {cell("t", "T")}
-        {cell("r", "R")}
-        {cell("b", "B")}
-        {cell("l", "L")}
-      </div>
-    </div>
+    <Group
+      label={label}
+      right={
+        <IconButton
+          icon={BorderSplitIcon}
+          active={open}
+          title={
+            paired
+              ? "Split into four sides"
+              : "Per-side values — can't collapse to an axis pair"
+          }
+          onClick={() => paired && setSplit((v) => !v)}
+        />
+      }
+    >
+      {open ? (
+        <div className="grid grid-cols-2 gap-2">
+          {side("t", BorderTopIcon, "t")}
+          {side("r", BorderRightIcon, "r")}
+          {side("b", BorderBottomIcon, "b")}
+          {side("l", BorderLeftIcon, "l")}
+        </div>
+      ) : (
+        <Row>
+          <Field
+            icon={ColumnSpacingIcon}
+            title={`${prefix}x-*`}
+            value={sides.l ?? ""}
+            onCommit={(v) => setSides({ l: v.trim() || null, r: v.trim() || null })}
+            onScrub={(dir, group) => {
+              const next = stepSpacing(sides.l, dir);
+              setSides({ l: next, r: next }, group);
+            }}
+          />
+          <Field
+            icon={RowSpacingIcon}
+            title={`${prefix}y-*`}
+            value={sides.t ?? ""}
+            onCommit={(v) => setSides({ t: v.trim() || null, b: v.trim() || null })}
+            onScrub={(dir, group) => {
+              const next = stepSpacing(sides.t, dir);
+              setSides({ t: next, b: next }, group);
+            }}
+          />
+        </Row>
+      )}
+    </Group>
   );
 }
 
 function SizeSection({ tokens, commit }: SectionProps) {
-  const knob = (label: string, re: RegExp, prefix: string) => (
-    <Row label={label}>
-      <CommitInput
-        value={readKnob(tokens, re) ?? ""}
-        placeholder="—"
-        onCommit={(v) =>
-          commit(setKnob(tokens, re, v.trim() ? `${prefix}-${v.trim()}` : null))
-        }
-      />
-    </Row>
+  const [bounds, setBounds] = useState(false);
+  const field = (re: RegExp, prefixClass: string, fieldIcon: IconType) => (
+    <Field
+      icon={fieldIcon}
+      title={`${prefixClass}-*`}
+      value={readKnob(tokens, re) ?? ""}
+      onCommit={(v) =>
+        commit(setKnob(tokens, re, v.trim() ? `${prefixClass}-${v.trim()}` : null))
+      }
+      onScrub={(dir, group) => {
+        const next = stepSpacing(readKnob(tokens, re), dir);
+        commit(setKnob(tokens, re, `${prefixClass}-${next}`), group);
+      }}
+    />
   );
   return (
-    <Section title="Size">
-      <div className="grid grid-cols-2 gap-x-2 gap-y-1.5">
-        {knob("W", KNOBS.width, "w")}
-        {knob("H", KNOBS.height, "h")}
-        {knob("Min W", KNOBS.minWidth, "min-w")}
-        {knob("Min H", KNOBS.minHeight, "min-h")}
-        {knob("Max W", KNOBS.maxWidth, "max-w")}
-        {knob("Max H", KNOBS.maxHeight, "max-h")}
-      </div>
+    <Section
+      title="Size"
+      right={
+        <IconButton
+          icon={DotsHorizontalIcon}
+          active={bounds}
+          title="Min / max constraints"
+          onClick={() => setBounds((v) => !v)}
+        />
+      }
+    >
+      <Group label="Dimensions">
+        <Row>
+          {field(KNOBS.width, "w", WidthIcon)}
+          {field(KNOBS.height, "h", HeightIcon)}
+        </Row>
+      </Group>
+      {bounds && (
+        <>
+          <Group label="Minimum">
+            <Row>
+              {field(KNOBS.minWidth, "min-w", WidthIcon)}
+              {field(KNOBS.minHeight, "min-h", HeightIcon)}
+            </Row>
+          </Group>
+          <Group label="Maximum">
+            <Row>
+              {field(KNOBS.maxWidth, "max-w", WidthIcon)}
+              {field(KNOBS.maxHeight, "max-h", HeightIcon)}
+            </Row>
+          </Group>
+        </>
+      )}
     </Section>
   );
 }
 
+const TEXT_ALIGN: Array<{ v: string; icon: IconType; title: string }> = [
+  { v: "left", icon: TextAlignLeftIcon, title: "text-left" },
+  { v: "center", icon: TextAlignCenterIcon, title: "text-center" },
+  { v: "right", icon: TextAlignRightIcon, title: "text-right" },
+  { v: "justify", icon: TextAlignJustifyIcon, title: "text-justify" },
+];
+
 function TypographySection({ tokens, commit }: SectionProps) {
+  const color = readKnob(tokens, KNOBS.textColor);
   return (
-    <Section title="Typography">
-      <Row label="Size">
-        <Select
-          value={readKnob(tokens, KNOBS.fontSize)}
-          onChange={(v) => commit(setKnob(tokens, KNOBS.fontSize, v && `text-${v}`))}
-          options={FONT_SIZES.map((v) => ({ v }))}
-        />
+    <Section title="Type">
+      <Row>
+        <Group label="Size">
+          <Select
+            icon={FontSizeIcon}
+            title="text-* (size)"
+            value={readKnob(tokens, KNOBS.fontSize)}
+            onChange={(v) => commit(setKnob(tokens, KNOBS.fontSize, v && `text-${v}`))}
+            options={FONT_SIZES.map((v) => ({ v }))}
+          />
+        </Group>
+        <Group label="Weight">
+          <Select
+            icon={FontBoldIcon}
+            title="font-* (weight)"
+            value={readKnob(tokens, KNOBS.fontWeight)}
+            onChange={(v) =>
+              commit(setKnob(tokens, KNOBS.fontWeight, v && `font-${v}`))
+            }
+            options={[
+              "thin",
+              "extralight",
+              "light",
+              "normal",
+              "medium",
+              "semibold",
+              "bold",
+              "extrabold",
+              "black",
+            ].map((v) => ({ v }))}
+          />
+        </Group>
       </Row>
-      <Row label="Weight">
-        <Select
-          value={readKnob(tokens, KNOBS.fontWeight)}
-          onChange={(v) => commit(setKnob(tokens, KNOBS.fontWeight, v && `font-${v}`))}
-          options={["thin", "extralight", "light", "normal", "medium", "semibold", "bold", "extrabold", "black"].map((v) => ({ v }))}
-        />
-      </Row>
-      <Row label="Align">
-        <Select
-          value={readKnob(tokens, KNOBS.textAlign)}
-          onChange={(v) => commit(setKnob(tokens, KNOBS.textAlign, v && `text-${v}`))}
-          options={["left", "center", "right", "justify"].map((v) => ({ v }))}
-        />
-      </Row>
-      <Row label="Color">
-        <CommitInput
-          value={readKnob(tokens, KNOBS.textColor) ?? ""}
-          placeholder="e.g. zinc-400"
-          onCommit={(v) =>
-            commit(setKnob(tokens, KNOBS.textColor, v.trim() ? `text-${v.trim()}` : null))
-          }
-        />
-      </Row>
+      <Group label="Alignment">
+        <Row>
+          <ToggleGroup
+            value={readKnob(tokens, KNOBS.textAlign)}
+            options={TEXT_ALIGN}
+            onChange={(v) => commit(setKnob(tokens, KNOBS.textAlign, v && `text-${v}`))}
+          />
+        </Row>
+      </Group>
+      <Group label="Colour">
+        <Row>
+          <Field
+            prefix={<Swatch value={color} />}
+            title="text-* (colour)"
+            value={color ?? ""}
+            placeholder="zinc-400"
+            onCommit={(v) =>
+              commit(setKnob(tokens, KNOBS.textColor, v.trim() ? `text-${v.trim()}` : null))
+            }
+          />
+        </Row>
+      </Group>
     </Section>
   );
 }
 
 function FillSection({ tokens, commit }: SectionProps) {
   const borderW = readKnob(tokens, KNOBS.borderWidth);
+  const fill = readKnob(tokens, KNOBS.background);
+  const borderColor = readKnob(tokens, KNOBS.borderColor);
   return (
-    <Section title="Fill & Border">
-      <Row label="Fill">
-        <CommitInput
-          value={readKnob(tokens, KNOBS.background) ?? ""}
-          placeholder="e.g. white, zinc-900"
-          onCommit={(v) =>
-            commit(setKnob(tokens, KNOBS.background, v.trim() ? `bg-${v.trim()}` : null))
-          }
-        />
-      </Row>
-      <Row label="Border">
-        <Select
-          value={borderW === null ? null : borderW.startsWith("border") ? "1" : borderW}
-          onChange={(v) =>
-            commit(setKnob(tokens, KNOBS.borderWidth, v === null ? null : v === "1" ? "border" : `border-${v}`))
-          }
-          options={[{ v: "0" }, { v: "1" }, { v: "2" }, { v: "4" }, { v: "8" }]}
-        />
-        <CommitInput
-          value={readKnob(tokens, KNOBS.borderColor) ?? ""}
-          placeholder="color"
-          onCommit={(v) =>
-            commit(setKnob(tokens, KNOBS.borderColor, v.trim() ? `border-${v.trim()}` : null))
-          }
-        />
-      </Row>
-      <Row label="Radius">
-        <Select
-          value={readKnob(tokens, KNOBS.radius) ?? (tokens.includes("rounded") ? "rounded" : null)}
-          onChange={(v) =>
-            commit(setKnob(tokens, KNOBS.radius, v === null ? null : v === "rounded" ? "rounded" : `rounded-${v}`))
-          }
-          options={[
-            { v: "none" },
-            { v: "sm" },
-            { v: "rounded", label: "default" },
-            { v: "md" },
-            { v: "lg" },
-            { v: "xl" },
-            { v: "2xl" },
-            { v: "3xl" },
-            { v: "full" },
-          ]}
-        />
-      </Row>
-      <Row label="Shadow">
-        <Select
-          value={readKnob(tokens, KNOBS.shadow) ?? (tokens.includes("shadow") ? "shadow" : null)}
-          onChange={(v) =>
-            commit(setKnob(tokens, KNOBS.shadow, v === null ? null : v === "shadow" ? "shadow" : `shadow-${v}`))
-          }
-          options={[
-            { v: "none" },
-            { v: "sm" },
-            { v: "shadow", label: "default" },
-            { v: "md" },
-            { v: "lg" },
-            { v: "xl" },
-            { v: "2xl" },
-            { v: "inner" },
-          ]}
-        />
-      </Row>
-    </Section>
+    <>
+      <Section title="Fill">
+        <Row>
+          <Field
+            prefix={<Swatch value={fill} />}
+            title="bg-*"
+            value={fill ?? ""}
+            placeholder="zinc-900"
+            onCommit={(v) =>
+              commit(setKnob(tokens, KNOBS.background, v.trim() ? `bg-${v.trim()}` : null))
+            }
+          />
+        </Row>
+      </Section>
+
+      <Section title="Stroke">
+        <Row>
+          <Group label="Width">
+            <Select
+              icon={BorderWidthIcon}
+              title="border / border-*"
+              value={borderW === null ? null : borderW.startsWith("border") ? "1" : borderW}
+              onChange={(v) =>
+                commit(
+                  setKnob(
+                    tokens,
+                    KNOBS.borderWidth,
+                    v === null ? null : v === "1" ? "border" : `border-${v}`,
+                  ),
+                )
+              }
+              options={[{ v: "0" }, { v: "1" }, { v: "2" }, { v: "4" }, { v: "8" }]}
+            />
+          </Group>
+          <Group label="Colour">
+            <Field
+              prefix={<Swatch value={borderColor} />}
+              title="border-* (colour)"
+              value={borderColor ?? ""}
+              placeholder="colour"
+              onCommit={(v) =>
+                commit(
+                  setKnob(tokens, KNOBS.borderColor, v.trim() ? `border-${v.trim()}` : null),
+                )
+              }
+            />
+          </Group>
+        </Row>
+      </Section>
+
+      <Section title="Appearance">
+        <Row>
+          <Group label="Corner radius">
+            <Select
+              icon={CornersIcon}
+              title="rounded-*"
+              value={
+                readKnob(tokens, KNOBS.radius) ??
+                (tokens.includes("rounded") ? "rounded" : null)
+              }
+              onChange={(v) =>
+                commit(
+                  setKnob(
+                    tokens,
+                    KNOBS.radius,
+                    v === null ? null : v === "rounded" ? "rounded" : `rounded-${v}`,
+                  ),
+                )
+              }
+              options={[
+                { v: "none" },
+                { v: "sm" },
+                { v: "rounded", label: "default" },
+                { v: "md" },
+                { v: "lg" },
+                { v: "xl" },
+                { v: "2xl" },
+                { v: "3xl" },
+                { v: "full" },
+              ]}
+            />
+          </Group>
+          <Group label="Shadow">
+            <Select
+              icon={ShadowIcon}
+              title="shadow-*"
+              value={
+                readKnob(tokens, KNOBS.shadow) ??
+                (tokens.includes("shadow") ? "shadow" : null)
+              }
+              onChange={(v) =>
+                commit(
+                  setKnob(
+                    tokens,
+                    KNOBS.shadow,
+                    v === null ? null : v === "shadow" ? "shadow" : `shadow-${v}`,
+                  ),
+                )
+              }
+              options={[
+                { v: "none" },
+                { v: "sm" },
+                { v: "shadow", label: "default" },
+                { v: "md" },
+                { v: "lg" },
+                { v: "xl" },
+                { v: "2xl" },
+                { v: "inner" },
+              ]}
+            />
+          </Group>
+        </Row>
+      </Section>
+    </>
   );
 }
 
 /** The raw class list — the escape hatch (FR-3.6). */
-function ClassesField({
+function ClassesSection({
   className,
   onCommit,
 }: {
@@ -409,11 +609,11 @@ function ClassesField({
 }) {
   const [draft, setDraft] = useState(className);
   useEffect(() => setDraft(className), [className]);
+  // Conflicts the knobs can't see: two `p-*`, a stray `flex` under a `grid`.
+  const tidied = mergeClasses(draft);
+  const hasConflicts = tidied !== draft.trim().replace(/\s+/g, " ");
   return (
-    <div className="px-3 py-3 border-b border-line">
-      <div className="text-2xs uppercase tracking-wider text-ink-faint mb-2 select-none">
-        Classes
-      </div>
+    <Section title="Classes">
       <textarea
         value={draft}
         spellCheck={false}
@@ -429,8 +629,20 @@ function ClassesField({
             e.stopPropagation();
           }
         }}
-        className="w-full resize-y bg-surface-2 border border-line rounded px-2 py-1.5 text-2xs font-mono text-ink leading-relaxed focus:outline-none focus:border-accent"
+        className="w-full resize-y rounded-md border border-transparent bg-surface-2 px-2 py-1.5 font-mono text-xs leading-relaxed text-ink outline-none hover:border-line-strong focus:border-accent"
       />
-    </div>
+      {hasConflicts && (
+        <button
+          onClick={() => {
+            setDraft(tidied);
+            onCommit(tidied);
+          }}
+          title={tidied}
+          className="mt-1 text-2xs text-ink-faint hover:text-accent"
+        >
+          Tidy — drop overridden classes
+        </button>
+      )}
+    </Section>
   );
 }

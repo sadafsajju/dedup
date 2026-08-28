@@ -17,7 +17,7 @@ pub fn run(
     let script = sidecar::ensure_named_bundle(root, "dedup-scan.mjs", SCAN_BUNDLE)?;
     let node = sidecar::find_node()?;
 
-    let mut child = Command::new(node)
+    let mut child = crate::toolpath::apply(&mut Command::new(node))
         .arg(&script)
         .current_dir(root)
         .stdin(Stdio::piped())

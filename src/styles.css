@@ -1,30 +1,65 @@
-@import "tailwindcss";
+/* `theme(static)` emits every theme variable, not just the used ones — the
+   inspector's colour swatches resolve Tailwind tokens by painting
+   `var(--color-zinc-400)` directly, so the whole palette has to be present. */
+@import "tailwindcss" theme(static);
 
-/* dedup — dark-mode-first, Figma-inspector-inspired palette (FR-6.5) */
+/* dedup — dark-first canvas UI (FR-6.5).
+ *
+ * The shape of the app is a design tool's: a full-bleed canvas with the
+ * chrome floating over it on rounded, elevated panels, rather than the
+ * hard-docked columns of an IDE. Two consequences run through every token
+ * below:
+ *
+ *  - Panels are lighter than the canvas and separated by *elevation* (a
+ *    hairline of light + a soft shadow), not by 1px dividers. `--color-line`
+ *    is therefore a low-alpha white rather than a solid grey — it reads
+ *    correctly on a panel and on the canvas without a second token.
+ *  - Radii are generous and consistent: 10px on controls, 14–16px on panels.
+ *    A control that reuses the panel radius, or vice versa, is the thing that
+ *    makes an interface look assembled rather than designed.
+ */
 @theme {
-  --color-surface-0: #0d0d10; /* app background / canvas gutter */
-  --color-surface-1: #141418; /* panels: sidebar, inspector */
-  --color-surface-2: #1c1c22; /* raised controls, inputs */
-  --color-surface-3: #26262d; /* hover / active control */
-  --color-line: #2a2a31; /* hairline borders */
-  --color-line-strong: #3a3a44;
+  --color-surface-0: #08080a; /* canvas / app backdrop */
+  --color-surface-1: #1b1b20; /* floating panels */
+  --color-surface-2: #26262c; /* fields + raised controls */
+  --color-surface-3: #323239; /* hover / active control */
+  /* Separators are light-on-dark at low alpha: one token that works both on
+     the panels and against the canvas behind them. */
+  --color-line: #ffffff17;
+  --color-line-strong: #ffffff2b;
 
-  --color-ink: #e6e6ea; /* primary text */
-  --color-ink-dim: #9a9aa5; /* secondary text / labels */
-  --color-ink-faint: #6a6a75; /* tertiary / placeholders */
+  --color-ink: #ededf0; /* primary text */
+  --color-ink-dim: #9c9ca6; /* secondary text / labels */
+  --color-ink-faint: #6b6b76; /* tertiary / placeholders */
 
-  --color-accent: #4c7fff; /* selection blue */
-  --color-accent-soft: #2b3b66;
-  --color-positive: #3ecf8e;
-  --color-warn: #e5b567;
-  --color-danger: #e5484d;
+  --color-accent: #2b8fff; /* selection + primary action */
+  --color-accent-soft: #12324f;
+  --color-positive: #34d399;
+  --color-warn: #f0b34a;
+  --color-danger: #f2555a;
 
-  --text-2xs: 0.6875rem; /* 11px — Figma label size */
+  --text-2xs: 0.6875rem; /* 11px — dense label size */
   --text-xs: 0.75rem; /* 12px */
+
+  --radius-control: 8px;
+  --radius-panel: 14px;
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* Native controls (select popups, scrollbars, focus rings) follow the app. */
+:root {
+  color-scheme: dark;
+  /* One definition of "a panel floating over the canvas": a hairline of light
+     on the top edge, a wider ambient shadow, and a tight contact shadow. Used
+     by .panel below and by anything that needs the same read. */
+  --elevation:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 0 0 1px var(--color-line),
+    0 1px 2px rgba(0, 0, 0, 0.5),
+    0 16px 40px -12px rgba(0, 0, 0, 0.7);
 }
 
 html,
@@ -45,7 +80,20 @@ body {
   user-select: none;
 }
 
-/* thin, unobtrusive scrollbars for the Figma feel */
+/* A floating chrome surface. Deliberately a class and not a Tailwind recipe
+   repeated per component: every panel in the app has to sit at exactly the
+   same elevation, or the illusion that they are all on one plane above the
+   canvas falls apart. */
+.panel {
+  background: color-mix(in srgb, var(--color-surface-1) 96%, transparent);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--elevation);
+}
+
+/* Thin, unobtrusive scrollbars — the chrome should not compete with the app
+   being designed inside it. */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -57,6 +105,9 @@ body {
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #4a4a55;
+  background: #ffffff40;
   background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
