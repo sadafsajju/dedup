@@ -117,14 +117,42 @@ pub fn prompt(text: &str, model: Option<&str>) -> Result<String, String> {
     stdin_thread.join().ok();
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
+
+    // Operational failures — an expired login, a rate limit — come back as a
+    // result envelope on STDOUT, with a non-zero exit and an *empty* stderr.
+    // So checking the status first and reporting stderr produced
+    // "claude exited with Some(1): ": an error message containing no error,
+    // while the CLI's own explanation sat unread in the envelope. Whenever
+    // there is an envelope, it is the better source.
     if !status.success() {
-        return Err(format!(
-            "claude exited with {:?}: {}",
-            status.code(),
-            stderr.trim()
-        ));
+        return Err(match parse_result_envelope(&stdout) {
+            Err(reason) if !stdout.trim().is_empty() => with_hint(reason),
+            _ if !stderr.trim().is_empty() => {
+                with_hint(format!("claude: {}", stderr.trim()))
+            }
+            _ => format!(
+                "claude exited with {:?} and reported nothing — run `claude` in a terminal to check it starts and is signed in",
+                status.code()
+            ),
+        });
     }
     parse_result_envelope(&stdout)
+}
+
+/// Point at the fix when the message is one dedup can recognise. An expired
+/// login is by far the most common failure here and is not self-evidently
+/// solvable from inside the app — dedup cannot re-authenticate the user's CLI.
+fn with_hint(reason: String) -> String {
+    let lower = reason.to_lowercase();
+    if lower.contains("authenticate")
+        || lower.contains("oauth")
+        || lower.contains("unauthorized")
+        || lower.contains("log in")
+        || lower.contains("login")
+    {
+        return format!("{reason} — run `claude` in a terminal and sign in, then try again");
+    }
+    reason
 }
 
 /// `--output-format json` wraps the answer in an envelope; the text lives in
@@ -159,5 +187,24 @@ mod tests {
 
         assert!(parse_result_envelope("not json").is_err());
         assert!(parse_result_envelope(r#"{"type":"result"}"#).is_err());
+    }
+
+    /// Regression: an expired login exits 1 with an EMPTY stderr and puts the
+    /// reason in the envelope on stdout. Reporting stderr gave the user
+    /// "claude exited with Some(1): " — a failure message with the failure
+    /// removed, and no way to guess that they simply needed to sign in.
+    #[test]
+    fn an_expired_login_reports_its_real_reason() {
+        let envelope = r#"{"type":"result","is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#;
+        let reason = with_hint(parse_result_envelope(envelope).unwrap_err());
+        assert!(reason.contains("OAuth session expired"), "{reason}");
+        assert!(reason.contains("sign in"), "must point at the fix: {reason}");
+    }
+
+    #[test]
+    fn hints_are_only_added_where_they_apply() {
+        let rate = with_hint("claude reported an error: rate limited".to_string());
+        assert_eq!(rate, "claude reported an error: rate limited");
+        assert!(with_hint("Unauthorized".to_string()).contains("sign in"));
     }
 }
