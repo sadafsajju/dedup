@@ -17,6 +17,7 @@ import { parse } from "@babel/parser";
 import MagicString from "magic-string";
 import fs from "node:fs";
 import { collectJsx } from "./jsxwalk.mjs";
+import { discoverRoutes } from "./routes.mjs";
 
 // className must stay a plain single-line string; anything else is refused.
 const SAFE_CLASS_RE = /^[^"'`\\\n\r]*$/;
@@ -645,6 +646,10 @@ process.stdin.on("end", () => {
   try {
     const req = JSON.parse(input);
     if (req.cmd === "inspect") result = inspect(req);
+    // Route discovery from outside the dev server. Vite projects get this
+    // over HTTP from the tagger's middleware; Next has no middleware to add
+    // one to, so this is the only way its file-based routes are ever found.
+    else if (req.cmd === "routes") result = { ok: true, routes: discoverRoutes(req.root) };
     else if (req.cmd === "apply") result = apply(req);
     else if (req.cmd === "writeFile") result = writeFile(req);
     else result = { ok: false, error: `unknown cmd: ${req.cmd}` };

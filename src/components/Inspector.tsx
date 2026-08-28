@@ -5,6 +5,7 @@ import { NextSetup } from "./NextSetup";
 import {
   ChatBubbleIcon,
   ChevronRightIcon,
+  CodeIcon,
   Component1Icon,
   ComponentInstanceIcon,
   ExclamationTriangleIcon,
@@ -44,9 +45,10 @@ function ElementActions() {
           className="w-full rounded border border-line bg-surface-2 px-1.5 py-1 text-2xs text-ink outline-none focus:border-accent"
         />
       ) : (
-        <div className="text-2xs text-ink-faint leading-relaxed">
-          Text isn't editable here — {sourceInfo.textReason ?? "not a text element"}.
-        </div>
+        <OpenInCode
+          reason={sourceInfo.textReason ?? "not a text element"}
+          line={sourceInfo.line}
+        />
       )}
 
       <div className="mt-2 flex items-center gap-2">
@@ -74,6 +76,41 @@ function ElementActions() {
 }
 
 /** Human explanation for why inspection is off (FR-1.6 honesty). */
+/**
+ * What the inspector offers where it refuses to edit.
+ *
+ * The refusal itself stays — dedup will not guess at a className built by
+ * `cn(...)` or text that comes from a prop. But it knows the file and the
+ * line that produced them, so the honest answer comes with a way out rather
+ * than being a dead end: one click puts the user in front of that exact code.
+ */
+function OpenCodeButton({ line }: { line: number }) {
+  const selected = useStore((s) => s.selected);
+  const openCode = useStore((s) => s.openCode);
+  const file = selected ? (parseDedupId(selected.dedupId)?.file ?? null) : null;
+  if (!file) return null;
+  return (
+    <button
+      onClick={() => void openCode(file, line)}
+      title={`Open ${file}:${line} — edit it directly`}
+      className="mt-px flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-ink-faint hover:bg-surface-3 hover:text-ink"
+    >
+      <CodeIcon width={13} height={13} />
+    </button>
+  );
+}
+
+function OpenInCode({ reason, line }: { reason: string; line: number }) {
+  return (
+    <div className="flex items-start gap-1.5">
+      <span className="flex-1 text-2xs text-ink-faint leading-relaxed">
+        {reason}
+      </span>
+      <OpenCodeButton line={line} />
+    </div>
+  );
+}
+
 function noInspectionReason(
   mode: "custom" | "framework" | "script" | "error" | "next-optin",
   detail: string | null,
@@ -251,12 +288,13 @@ export function Inspector() {
                   height={13}
                   className="text-warn shrink-0 mt-px"
                 />
-                <div className="text-2xs text-ink-dim leading-relaxed">
+                <div className="flex-1 text-2xs text-ink-dim leading-relaxed">
                   <span className="text-ink">Read-only:</span> this element's
                   classes are {sourceInfo.reason ?? "not statically editable"}.
-                  Edit it in your editor — dedup only rewrites what it can
-                  rewrite safely.
+                  dedup only rewrites what it can rewrite safely — open the
+                  source to change it yourself.
                 </div>
+                <OpenCodeButton line={sourceInfo.line} />
               </div>
               {selected.domClassName && (
                 <div className="mt-2 text-2xs font-mono text-ink-faint break-words select-text">

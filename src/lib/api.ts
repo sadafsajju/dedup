@@ -239,6 +239,13 @@ export const onInstrumentation = (
     cb(e.payload),
   );
 
+/** Page routes read from the project's files — works with no dev server, and
+ *  is the only route source a Next.js project has (no middleware to add). */
+export const detectRoutesFromSource = (root: string) =>
+  invoke<{ ok: boolean; routes?: string[]; error?: string }>("detect_routes", {
+    root,
+  });
+
 /** What dedup can do for a Next.js project: wired, offered (with the exact
  *  config diff), or unavailable with a reason. Read-only. */
 export const nextStatus = (root: string) =>

@@ -4,9 +4,14 @@
 // scan can't know about — dynamic paths like /orders/42). Clicking a row
 // opens the route as a page artboard if it isn't one and pans the canvas to
 // it — the same focusRoute path a canvas navigation takes.
+//
+// Nothing is on the canvas until a row here is clicked. Mounting an artboard
+// boots the user's real app — their auth guards, their data fetching, their
+// analytics — so dedup opens the page they asked for and no others.
 import { useEffect } from "react";
 import { useStore } from "../lib/store";
 import {
+  Cross2Icon,
   FileTextIcon,
   LockClosedIcon,
   LockOpen1Icon,
@@ -28,6 +33,7 @@ export function PagesTab() {
   const selectedRoute = useStore((s) => s.selectedRoute);
   const fetchDetectedRoutes = useStore((s) => s.fetchDetectedRoutes);
   const focusRoute = useStore((s) => s.focusRoute);
+  const closeRoute = useStore((s) => s.closeRoute);
   const sessionSeed = useStore((s) => s.sessionSeed);
   const openSessionModal = useStore((s) => s.openSessionModal);
   const sessionModes = useStore((s) => s.sessionModes);
@@ -65,7 +71,7 @@ export function PagesTab() {
       <div className="px-3 py-2 text-2xs border-b border-line flex items-center gap-2">
         <span className="text-ink-faint">
           {rows.length} page{rows.length === 1 ? "" : "s"} ·{" "}
-          {routes.length} open
+          {routes.length === 0 ? "none open" : `${routes.length} open`}
         </span>
         <span className="flex-1" />
         <button
@@ -81,8 +87,13 @@ export function PagesTab() {
       {detectedRoutes.length === 0 && (
         <div className="px-3 py-2 text-2xs text-ink-dim border-b border-line">
           {instrumentation && !instrumentation.active
-            ? "Route detection needs element tagging, which is off for this session. Pages you browse to still appear here."
-            : "No routes detected — only static react-router paths are found. Browse to a page (browse tool) to add it here."}
+            ? "Route detection needs element tagging, which is off for this session. Open the home page below, then browse from there — where you land is added here."
+            : "No routes detected — only static react-router and Next file routes are found. Open the home page below, then use the browse tool; where you land is added here."}
+        </div>
+      )}
+      {routes.length === 0 && (
+        <div className="px-3 py-2 text-2xs text-ink-dim border-b border-line">
+          Click a page to open it as an artboard.
         </div>
       )}
       <div className="flex-1 overflow-y-auto py-1">
@@ -147,6 +158,16 @@ export function PagesTab() {
                     canSignOut={!!devAltUrl}
                     onPick={(next) => setSessionMode(route, next)}
                   />
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeRoute(route);
+                    }}
+                    title="Close this artboard — stops running this page. Staged edits are kept."
+                    className="shrink-0 rounded p-0.5 text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-surface-3"
+                  >
+                    <Cross2Icon width={11} height={11} />
+                  </button>
                 </>
               )}
               {locked && (

@@ -151,9 +151,18 @@ export function NextSetup() {
         </span>
       </div>
 
-      {/* The harness is genuinely Vite-only; say so rather than let the
-          Components tab look broken later. */}
+      {/* Both limitations, said before the user opts in rather than
+          discovered afterwards. */}
       <div className="px-3 pb-2 text-[10px] text-ink-faint">
+        {status?.state === "offered" && status.needsWebpack && (
+          <div className="mb-1">
+            Your dev script uses Turbopack, which never runs the hook dedup tags
+            through — so while inspecting, dedup starts the dev server with{" "}
+            <span className="font-mono">--webpack</span>. Same script, same env,
+            different bundler: slower to start, and not what your own{" "}
+            <span className="font-mono">next dev</span> uses.
+          </div>
+        )}
         Isolated component previews (the Components tab) stay Vite-only — they
         need the dev server to serve arbitrary module URLs, which Next doesn't.
       </div>

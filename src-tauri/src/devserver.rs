@@ -90,8 +90,11 @@ impl From<ExecSpec> for Launch {
 /// How to launch the dev server.
 #[derive(Clone)]
 pub enum ExecSpec {
-    /// `<pm> run dev` in the project root.
-    Script(PackageManager),
+    /// `<pm> run dev` in the project root, plus any extra args forwarded to
+    /// the script itself (how dedup adds `--webpack` to a Next dev server
+    /// without replacing the user's script and losing its env, e.g. the
+    /// `NODE_OPTIONS=--max-old-space-size` a big app needs).
+    Script(PackageManager, Vec<String>),
     /// User-supplied command through a shell (FR-1.3 escape hatch).
     Shell(String),
     /// Direct binary invocation — used for the instrumented Vite launch
@@ -104,7 +107,7 @@ pub enum ExecSpec {
 
 impl Default for ExecSpec {
     fn default() -> Self {
-        ExecSpec::Script(PackageManager::Unknown)
+        ExecSpec::Script(PackageManager::Unknown, Vec::new())
     }
 }
 
@@ -419,7 +422,7 @@ fn build_command(root: &str, exec: &ExecSpec) -> Command {
             c.args(args).current_dir(root);
             c
         }
-        ExecSpec::Script(pm) => {
+        ExecSpec::Script(pm, extra) => {
             let bin = match pm {
                 PackageManager::Pnpm => "pnpm",
                 PackageManager::Yarn => "yarn",
@@ -438,6 +441,14 @@ fn build_command(root: &str, exec: &ExecSpec) -> Command {
                 _ => {
                     c.arg("run").arg("dev");
                 }
+            }
+            if !extra.is_empty() {
+                // npm is the odd one out: it needs `--` before args meant for
+                // the script rather than for npm itself.
+                if matches!(pm, PackageManager::Npm | PackageManager::Unknown) {
+                    c.arg("--");
+                }
+                c.args(extra);
             }
             c.current_dir(root);
             c

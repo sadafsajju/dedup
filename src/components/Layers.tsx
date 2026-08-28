@@ -126,6 +126,7 @@ export function LayersTab() {
   const selectedId = useStore((s) => s.selected?.dedupId ?? null);
   const devStatus = useStore((s) => s.devStatus);
   const instrumentation = useStore((s) => s.instrumentation);
+  const setSidebarTab = useStore((s) => s.setSidebarTab);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -175,6 +176,25 @@ export function LayersTab() {
   const populated = routes.filter((r) => (layers[r] ?? []).length > 0);
 
   if (populated.length === 0) {
+    // No artboard open is a different situation from one that hasn't reported
+    // yet: it has an action attached, so it gets its own state rather than an
+    // explanation of something the user hasn't done.
+    if (routes.length === 0 && devStatus === "ready") {
+      return (
+        <div className="flex-1 flex flex-col items-center justify-center px-6 text-center gap-2">
+          <LayersIcon width={22} height={22} className="text-ink-faint" />
+          <div className="text-2xs text-ink-dim">
+            No page open yet — layers appear once you open one.
+          </div>
+          <button
+            onClick={() => setSidebarTab("pages")}
+            className="text-2xs text-accent hover:underline"
+          >
+            Go to Pages
+          </button>
+        </div>
+      );
+    }
     const reason =
       instrumentation && !instrumentation.active
         ? (instrumentation.detail ??

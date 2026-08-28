@@ -14,6 +14,7 @@ const TAGGER_BUNDLE: &str = include_str!("../assets/dedup-tagger.mjs");
 const OVERLAY_SRC: &str = include_str!("../assets/dedup-overlay.js");
 const NEXT_WRAPPER: &str = include_str!("../assets/dedup-next.mjs");
 const NEXT_LOADER: &str = include_str!("../assets/dedup-next-loader.cjs");
+const NEXT_TYPES: &str = include_str!("../assets/dedup-next.d.mts");
 
 pub struct Instrumentation {
     /// Absolute path to the executable to spawn (node_modules/.bin/vite).
@@ -191,15 +192,65 @@ mod tests {
 #[serde(rename_all = "camelCase", tag = "state")]
 pub enum NextStatus {
     /// The config already calls `withDedup` — tagging is on.
-    Wired { config: String },
+    Wired {
+        config: String,
+        /// The project's dev server would otherwise run Turbopack, so dedup
+        /// launches it under webpack; the UI says so.
+        needs_webpack: bool,
+    },
     /// A config exists and could be wrapped; here is the change.
     Offered {
         config: String,
         before: String,
         after: String,
+        needs_webpack: bool,
     },
     /// Nothing dedup knows how to edit safely; inspection stays off.
     Unavailable { reason: String },
+}
+
+/// Why this project's dev server won't run dedup's webpack hook, or None.
+///
+/// Two ways a project ends up on Turbopack: the flag on its dev script, and
+/// Next 16, where Turbopack is the default and `--webpack` is the opt-out.
+fn turbopack_reason(root: &Path) -> Option<String> {
+    #[derive(serde::Deserialize, Default)]
+    struct Pkg {
+        #[serde(default)]
+        scripts: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        dependencies: std::collections::HashMap<String, String>,
+        #[serde(default, rename = "devDependencies")]
+        dev_dependencies: std::collections::HashMap<String, String>,
+    }
+    let pkg: Pkg = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+
+    let dev = pkg.scripts.get("dev").cloned().unwrap_or_default();
+    if dev.contains("--webpack") {
+        return None; // explicitly opted back into webpack
+    }
+    if dev.contains("--turbopack") || dev.contains("--turbo") {
+        return Some("the dev script asks for Turbopack".into());
+    }
+    let version = pkg
+        .dependencies
+        .get("next")
+        .or_else(|| pkg.dev_dependencies.get("next"))
+        .cloned()
+        .unwrap_or_default();
+    let major: u32 = version
+        .trim_start_matches(['^', '~', '>', '=', 'v', ' '])
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    if major >= 16 {
+        return Some(format!("Next {major} runs Turbopack by default"));
+    }
+    None
 }
 
 const NEXT_CONFIGS: [&str; 4] = [
@@ -227,6 +278,11 @@ fn write_next_assets(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("write next wrapper: {e}"))?;
     std::fs::write(dir.join("next-loader.cjs"), NEXT_LOADER)
         .map_err(|e| format!("write next loader: {e}"))?;
+    // Sits beside next.mjs so TypeScript resolves `next.d.mts` for it — a
+    // strict next.config.ts importing an untyped module is a TS7016 error,
+    // and that would make dedup's own line break dedup's typecheck gate.
+    std::fs::write(dir.join("next.d.mts"), NEXT_TYPES)
+        .map_err(|e| format!("write next types: {e}"))?;
     // The client entry is the overlay, gated to framed pages. The boot script
     // (mock session + hold) is served per request on Vite; on Next there is no
     // request to hook, so the overlay carries itself alone and the seed stays
@@ -289,10 +345,24 @@ fn wrap_next_config(source: &str, esm: bool) -> Result<String, String> {
 /// Report what dedup can do for this Next project, writing the assets it will
 /// need either way (they are inert until the config calls them).
 pub fn next_status(root: &str) -> NextStatus {
-    let root_path = Path::new(root);
-    if let Err(e) = write_next_assets(root_path) {
+    if let Err(e) = write_next_assets(Path::new(root)) {
         return NextStatus::Unavailable { reason: e };
     }
+    inspect_next_config(root)
+}
+
+/// The same verdict with **no side effects** — nothing written, nothing
+/// created. The compatibility card runs before the user has decided to open
+/// the project at all, and a read-only probe must not start putting files in
+/// their `node_modules`.
+pub fn inspect_next_config(root: &str) -> NextStatus {
+    let root_path = Path::new(root);
+
+    // Turbopack does not run `webpack()`, so the wrapper would be inert on a
+    // Turbopack dev server. That is a launch detail rather than a dealbreaker:
+    // dedup starts the dev server itself, so it can start it under webpack.
+    // Verified against Next 16.2.4 — `--webpack` is still supported there.
+    let needs_webpack = turbopack_reason(root_path).is_some();
     let Some(config) = find_next_config(root_path) else {
         return NextStatus::Unavailable {
             reason: "this project has no next.config file for dedup to extend".into(),
@@ -308,7 +378,7 @@ pub fn next_status(root: &str) -> NextStatus {
         };
     };
     if source.contains("withDedup") {
-        return NextStatus::Wired { config: name };
+        return NextStatus::Wired { config: name, needs_webpack };
     }
     let esm = name.ends_with(".mjs") || name.ends_with(".ts") || source.contains("export default");
     match wrap_next_config(&source, esm) {
@@ -316,6 +386,7 @@ pub fn next_status(root: &str) -> NextStatus {
             config: name,
             before: source,
             after,
+            needs_webpack,
         },
         Err(reason) => NextStatus::Unavailable { reason },
     }
@@ -353,6 +424,59 @@ mod next_tests {
     fn refuses_a_config_it_already_wrapped() {
         let once = wrap_next_config("export default nextConfig;\n", true).unwrap();
         assert!(wrap_next_config(&once, true).is_err());
+    }
+
+    /// Turbopack ignores `webpack()`, so the wrapper alone would tag nothing.
+    /// dedup starts the dev server, so the answer is to start it under
+    /// webpack — verified against Next 16.2.4, where `--webpack` still works.
+    /// What this pins is that the *need* is detected; refusing the wrapper
+    /// outright would leave a Turbopack project with no way to ever enable
+    /// inspection.
+    #[test]
+    fn turbopack_projects_are_offered_the_wrapper_and_flagged_for_webpack() {
+        let dir = std::env::temp_dir().join(format!("dedup-turbo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("next.config.mjs"), "export default {};\n").unwrap();
+        let root = dir.to_str().unwrap();
+
+        let needs = |pkg: &str| {
+            std::fs::write(dir.join("package.json"), pkg).unwrap();
+            match inspect_next_config(root) {
+                NextStatus::Offered { needs_webpack, .. } => needs_webpack,
+                other => panic!("expected Offered, got {other:?}"),
+            }
+        };
+
+        // The flag on the dev script.
+        assert!(needs(
+            r#"{"scripts":{"dev":"next dev --turbopack"},"dependencies":{"next":"15.1.0"}}"#
+        ));
+        // Next 16 runs Turbopack even with no flag.
+        assert!(needs(
+            r#"{"scripts":{"dev":"next dev"},"dependencies":{"next":"^16.2.4"}}"#
+        ));
+        // ...unless they opted back into webpack themselves.
+        assert!(!needs(
+            r#"{"scripts":{"dev":"next dev --webpack"},"dependencies":{"next":"^16.2.4"}}"#
+        ));
+        // Next 15 without the flag is webpack already.
+        assert!(!needs(
+            r#"{"scripts":{"dev":"next dev"},"dependencies":{"next":"15.1.0"}}"#
+        ));
+
+        // A wired config carries the same answer, so the launcher knows.
+        std::fs::write(dir.join("package.json"), r#"{"scripts":{"dev":"next dev --turbopack"},"dependencies":{"next":"16.2.4"}}"#).unwrap();
+        std::fs::write(
+            dir.join("next.config.mjs"),
+            "import { withDedup } from \"./node_modules/.dedup/next.mjs\";\nexport default withDedup({});\n",
+        )
+        .unwrap();
+        match inspect_next_config(root) {
+            NextStatus::Wired { needs_webpack, .. } => assert!(needs_webpack),
+            other => panic!("expected Wired, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

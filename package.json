@@ -18,7 +18,8 @@
     "test:errors": "node plugin-src/run-ts.mjs plugin-src/errors.test.mts",
     "test:origins": "node plugin-src/run-ts.mjs plugin-src/origins.test.mts",
     "test:merge": "node plugin-src/merge.test.mjs",
-    "test:proposal": "node plugin-src/run-ts.mjs plugin-src/merge.proposal.test.mts"
+    "test:proposal": "node plugin-src/run-ts.mjs plugin-src/merge.proposal.test.mts",
+    "test:highlight": "node plugin-src/run-ts.mjs plugin-src/highlight.test.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

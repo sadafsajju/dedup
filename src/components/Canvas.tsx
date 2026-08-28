@@ -18,7 +18,7 @@ import { frameUrl, resolveOrigin } from "../lib/origins";
 import { PALETTE } from "../lib/palette";
 import { VIEWPORTS } from "../lib/types";
 import type { DropPosition, LayerNode, SelectedElement } from "../lib/types";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { Cross2Icon, FileTextIcon, ReloadIcon } from "@radix-ui/react-icons";
 
 /** Zoom about a point given in canvas-container coordinates, keeping the
  * point visually fixed (Figma semantics). */
@@ -90,6 +90,10 @@ export function Canvas() {
   const editorTab = useStore((s) => s.editorTab);
   const selectedRoute = useStore((s) => s.selectedRoute);
   const setSelectedRoute = useStore((s) => s.setSelectedRoute);
+  const closeRoute = useStore((s) => s.closeRoute);
+  // Opening/closing the code panel changes how much canvas is visible, so the
+  // artboards re-centre for it the same way they do for a viewport change.
+  const codePanelOpen = useStore((s) => s.codePanel !== null);
   const containerRef = useRef<HTMLDivElement>(null);
   // Space-held hand tool + active drag (space-drag or middle-drag).
   const [spaceHeld, setSpaceHeld] = useState(false);
@@ -367,16 +371,21 @@ export function Canvas() {
     if (!el || !devUrl) return;
     const { width } = el.getBoundingClientRect();
     const z = useStore.getState().zoom;
-    const { sidebar, inspector } = useStore.getState().panelWidths;
+    const state = useStore.getState();
+    const { sidebar, inspector, code } = state.panelWidths;
     const left = sidebar + CHROME_GUTTER;
-    const right = inspector + CHROME_GUTTER;
+    // The code panel sits between the canvas and the inspector when open, so
+    // it takes its width out of the free space too — otherwise the artboard
+    // centres itself underneath it.
+    const right =
+      inspector + CHROME_GUTTER + (state.codePanel ? code + CHROME_GUTTER : 0);
     const free = Math.max(width - left - right, 0);
     setPan({
       x: Math.max(left + (free - viewport.width * z) / 2, left),
       y: CHROME_TOP,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [devUrl, viewportId]);
+  }, [devUrl, viewportId, codePanelOpen]);
 
   function startDrag(e: React.PointerEvent<HTMLElement>) {
     dragRef.current = { x: e.clientX, y: e.clientY };
@@ -507,6 +516,26 @@ export function Canvas() {
             </div>
           )}
         </CenteredPanel>
+      ) : routes.length === 0 ? (
+        // Dev server is up, nothing mounted yet. The canvas says what to do
+        // rather than showing an empty grid that reads as a failure.
+        <CenteredPanel>
+          <FileTextIcon width={20} height={20} className="text-ink-faint" />
+          <div className="text-[13px] text-ink mt-3">No page open</div>
+          <p className="text-2xs text-ink-dim mt-1.5 max-w-xs text-center">
+            Pick a page in the Pages panel to open it as an artboard. Each one
+            runs your real app, so dedup waits for you to choose.
+          </p>
+          <button
+            onClick={() => {
+              useStore.getState().setSidebarTab("pages");
+              useStore.getState().focusRoute("/");
+            }}
+            className="mt-4 rounded-lg px-3 py-1.5 text-2xs font-medium bg-accent text-white hover:brightness-110"
+          >
+            Open the home page
+          </button>
+        </CenteredPanel>
       ) : (
         <>
           {httpsWarning && (
@@ -522,7 +551,7 @@ export function Canvas() {
           {routes.map((route, i) => (
             <div
               key={route}
-              className="absolute flex items-baseline gap-1.5 text-2xs select-none cursor-pointer"
+              className="group absolute flex items-baseline gap-1.5 text-2xs select-none cursor-pointer"
               style={{
                 left: pan.x + i * pageStep * zoom,
                 top: pan.y - 22,
@@ -590,6 +619,20 @@ export function Canvas() {
                   mock session
                 </span>
               )}
+              {/* Close the artboard from where the user is already looking.
+                  Hover-revealed: the label is read far more often than it is
+                  dismissed, and a permanent × next to every page name would
+                  compete with the name itself. */}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeRoute(route);
+                }}
+                title="Close this artboard — stops running this page. Staged edits are kept."
+                className="shrink-0 rounded p-0.5 text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink hover:bg-surface-2"
+              >
+                <Cross2Icon width={11} height={11} />
+              </button>
             </div>
           ))}
           {/* Pannable surface: pages-row origin lives at `pan`, scaled by

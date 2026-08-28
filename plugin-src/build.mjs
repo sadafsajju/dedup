@@ -76,6 +76,13 @@ await build({
   },
 });
 
+// The wrapper's type declaration rides along: a TypeScript next.config under
+// `strict` that imports an untyped .mjs fails its own typecheck.
+fs.copyFileSync(
+  path.join(here, "next.d.mts"),
+  path.join(outDir, "dedup-next.d.mts"),
+);
+
 fs.copyFileSync(
   path.join(here, "overlay.js"),
   path.join(outDir, "dedup-overlay.js"),

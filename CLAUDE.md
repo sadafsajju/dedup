@@ -22,6 +22,7 @@ pnpm test:origins       # which session (origin) a page artboard renders under
 pnpm test:chat          # AI chat edit-block parse/apply
 pnpm test:merge         # guarded-merge codemod (tests the BUILT bundle)
 pnpm test:proposal      # merge proposal parse + review diff + gate rules
+pnpm test:highlight     # code-panel syntax colouring (round-trip invariant)
 cargo test              # from src-tauri/ — all Rust tests
 ```
 
@@ -132,8 +133,12 @@ cargo test              # from src-tauri/ — all Rust tests
   nothing else. An element's id is its ordinal in `jsxwalk`, so a second
   stamping implementation would be a second, silently incompatible identity
   scheme for one write-back. Never fork it (same rule as jsxwalk itself).
-- Next.js element tagging needs a line in the user's `next.config`, because
-  Next has no `--config` flag. That is offered with its diff, committed on the
+- Next.js: element tagging needs a line in the user's `next.config`, because
+  Next has no `--config` flag. Two things that only showed up on a real app —
+  a TypeScript config under `strict` needs the shipped `next.d.mts` or dedup's
+  own line fails dedup's typecheck gate, and Turbopack never runs `webpack()`,
+  so dedup launches the dev server with `--webpack` *through* the project's
+  own script (replacing the script would drop whatever env it sets). That is offered with its diff, committed on the
   session branch and undoable — and the wrapper is inert without
   `DEDUP_TAGGING=1`, so it changes nothing about the user's own `next dev`,
   CI or production build. The convention forbids *silent* mutation; this is
@@ -143,6 +148,14 @@ cargo test              # from src-tauri/ — all Rust tests
   one with a dark top row hash identically — and UI is mostly flat,
   axis-aligned blocks. Both invariants are pinned by tests; don't "simplify"
   it back.
+- Route discovery has two callers — the Vite plugin's `/__dedup/routes`
+  middleware and the write-back sidecar's `routes` command — because Next has
+  no middleware dedup can add. It lives in `plugin-src/routes.mjs`; a copy in
+  either caller would mean Vite and Next projects disagreed about what pages a
+  project has.
+- The code panel paints highlight tokens *behind* a transparent textarea, so
+  `tokenize` must round-trip its input exactly. A dropped or added character
+  moves the caret away from the text under it. `test:highlight` pins it.
 - The chrome floats over a full-bleed canvas. Anything that positions content
   on the canvas (initial pan, focus-a-route, the Components gallery) must inset
   by the live panel widths, or it lands under a panel. `.panel` in `styles.css`

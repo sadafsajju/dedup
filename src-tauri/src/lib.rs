@@ -69,7 +69,7 @@ fn start_dev_server(
                 InstrumentationEvent { active: true, mode: "tagged", detail: None },
             ),
             Ok(None) => (
-                ExecSpec::Script(package_manager).into(),
+                ExecSpec::Script(package_manager, Vec::new()).into(),
                 InstrumentationEvent { active: false, mode: "script", detail: None },
             ),
             Err(e) => {
@@ -83,7 +83,7 @@ fn start_dev_server(
                     }),
                 );
                 (
-                    ExecSpec::Script(package_manager).into(),
+                    ExecSpec::Script(package_manager, Vec::new()).into(),
                     InstrumentationEvent { active: false, mode: "error", detail: Some(e) },
                 )
             }
@@ -94,15 +94,28 @@ fn start_dev_server(
         // is inert without DEDUP_TAGGING, so setting it here is what turns
         // tagging on for dedup's dev server and nobody else's.
         match instrument::next_status(&root) {
-            instrument::NextStatus::Wired { .. } => (
+            instrument::NextStatus::Wired { needs_webpack, .. } => (
                 devserver::Launch {
-                    exec: ExecSpec::Script(package_manager),
+                    // Turbopack never runs the webpack hook dedup tags
+                    // through, so a Turbopack project is launched under
+                    // webpack. The flag goes *through* the project's own dev
+                    // script rather than replacing it, so whatever the script
+                    // sets up (NODE_OPTIONS for a big app's heap, env files)
+                    // still applies.
+                    exec: ExecSpec::Script(
+                        package_manager,
+                        if needs_webpack { vec!["--webpack".into()] } else { Vec::new() },
+                    ),
                     env: vec![("DEDUP_TAGGING".into(), "1".into())],
                 },
-                InstrumentationEvent { active: true, mode: "tagged", detail: None },
+                InstrumentationEvent {
+                    active: true,
+                    mode: "tagged",
+                    detail: needs_webpack.then(|| "webpack".to_string()),
+                },
             ),
             instrument::NextStatus::Offered { config, .. } => (
-                ExecSpec::Script(package_manager).into(),
+                ExecSpec::Script(package_manager, Vec::new()).into(),
                 InstrumentationEvent {
                     active: false,
                     mode: "next-optin",
@@ -110,7 +123,7 @@ fn start_dev_server(
                 },
             ),
             instrument::NextStatus::Unavailable { reason } => (
-                ExecSpec::Script(package_manager).into(),
+                ExecSpec::Script(package_manager, Vec::new()).into(),
                 InstrumentationEvent {
                     active: false,
                     mode: "framework",
@@ -120,7 +133,7 @@ fn start_dev_server(
         }
     } else {
         (
-            ExecSpec::Script(package_manager).into(),
+            ExecSpec::Script(package_manager, Vec::new()).into(),
             InstrumentationEvent {
                 active: false,
                 mode: "framework",
@@ -314,6 +327,14 @@ async fn capture_project_thumbnail(
         .map_err(|e| format!("capture thumbnail: {e}"))?
 }
 
+/// Page routes discovered from the project's files (no dev server needed).
+#[tauri::command]
+async fn detect_routes(root: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || sidecar::routes(&root))
+        .await
+        .map_err(|e| format!("route scan failed: {e}"))?
+}
+
 /// What dedup can do for a Next.js project: already wired, an offer with the
 /// exact config diff, or a reason it cannot be. Read-only.
 #[tauri::command]
@@ -493,6 +514,7 @@ pub fn run() {
             remove_recent_project,
             project_thumbnail,
             capture_project_thumbnail,
+            detect_routes,
             next_status,
             merge_plan,
             merge_apply,

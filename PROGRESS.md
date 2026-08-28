@@ -1024,6 +1024,51 @@ isolation needs an arbitrary module URL from the dev server, which Vite serves
 and Next does not. The Components tab says so rather than showing empty cards,
 which also means the visual similarity signal is Vite-only.
 
+## Next.js, verified against a real app (2026-08-28)
+
+The Phase 5 write-up claimed Next support on the strength of unit tests. Run
+against a real Next 16.2.4 project (yarn, TypeScript config, 31 routes), three
+things were wrong — two of them silent.
+
+**Route discovery was unreachable.** `discoverNextRoutes` was served only from
+the Vite plugin's `/__dedup/routes` middleware, and Next has no middleware
+dedup can add — so the feature written for Next projects worked on every
+project except Next. Discovery now lives in `plugin-src/routes.mjs`, the
+write-back sidecar answers a `routes` command, and the frontend falls back to
+it whenever the HTTP endpoint is absent or empty. One implementation, two
+callers, same rule as `tagCode` and `jsxwalk`.
+
+**A TypeScript config broke dedup's own gate.** `next.config.ts` under `strict`
+importing an untyped `.mjs` is TS7016, and `skipLibCheck` does not help — it
+skips checking declaration files, not their absence. dedup's config line would
+have failed dedup's typecheck gate. A `next.d.mts` now ships beside the
+wrapper; deleting it reproduces the error on the real project, restoring it
+passes clean.
+
+**Turbopack never runs `webpack()`.** The project's dev script is
+`next dev --turbopack`, and Next 16 uses Turbopack by default anyway — so the
+wrapper would have been a config line that looks wired and tags nothing. The
+first fix refused to offer the wrapper at all, which was worse: a Turbopack
+project could then never reach a wired state. Since dedup starts the dev
+server, it starts it under `--webpack` instead, and the flag goes *through* the
+project's own script rather than replacing it — that project's script carries
+`NODE_OPTIONS=--max-old-space-size=8192` for a documented OOM, and a direct
+`next dev` would have dropped it.
+
+**What the run proved.** With the wrapper in place: dev server ready in 930ms,
+**346 tagged elements** in the SSR HTML with correct `file@ordinal` ids,
+component names, and the capability markers the overlay gates gestures on (17
+`core="root"`, 2 `core="body"`, 15 `dyn="array"`, 13 `dyn="conditional"`); the
+overlay entry present in `main-app.js`; `tsc --noEmit` clean. The project was
+restored to a clean tree afterwards.
+
+**Still not supported on Next:** isolated component previews, and therefore the
+visual similarity signal — they need the dev server to serve arbitrary module
+URLs, which Vite does and Next does not. Turbopack itself remains unsupported
+as a *bundler*; dedup works around it by launching webpack rather than by
+tagging under it.
+
+
 ## Interlude — the canvas becomes the app (2026-08-28)
 
 The chrome was docked columns with hairline dividers, squeezing the canvas into
@@ -1048,7 +1093,7 @@ Three things follow from that, and each is a real change rather than styling:
 
 ## Verification inventory
 
-- `cargo test` (src-tauri): 60 — URL/ANSI parsing, project detection,
+- `cargo test` (src-tauri): 63 — URL/ANSI parsing, project detection,
   instrumentation, tunnel (real TLS upstream, IPv6-only), sidecar (real node
   spawn E2E incl. the full-file parse gate and an edit program that is
   all-or-nothing), git branch/commit isolation, Next stale-lock parsing, scan
@@ -1111,6 +1156,15 @@ Three things follow from that, and each is a real change rather than styling:
   artboard live at once, graceful degrade with no alternate origin, and null
   before the dev server is up; plus the hold flag's URL handling and the
   cross-bundle invariant that the editor and the tagger spell it the same.
+- `pnpm test:highlight`: 11 — the code panel's syntax colouring, with the
+  load-bearing invariant first: every character survives tokenizing exactly
+  once (the tokens are painted *behind* a transparent textarea, so a dropped
+  character moves the caret away from what the user is typing). Plus strings,
+  templates and comments as single tokens, an escaped quote not ending a
+  string, an unterminated quote stopping at its line rather than painting the
+  rest of the file, comment markers inside strings and vice versa, keywords vs
+  identifiers that merely start with one, JSX tag names, and a `<` that isn't
+  a tag.
 - `pnpm test:chat`: 8 — chat edit-block parse/apply: single/multi block,
   deletion, non-match + ambiguous + malformed all throw (no half-applies),
   full-file fallback, prose passthrough.

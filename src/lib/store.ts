@@ -16,6 +16,7 @@ import {
   loadSessionSeed as apiLoadSessionSeed,
   saveSessionSeed as apiSaveSessionSeed,
   collectAuthContext,
+  detectRoutesFromSource,
   mergePlan as apiMergePlan,
   mergeApply,
   mergeTrash,
@@ -140,8 +141,11 @@ interface AppState {
   zoom: number;
   /** Canvas pan offset in px — where the frame's origin sits (FR-6.1). */
   pan: { x: number; y: number };
-  /** Visited route paths — each renders as its own page artboard. Starts at
-   * just "/"; navigation and the Pages tab spawn the rest one by one. */
+  /** Open page artboards, in canvas order. **Starts empty**: nothing is
+   * mounted until the user picks a page in the Pages tab. Booting the app in
+   * a frame is not free — it runs their real dev server, their real auth
+   * guards and their real data fetching — so it happens when they ask for it,
+   * on the page they asked for. Browsing (browse tool) spawns the rest. */
   routes: string[];
   /** Routes the tagger's static scan found (FR-6.3) — the Pages tab's list.
    * null = not fetched yet this dev-server session. */
@@ -187,6 +191,28 @@ interface AppState {
   authProvider: AuthProvider | null;
   /** Top-level editor view: the live canvas or the component gallery. */
   editorTab: "canvas" | "components";
+
+  /**
+   * The source file open in the split code panel, or null.
+   *
+   * This is the escape hatch behind every "dedup can't edit this here": a
+   * className computed by `cn(...)`, text that comes from an expression. The
+   * panel does not make those editable through the inspector — it shows the
+   * user the code that produced them, at the right line, and lets them fix it
+   * directly. `draft` is the working buffer; the file on disk is untouched
+   * until Save, which goes through the same parse gate as every other write.
+   */
+  codePanel: {
+    file: string;
+    /** 1-based line to reveal and highlight (the element's opening tag). */
+    line: number;
+    /** Content as loaded — the baseline for "is this dirty". */
+    original: string;
+    draft: string;
+    loading: boolean;
+    saving: boolean;
+    error: string | null;
+  } | null;
 
   /** Element currently selected on the canvas (FR-2.2). */
   selected: SelectedElement | null;
@@ -294,6 +320,8 @@ interface AppState {
   /** Atomic zoom+pan update so zoom-toward-cursor never flickers. */
   setZoomPan: (zoom: number, pan: { x: number; y: number }) => void;
   visitRoute: (path: string) => void;
+  /** Close one page artboard and forget everything keyed to it. */
+  closeRoute: (path: string) => void;
   /** Open a route as a page artboard (if it isn't one) and pan the canvas to
    * it — the Pages tab's click, and where new artboards land (FR-6.3). */
   focusRoute: (path: string) => void;
@@ -333,6 +361,12 @@ interface AppState {
   /** Draft a seed from the project's auth source via the active AI backend. */
   generateSessionSeed: () => Promise<void>;
   setEditorTab: (tab: "canvas" | "components") => void;
+  /** Open a source file in the split code panel, revealing `line`. */
+  openCode: (file: string, line?: number) => Promise<void>;
+  closeCode: () => void;
+  setCodeDraft: (draft: string) => void;
+  /** Write the buffer through the parse gate and commit it. */
+  saveCode: () => Promise<void>;
   setSelected: (sel: SelectedElement | null) => void;
   /** Clear selection here and in the overlay. */
   clearSelection: () => void;
@@ -446,6 +480,7 @@ const PANEL_WIDTH_STORAGE = "dedup:panel-widths";
 export const PANEL_BOUNDS = {
   sidebar: { min: 180, max: 480, default: 224 },
   inspector: { min: 220, max: 520, default: 256 },
+  code: { min: 320, max: 900, default: 460 },
 } as const;
 
 export type Panel = keyof typeof PANEL_BOUNDS;
@@ -463,6 +498,7 @@ function loadPanelWidths(): Record<Panel, number> {
   const fallback: Record<Panel, number> = {
     sidebar: PANEL_BOUNDS.sidebar.default,
     inspector: PANEL_BOUNDS.inspector.default,
+    code: PANEL_BOUNDS.code.default,
   };
   try {
     const raw = localStorage.getItem(PANEL_WIDTH_STORAGE);
@@ -819,7 +855,7 @@ export const useStore = create<AppState>((set, get) => ({
   // default width, and the top bar occupies the first ~60px. Starting the
   // artboards under a panel would make the app look like it failed to load.
   pan: { x: 232, y: 120 },
-  routes: ["/"],
+  routes: [],
   detectedRoutes: null,
   pageHeights: {},
   pagePaths: {},
@@ -836,6 +872,7 @@ export const useStore = create<AppState>((set, get) => ({
   sessionError: null,
   authProvider: null,
   editorTab: "canvas",
+  codePanel: null,
   selected: null,
   sourceInfo: null,
 
@@ -889,7 +926,9 @@ export const useStore = create<AppState>((set, get) => ({
     // Past chats come back with the project; land on the most recent one.
     const chatSessions = loadChatSessions(project.root);
     set({
-      sidebarTab: "layers",
+      // Nothing is mounted until the user picks a page, so Pages is the only
+      // tab with anything to act on — land there rather than on empty Layers.
+      sidebarTab: "pages",
       inspectorTab: "design",
       chatSessions,
       activeChatId: chatSessions[chatSessions.length - 1]?.id ?? null,
@@ -911,6 +950,7 @@ export const useStore = create<AppState>((set, get) => ({
       categorizeError: null,
       view: "editor",
       editorTab: "canvas",
+      codePanel: null,
       selectedRoute: null,
       sessionSeed: null,
       sessionModalOpen: false,
@@ -950,7 +990,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   backToLaunch: () =>
     set({
-      sidebarTab: "layers",
+      sidebarTab: "pages",
       chatSessions: [],
       activeChatId: null,
       chatBusy: false,
@@ -971,6 +1011,7 @@ export const useStore = create<AppState>((set, get) => ({
       categorizeError: null,
       view: "launch",
       editorTab: "canvas",
+      codePanel: null,
       selectedRoute: null,
       merge: null,
       history: [],
@@ -1015,7 +1056,10 @@ export const useStore = create<AppState>((set, get) => ({
       devUrl: url,
       devPort: port,
       crashed: false,
-      routes: ["/"],
+      // A restart clears the pages row rather than re-mounting what was
+      // open: the artboards are the user's choice, and silently reloading
+      // three frames of their app is the thing this defers.
+      routes: [],
       detectedRoutes: null,
       pageHeights: {},
       layers: {},
@@ -1096,11 +1140,56 @@ export const useStore = create<AppState>((set, get) => ({
         : { routes: [...s.routes, path] },
     ),
 
+  closeRoute: (path) => {
+    const s = get();
+    if (!s.routes.includes(path)) return;
+    const idx = s.routes.indexOf(path);
+    const routes = s.routes.filter((r) => r !== path);
+
+    // Everything keyed by route goes with it. Leaving entries behind would
+    // resurrect a stale height, a stale drift label or a stale session choice
+    // if the same route is opened again later.
+    const drop = <T,>(map: Record<string, T>) => {
+      const next = { ...map };
+      delete next[path];
+      return next;
+    };
+
+    set({
+      routes,
+      pageHeights: drop(s.pageHeights),
+      pagePaths: drop(s.pagePaths),
+      layers: drop(s.layers),
+      frameOrigins: drop(s.frameOrigins),
+      sessionModes: drop(s.sessionModes),
+      heldRoutes: drop(s.heldRoutes),
+      // The scan targets an artboard; closing it leaves no target.
+      selectedRoute: s.selectedRoute === path ? null : s.selectedRoute,
+      // pageMeta is the root frame's report of the live app.
+      ...(path === "/" ? { pageMeta: null } : {}),
+      // The selection lived in a frame that is going away. Staged edits do
+      // NOT go with it — they address `file@ordinal`, so they still apply and
+      // still save; only the on-screen selection is gone.
+      selected: null,
+      sourceInfo: null,
+    });
+
+    // Closing shifts every later artboard one slot left, so a fixed pan would
+    // silently show a different page. Land on whatever took this one's place.
+    const neighbour = routes[Math.min(idx, routes.length - 1)];
+    if (neighbour) get().focusRoute(neighbour);
+  },
+
   focusRoute: (path) => {
+    const wasOpen = get().routes.includes(path);
     get().visitRoute(path);
     const s = get();
     const idx = s.routes.indexOf(path);
     if (idx < 0) return; // visitRoute refused (artboard cap reached)
+    // Opening the first artboard is the clearest statement of "this is the
+    // page I'm working on", and Scan needs a target — so it becomes one,
+    // without ever overriding a choice the user made on the canvas.
+    if (!wasOpen && !s.selectedRoute) set({ selectedRoute: path });
     const vp = VIEWPORTS.find((v) => v.id === s.viewportId)!;
     // Same clearance the initial pan uses: the focused artboard has to land
     // beside the floating sidebar and below the top bar, not under them.
@@ -1110,8 +1199,26 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   fetchDetectedRoutes: async () => {
-    const { devUrl } = get();
+    const { devUrl, project } = get();
     if (!devUrl) return;
+
+    /**
+     * Read the routes off the filesystem through the sidecar. This is the
+     * fallback for Vite and the *only* path for Next: the HTTP endpoint below
+     * is served by the tagger's Vite middleware, and Next has no middleware
+     * dedup can add — so without this, a Next project's file-based routes are
+     * discovered and then never reachable.
+     */
+    const fromSource = async (): Promise<string[] | null> => {
+      if (!project) return null;
+      try {
+        const res = await detectRoutesFromSource(project.root);
+        return res.ok && Array.isArray(res.routes) ? res.routes : null;
+      } catch {
+        return null;
+      }
+    };
+
     try {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), 2000);
@@ -1121,15 +1228,23 @@ export const useStore = create<AppState>((set, get) => ({
       clearTimeout(timer);
       const data = (await res.json()) as { routes?: unknown };
       if (get().devUrl !== devUrl) return; // server changed meanwhile
-      set({
-        detectedRoutes: Array.isArray(data.routes)
-          ? data.routes.filter((r): r is string => typeof r === "string")
-          : [],
-      });
+      const routes = Array.isArray(data.routes)
+        ? data.routes.filter((r): r is string => typeof r === "string")
+        : [];
+      // A bare "/" means the middleware answered but found nothing; the
+      // source scan may still know better (it reads Next's route tree).
+      if (routes.length > 1) {
+        set({ detectedRoutes: routes });
+        return;
+      }
+      const scanned = await fromSource();
+      if (get().devUrl !== devUrl) return;
+      set({ detectedRoutes: scanned ?? routes });
     } catch {
-      // No endpoint (tagging off) or no answer — an empty list is the honest
-      // result; the tab explains why alongside it.
-      if (get().devUrl === devUrl) set({ detectedRoutes: [] });
+      // No endpoint (Next, or tagging off) — read the files directly. An
+      // empty list is still the honest result if that finds nothing too.
+      const scanned = await fromSource();
+      if (get().devUrl === devUrl) set({ detectedRoutes: scanned ?? [] });
     }
   },
 
@@ -1306,6 +1421,92 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setEditorTab: (editorTab) => set({ editorTab }),
+
+  openCode: async (file, line = 1) => {
+    const { project, codePanel } = get();
+    if (!project) return;
+    // Re-targeting the file already open keeps the user's unsaved buffer and
+    // just moves the highlight — losing an edit because they clicked another
+    // element in the same file would be its own bug.
+    if (codePanel && codePanel.file === file) {
+      set({ codePanel: { ...codePanel, line } });
+      return;
+    }
+    set({
+      codePanel: {
+        file,
+        line,
+        original: "",
+        draft: "",
+        loading: true,
+        saving: false,
+        error: null,
+      },
+    });
+    try {
+      const content = await readSource(project.root, file);
+      // The user may have closed it or opened another file meanwhile.
+      const current = get().codePanel;
+      if (!current || current.file !== file) return;
+      set({
+        codePanel: { ...current, original: content, draft: content, loading: false },
+      });
+    } catch (e) {
+      const current = get().codePanel;
+      if (!current || current.file !== file) return;
+      set({
+        codePanel: { ...current, loading: false, error: errorText(e) },
+      });
+    }
+  },
+
+  closeCode: () => set({ codePanel: null }),
+
+  setCodeDraft: (draft) => {
+    const codePanel = get().codePanel;
+    if (!codePanel) return;
+    set({ codePanel: { ...codePanel, draft, error: null } });
+  },
+
+  saveCode: async () => {
+    const { project, codePanel } = get();
+    if (!project || !codePanel || codePanel.saving) return;
+    if (codePanel.draft === codePanel.original) return;
+    set({ codePanel: { ...codePanel, saving: true, error: null } });
+    try {
+      // Same gate as the AI chat's writes: the sidecar re-parses strictly and
+      // refuses anything that doesn't, so a half-typed edit can't land.
+      const res = await writeSource(project.root, codePanel.file, codePanel.draft);
+      if (!res.ok) throw new Error(res.error ?? "the file could not be written");
+      const [, hash] = await commitSession(
+        project.root,
+        `dedup: edit ${codePanel.file}`,
+        [codePanel.file],
+      );
+      const current = get().codePanel;
+      if (current?.file === codePanel.file) {
+        set({
+          codePanel: {
+            ...current,
+            original: codePanel.draft,
+            saving: false,
+            error: null,
+          },
+        });
+      }
+      set({ lastSave: { branch: "", hash } });
+      gitStatus(project.root).then((g) => set({ git: g })).catch(() => {});
+      // A hand edit can add or remove elements, which renumbers the ordinals
+      // every dedup id is built from — the canvas must re-read its tags.
+      setTimeout(() => sendToOverlay({ type: "reload" }), 150);
+      set({ selected: null, sourceInfo: null });
+    } catch (e) {
+      const current = get().codePanel;
+      if (current?.file === codePanel.file) {
+        set({ codePanel: { ...current, saving: false, error: errorText(e) } });
+      }
+    }
+  },
 
   setSelected: (selected) => {
     set({ selected, sourceInfo: null });

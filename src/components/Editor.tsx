@@ -21,6 +21,7 @@ import { SessionModal } from "./SessionModal";
 import { ClusterReview } from "./Duplicates";
 import { MergeReview } from "./MergeReview";
 import { HistoryPanel } from "./History";
+import { CodePanel } from "./CodePanel";
 
 export function Editor() {
   const project = useStore((s) => s.project);
@@ -151,6 +152,7 @@ export function Editor() {
             s.cancelMerge();
           }
         } else if (s.historyOpen) s.toggleHistory(false);
+        else if (s.codePanel) s.closeCode();
         else if (s.openClusterId) s.openCluster(null);
         else if (s.insertKind) s.setInsertKind(null);
         else if (s.selected) s.clearSelection();
@@ -190,6 +192,7 @@ export function Editor() {
       </div>
       <TopBar />
       <Sidebar />
+      <CodePanel />
       <Inspector />
       <ConsoleDrawer />
       <ClusterReview />

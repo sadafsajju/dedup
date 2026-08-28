@@ -275,6 +275,7 @@ export function ComponentsView() {
   const categories = useStore((s) => s.categories);
   const mockProps = useStore((s) => s.mockProps);
   const panelWidths = useStore((s) => s.panelWidths);
+  const codeOpen = useStore((s) => s.codePanel !== null);
   const [sizes, setSizes] = useState<SizeMap>({});
 
   // Natural sizes / render failures reported by the harness iframes. Runs
@@ -326,7 +327,10 @@ export function ComponentsView() {
       // first column of cards behind the sidebar.
       style={{
         paddingLeft: panelWidths.sidebar + CHROME_GUTTER,
-        paddingRight: panelWidths.inspector + CHROME_GUTTER,
+        paddingRight:
+          panelWidths.inspector +
+          CHROME_GUTTER +
+          (codeOpen ? panelWidths.code + CHROME_GUTTER : 0),
         paddingTop: CHROME_TOP,
         paddingBottom: CHROME_BOTTOM,
       }}

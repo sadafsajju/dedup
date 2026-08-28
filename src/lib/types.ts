@@ -76,8 +76,18 @@ export interface InstrumentationInfo {
 
 /** What dedup can do for a Next.js project (Phase 5). */
 export type NextStatus =
-  | { state: "wired"; config: string }
-  | { state: "offered"; config: string; before: string; after: string }
+  | { state: "wired"; config: string; needsWebpack: boolean }
+  | {
+      state: "offered";
+      config: string;
+      before: string;
+      after: string;
+      /** The project's dev script asks for Turbopack, which never runs the
+       * webpack hook dedup tags through — so dedup launches it under webpack
+       * while inspecting. Said out loud: it is a different bundler than the
+       * one the user's own `next dev` uses. */
+      needsWebpack: boolean;
+    }
   | { state: "unavailable"; reason: string };
 
 export type DevServerStatus =

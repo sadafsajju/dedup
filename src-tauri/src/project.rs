@@ -95,11 +95,44 @@ pub fn detect(root: &str) -> ProjectInfo {
     if framework == Framework::Unknown {
         warnings.push("Couldn't detect Vite or Next.js. Only these are supported in the MVP.".into());
     }
-    if framework == Framework::Next {
-        warnings.push(
-            "Next.js: canvas preview and duplicate scan work, but element inspection is Vite-only until Phase 5.".into(),
-        );
-    }
+    // Next.js is supported, but element tagging depends on one line in the
+    // project's own next.config — Next has no `--config` flag, so dedup can't
+    // wrap it invisibly the way it does Vite. The card says which of the two
+    // situations this project is in rather than a blanket "partial".
+    let next_ready = if framework == Framework::Next {
+        match crate::instrument::inspect_next_config(root) {
+            crate::instrument::NextStatus::Wired { config, needs_webpack } => {
+                let bundler = if needs_webpack {
+                    " dedup runs the dev server under webpack, since Turbopack doesn't run the hook it tags through."
+                } else {
+                    ""
+                };
+                warnings.push(format!(
+                    "Next.js: element inspection is enabled via {config}.{bundler} Isolated component previews stay Vite-only — Next can't serve the harness route."
+                ));
+                true
+            }
+            crate::instrument::NextStatus::Offered { config, needs_webpack, .. } => {
+                let bundler = if needs_webpack {
+                    " dedup will run the dev server under webpack while inspecting."
+                } else {
+                    ""
+                };
+                warnings.push(format!(
+                    "Next.js: element inspection needs one line in {config}.{bundler} dedup shows you the exact change once the project is open — it's committed and undoable, and inert outside dedup."
+                ));
+                false
+            }
+            crate::instrument::NextStatus::Unavailable { reason } => {
+                warnings.push(format!(
+                    "Next.js: canvas, routes and the duplicate scan work, but element inspection is unavailable — {reason}."
+                ));
+                false
+            }
+        }
+    } else {
+        true
+    };
     if !has_tailwind {
         warnings.push("Tailwind CSS not detected. The inspector edits Tailwind classes only.".into());
     }
@@ -115,8 +148,7 @@ pub fn detect(root: &str) -> ProjectInfo {
 
     let support = if pkg.is_none() || framework == Framework::Unknown || dev_script.is_none() {
         SupportLevel::Unsupported
-    } else if !has_tailwind || !has_typescript || !has_git || framework == Framework::Next {
-        // Next.js runs (canvas + scan) but without element inspection — Phase 5.
+    } else if !has_tailwind || !has_typescript || !has_git || !next_ready {
         SupportLevel::Partial
     } else {
         SupportLevel::Full
@@ -274,6 +306,62 @@ mod tests {
         // No git in the temp dir -> at most Partial.
         assert_eq!(info.support, SupportLevel::Partial);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A wired next.config is not a "partial" project — and an unwired one
+    /// must say what to do rather than that the feature doesn't exist.
+    #[test]
+    fn next_verdict_follows_the_config() {
+        let dir = std::env::temp_dir().join(format!("dedup-next-verdict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"dev":"next dev"},"dependencies":{"next":"14"},"devDependencies":{"tailwindcss":"^3","typescript":"^5"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
+        let root = dir.to_str().unwrap();
+
+        // No config at all: supported, but inspection is unavailable and says why.
+        let bare = detect(root);
+        assert_eq!(bare.support, SupportLevel::Partial);
+        assert!(
+            bare.warnings.iter().any(|w| w.contains("no next.config")),
+            "{:?}",
+            bare.warnings
+        );
+
+        // A config dedup could wrap: the card offers the change.
+        std::fs::write(dir.join("next.config.mjs"), "export default {};\n").unwrap();
+        let offered = detect(root);
+        assert_eq!(offered.support, SupportLevel::Partial);
+        assert!(
+            offered.warnings.iter().any(|w| w.contains("one line in next.config.mjs")),
+            "{:?}",
+            offered.warnings
+        );
+
+        // Already wired: nothing about Next holds it back any more.
+        std::fs::write(
+            dir.join("next.config.mjs"),
+            "import { withDedup } from \"./node_modules/.dedup/next.mjs\";\nexport default withDedup({});\n",
+        )
+        .unwrap();
+        let wired = detect(root);
+        assert_eq!(wired.support, SupportLevel::Full, "{:?}", wired.warnings);
+        assert!(
+            wired.warnings.iter().any(|w| w.contains("enabled via next.config.mjs")),
+            "{:?}",
+            wired.warnings
+        );
+
+        // The read-only probe must not have created anything.
+        assert!(
+            !dir.join("node_modules").exists(),
+            "the compatibility card must not write into the project"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

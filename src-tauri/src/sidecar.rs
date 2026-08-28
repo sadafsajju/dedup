@@ -44,6 +44,14 @@ pub fn write_file(root: &str, rel_file: &str, content: &str) -> Result<serde_jso
     run(root, json!({ "cmd": "writeFile", "file": file, "content": content }))
 }
 
+/// The project's page routes, read straight off the filesystem — react-router
+/// path literals and Next's `app/`/`pages/` trees. Needs no dev server, which
+/// is the point: Vite projects get this over HTTP from the tagger's
+/// middleware, and a Next project has no middleware dedup can add.
+pub fn routes(root: &str) -> Result<serde_json::Value, String> {
+    run(root, json!({ "cmd": "routes", "root": root }))
+}
+
 /// Apply one file's edit program (class / text / insert / remove / move).
 /// All ops resolve against a single parse and land as one write, or none of
 /// them do — partial application of a program is never observable.
@@ -215,6 +223,47 @@ mod tests {
         .unwrap();
         assert_eq!(refused["ok"], false, "root removal must be refused");
         assert_eq!(std::fs::read_to_string(root.join("App.tsx")).unwrap(), snapshot);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Next's file-based routes have to be reachable *through the sidecar*.
+    /// The Vite plugin serves them over HTTP from inside the dev server, and
+    /// a Next project has no middleware dedup can add — so if this path
+    /// breaks, a Next project silently shows no pages at all.
+    #[test]
+    fn discovers_next_routes_without_a_dev_server() {
+        let root = std::env::temp_dir().join(format!("dedup-scroutes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [
+            "app/(marketing)/about",
+            "app/blog/[slug]",
+            "app/dashboard/settings",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [
+            "app/page.tsx",
+            "app/(marketing)/about/page.tsx",
+            "app/blog/[slug]/page.tsx",
+            "app/dashboard/settings/page.tsx",
+        ] {
+            std::fs::write(root.join(file), "export default function P() { return null; }").unwrap();
+        }
+
+        let out = routes(root.to_str().unwrap()).unwrap();
+        assert_eq!(out["ok"], true, "{out}");
+        let mut found: Vec<String> = out["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["/", "/about", "/dashboard/settings"],
+            "route groups collapse, dynamic segments are skipped (no value to put in [slug])"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
