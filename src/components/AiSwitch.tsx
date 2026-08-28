@@ -1,20 +1,105 @@
-// TopBar AI backend switch: Claude Code subscription vs raw API key.
-// Claude Code is opt-in via an explicit Connect step (consent + live test);
-// the API key entry lives here too, out of the Duplicates tab.
+// TopBar AI backend switch: a coding-agent CLI the user already pays for, or
+// a raw API key.
+//
+// Every CLI agent is opt-in through an explicit Connect step — a live
+// round-trip that proves the binary is there *and* signed in, which is the one
+// thing "installed" doesn't tell you. dedup never spends someone's
+// subscription before that succeeds.
+//
+// The cards are generated from CLI_AGENTS rather than written per agent, so
+// adding a third is a row in that list.
 import { useEffect, useRef, useState } from "react";
 import { useStore } from "../lib/store";
+import { CLI_AGENTS } from "../lib/types";
+import type { CliAgent } from "../lib/types";
+
+/** One agent's card: state, Connect, model picker, and its last error. */
+function AgentCard({
+  meta,
+  active,
+}: {
+  meta: (typeof CLI_AGENTS)[number];
+  active: boolean;
+}) {
+  const state = useStore((s) => s.agents[meta.id]);
+  const connect = useStore((s) => s.connectAgent);
+  const setModel = useStore((s) => s.setAgentModel);
+  const setAiPref = useStore((s) => s.setAiPref);
+
+  return (
+    <div
+      className={`rounded-lg border p-2.5 mb-2 ${
+        active ? "border-accent/50 bg-accent/5" : "border-line"
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium text-ink">{meta.label}</span>
+        <span className="text-2xs text-ink-faint">{meta.detail}</span>
+        <span className="flex-1" />
+        {active ? (
+          <span className="text-2xs text-positive">connected ✓</span>
+        ) : state.installed === false ? (
+          <span className="text-2xs text-ink-faint">not installed</span>
+        ) : (
+          <button
+            onClick={() => void connect(meta.id)}
+            disabled={state.connecting}
+            className="rounded-md px-2 py-0.5 text-2xs font-medium bg-accent text-white hover:brightness-110 disabled:opacity-60"
+          >
+            {state.connecting ? "Connecting…" : state.consent ? "Use this" : "Connect"}
+          </button>
+        )}
+      </div>
+
+      <div className="mt-1 text-2xs text-ink-dim leading-relaxed">
+        Runs the local <span className="font-mono">{meta.command}</span> CLI on
+        your plan — no API key. Connecting sends one test prompt to check it's
+        signed in.
+      </div>
+
+      {meta.models.length > 1 && (
+        <div className="mt-1.5 flex items-center gap-2">
+          <label className="text-2xs text-ink-faint" htmlFor={`${meta.id}-model`}>
+            Model
+          </label>
+          <select
+            id={`${meta.id}-model`}
+            value={state.model ?? ""}
+            onChange={(e) => setModel(meta.id, e.target.value || null)}
+            className="rounded-md bg-surface-2 px-1.5 py-0.5 text-2xs text-ink outline-none focus:ring-1 focus:ring-accent"
+          >
+            {meta.models.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {state.error && (
+        <div className="mt-1.5 whitespace-pre-wrap text-2xs text-danger break-words">
+          {state.error}
+        </div>
+      )}
+
+      {active && (
+        <button
+          onClick={() => setAiPref(null)}
+          className="mt-1.5 text-2xs text-ink-faint hover:text-ink"
+        >
+          Disconnect
+        </button>
+      )}
+    </div>
+  );
+}
 
 export function AiSwitch() {
-  const claudeCode = useStore((s) => s.claudeCode);
   const aiPref = useStore((s) => s.aiPref);
-  const ccConnecting = useStore((s) => s.ccConnecting);
-  const ccError = useStore((s) => s.ccError);
   const anthropicKey = useStore((s) => s.anthropicKey);
   const setAnthropicKey = useStore((s) => s.setAnthropicKey);
   const setAiPref = useStore((s) => s.setAiPref);
-  const ccModel = useStore((s) => s.ccModel);
-  const setCcModel = useStore((s) => s.setCcModel);
-  const connectClaudeCode = useStore((s) => s.connectClaudeCode);
   const active = useStore((s) => s.activeAiBackend());
 
   const [open, setOpen] = useState(false);
@@ -31,12 +116,11 @@ export function AiSwitch() {
     return () => window.removeEventListener("mousedown", onDown);
   }, [open]);
 
-  const label =
-    active === "claude-code"
-      ? "AI: Claude Code"
-      : active === "api"
-        ? "AI: API"
-        : "AI: off";
+  const label = !active
+    ? "AI: off"
+    : active === "api"
+      ? "AI: API"
+      : `AI: ${CLI_AGENTS.find((a) => a.id === active)?.label ?? active}`;
 
   return (
     <div className="relative" ref={panelRef}>
@@ -55,76 +139,22 @@ export function AiSwitch() {
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full mt-1.5 z-50 w-80 rounded-lg border border-line bg-surface-1 shadow-2xl p-3">
+        <div className="panel absolute right-0 top-full mt-1.5 z-50 w-80 p-3">
           <div className="text-2xs uppercase tracking-wider text-ink-faint mb-2">
             AI backend
           </div>
 
-          {/* Claude Code subscription */}
-          <div
-            className={`rounded-md border p-2.5 mb-2 ${
-              active === "claude-code"
-                ? "border-accent/50 bg-accent/5"
-                : "border-line"
-            }`}
-          >
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-ink">Claude Code</span>
-              <span className="text-2xs text-ink-faint">subscription</span>
-              <span className="flex-1" />
-              {active === "claude-code" ? (
-                <span className="text-2xs text-positive">connected ✓</span>
-              ) : claudeCode === false ? (
-                <span className="text-2xs text-ink-faint">not installed</span>
-              ) : (
-                <button
-                  onClick={connectClaudeCode}
-                  disabled={ccConnecting}
-                  className="rounded px-2 py-0.5 text-2xs font-medium bg-accent text-white hover:brightness-110 disabled:opacity-60"
-                >
-                  {ccConnecting ? "Connecting…" : "Connect"}
-                </button>
-              )}
-            </div>
-            <div className="mt-1 text-2xs text-ink-dim leading-relaxed">
-              Runs the local <span className="font-mono">claude</span> CLI on
-              your plan — no API key. Connecting sends one test prompt to
-              verify your login.
-            </div>
-            <div className="mt-1.5 flex items-center gap-2">
-              <label className="text-2xs text-ink-faint" htmlFor="cc-model">
-                Model
-              </label>
-              <select
-                id="cc-model"
-                value={ccModel ?? ""}
-                onChange={(e) => setCcModel(e.target.value || null)}
-                className="rounded bg-surface-2 px-1.5 py-0.5 text-2xs text-ink outline-none focus:ring-1 focus:ring-accent"
-              >
-                <option value="">CLI default</option>
-                <option value="haiku">Haiku (fastest)</option>
-                <option value="sonnet">Sonnet</option>
-                <option value="opus">Opus (most capable)</option>
-              </select>
-            </div>
-            {ccError && (
-              <div className="mt-1.5 text-2xs text-danger break-words">
-                {ccError}
-              </div>
-            )}
-            {active === "claude-code" && (
-              <button
-                onClick={() => setAiPref(null)}
-                className="mt-1.5 text-2xs text-ink-faint hover:text-ink"
-              >
-                Disconnect
-              </button>
-            )}
-          </div>
+          {CLI_AGENTS.map((meta) => (
+            <AgentCard
+              key={meta.id}
+              meta={meta}
+              active={active === (meta.id as CliAgent)}
+            />
+          ))}
 
           {/* Raw API key */}
           <div
-            className={`rounded-md border p-2.5 ${
+            className={`rounded-lg border p-2.5 ${
               active === "api" ? "border-accent/50 bg-accent/5" : "border-line"
             }`}
           >

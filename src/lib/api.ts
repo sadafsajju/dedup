@@ -28,6 +28,7 @@ import type {
   TrashEntry,
   VisualDiff,
   NextStatus,
+  CliAgent,
 } from "./types";
 
 export const detectProject = (root: string) =>
@@ -117,14 +118,18 @@ export const scanProject = (root: string, files?: string[] | null) =>
 export const loadScanResult = (root: string) =>
   invoke<ScanResult | null>("load_scan_result", { root });
 
-/** Is the Claude Code CLI installed? (preferred AI backend). */
-export const claudeCodeAvailable = () =>
-  invoke<boolean>("claude_code_available");
+/** Is this coding-agent CLI installed? (preferred AI backends — they run on
+ *  a subscription the user already has; an API key is the fallback). */
+export const agentAvailable = (agent: CliAgent) =>
+  invoke<boolean>("agent_available", { agent });
 
-/** One headless prompt through the user's Claude Code install.
- *  `model` is a CLI alias or full id; null/omitted uses the CLI default. */
-export const claudeCodePrompt = (prompt: string, model?: string | null) =>
-  invoke<string>("claude_code_prompt", { prompt, model: model ?? null });
+/** One headless prompt through the named agent's CLI. `model` is whatever
+ *  that CLI calls a model; null/omitted uses its own default. */
+export const agentPrompt = (
+  agent: CliAgent,
+  prompt: string,
+  model?: string | null,
+) => invoke<string>("agent_prompt", { agent, prompt, model: model ?? null });
 
 /** Cached AI category assignments (file#name → {hash, category}). */
 export const loadSessionSeed = (root: string) =>

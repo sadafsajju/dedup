@@ -256,20 +256,25 @@ fn load_scan_result(root: String) -> Option<serde_json::Value> {
     scan::load_saved(&root)
 }
 
-/// Is the Claude Code CLI installed? (Preferred AI backend — uses the
-/// user's existing subscription; API key is the fallback.)
+/// Which coding-agent CLIs are installed. Preferred AI backends — they use a
+/// subscription the user already has; an API key is the fallback.
 #[tauri::command]
-fn claude_code_available() -> bool {
-    ai::available()
+fn agent_available(agent: String) -> bool {
+    ai::Agent::parse(&agent).is_some_and(ai::available)
 }
 
-/// One headless prompt through the user's Claude Code install. `model` picks
-/// the CLI model ("sonnet", "opus", …); None uses the CLI default.
+/// One headless prompt through the named agent. `model` is whatever that CLI
+/// calls a model; None uses its own default.
 #[tauri::command]
-async fn claude_code_prompt(prompt: String, model: Option<String>) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || ai::prompt(&prompt, model.as_deref()))
+async fn agent_prompt(
+    agent: String,
+    prompt: String,
+    model: Option<String>,
+) -> Result<String, String> {
+    let agent = ai::Agent::parse(&agent).ok_or_else(|| format!("unknown agent: {agent}"))?;
+    tauri::async_runtime::spawn_blocking(move || ai::prompt(agent, &prompt, model.as_deref()))
         .await
-        .map_err(|e| format!("claude task failed: {e}"))?
+        .map_err(|e| format!("agent task failed: {e}"))?
 }
 
 /// Cached AI category assignments for the project's components.
@@ -536,8 +541,8 @@ pub fn run() {
             load_session_seed,
             save_session_seed,
             collect_auth_context,
-            claude_code_available,
-            claude_code_prompt,
+            agent_available,
+            agent_prompt,
             commit_session,
             get_recent_projects,
             add_recent_project,

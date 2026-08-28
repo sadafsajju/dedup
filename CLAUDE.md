@@ -28,6 +28,17 @@ cargo test              # from src-tauri/ — all Rust tests
 
 ## Architecture map
 
+- AI backends are coding-agent CLIs the user already pays for (`ai.rs`:
+  `Agent::ClaudeCode`, `Agent::Codex`), with a raw API key as the fallback.
+  Everything agent-specific — binary name, install fallbacks, the flags that
+  mean "headless, no tools, no session", how the answer is framed — lives in
+  `Agent`; adding one is a match arm plus a row in `CLI_AGENTS` (lib/types).
+  They are asked for *text*, never given tools or write access: dedup edits
+  through its own parse-gated write-back, and a second path to the user's
+  source would be an unaudited one.
+- An agent is only usable after an explicit Connect — a live round-trip. It is
+  the one thing that distinguishes "installed" from "signed in", which for
+  these CLIs is a real and common difference.
 - `src-tauri/src/` — Rust core: `project.rs` (detection), `devserver.rs`
   (child process in own pgroup, log streaming, ready-URL parse), `proxy.rs`
   (HTTP→self-signed-HTTPS tunnel for the canvas), `instrument.rs` (writes

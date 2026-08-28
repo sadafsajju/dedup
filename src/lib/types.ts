@@ -2,6 +2,53 @@
 
 import { withAttr, withText } from "./palette";
 
+/** A coding-agent CLI dedup can borrow for a prompt. Mirrors `ai::Agent`. */
+export type CliAgent = "claude-code" | "codex";
+
+/** What dedup knows about one agent on this machine. */
+export interface AgentState {
+  /** null until probed. */
+  installed: boolean | null;
+  /** The user explicitly connected it — a live round-trip that succeeded.
+   * dedup never spends someone's subscription before that. */
+  consent: boolean;
+  /** Model override for that CLI; null keeps its own default. */
+  model: string | null;
+  connecting: boolean;
+  error: string | null;
+}
+
+export const CLI_AGENTS: {
+  id: CliAgent;
+  label: string;
+  /** What the user gets billed through, in their words. */
+  detail: string;
+  /** Command to run if it isn't installed or isn't signed in. */
+  command: string;
+  /** Model choices offered; "" means the CLI's own default. */
+  models: { value: string; label: string }[];
+}[] = [
+  {
+    id: "claude-code",
+    label: "Claude Code",
+    detail: "subscription",
+    command: "claude",
+    models: [
+      { value: "", label: "CLI default" },
+      { value: "haiku", label: "Haiku" },
+      { value: "sonnet", label: "Sonnet" },
+      { value: "opus", label: "Opus" },
+    ],
+  },
+  {
+    id: "codex",
+    label: "Codex",
+    detail: "subscription",
+    command: "codex",
+    models: [{ value: "", label: "CLI default" }],
+  },
+];
+
 export type PackageManager = "pnpm" | "yarn" | "bun" | "npm" | "unknown";
 export type Framework = "vite" | "next" | "unknown";
 export type SupportLevel = "full" | "partial" | "unsupported";

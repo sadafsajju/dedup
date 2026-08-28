@@ -11,6 +11,7 @@ import {
   stopDevServer,
 } from "../lib/api";
 import { useStore } from "../lib/store";
+import { CLI_AGENTS } from "../lib/types";
 import { TopBar } from "./TopBar";
 import { Sidebar } from "./Sidebar";
 import { Canvas } from "./Canvas";
@@ -89,7 +90,10 @@ export function Editor() {
       // A previous session's scan renders immediately instead of demanding
       // a rescan every time the project is reopened.
       void useStore.getState().restoreScan();
-      void useStore.getState().detectClaudeCode();
+      // Probe every agent so the AI switch can say which are installed.
+      for (const agent of CLI_AGENTS) {
+        void useStore.getState().detectAgent(agent.id);
+      }
       void useStore.getState().loadSessionSeed();
       // The history panel is the session branch read back, and the trash tray
       // may hold files a previous session staged — both are project state, so

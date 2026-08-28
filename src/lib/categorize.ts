@@ -7,7 +7,7 @@
 // (tag/class skeletons) are sent — never full source code.
 
 import Anthropic from "@anthropic-ai/sdk";
-import type { GalleryEntry } from "./types";
+import type { CliAgent, GalleryEntry } from "./types";
 
 export const CATEGORIES = [
   "Buttons",
@@ -103,8 +103,12 @@ function listingFor(chunk: GalleryEntry[]): string {
 }
 
 /** Where AI calls go: the user's Claude Code install, or a raw API key. */
+/** How a prompt gets answered. `cli` borrows a coding agent the user already
+ * has installed and signed into (Claude Code, Codex); `api` is the raw-key
+ * fallback. Consumers only ever need "is there a run() or a key", so the
+ * union does not name individual agents — adding one is a store change. */
 export type AiBackend =
-  | { kind: "claude-code"; run: (prompt: string) => Promise<string> }
+  | { kind: "cli"; agent: CliAgent; run: (prompt: string) => Promise<string> }
   | { kind: "api"; apiKey: string };
 
 /** Pull the first {...} out of free-form model text (fences, prose, etc.). */
@@ -120,7 +124,7 @@ function extractJson(text: string): string {
 async function runChunk(backend: AiBackend, listing: string): Promise<string> {
   const userPrompt = `Categorize every component below.\n\n${listing}`;
 
-  if (backend.kind === "claude-code") {
+  if (backend.kind === "cli") {
     // Headless CLI has no schema enforcement — ask for bare JSON and be
     // lenient when parsing.
     const prompt = `${SYSTEM_PROMPT}\n\nAllowed categories: ${CATEGORIES.join(", ")}\n\n${userPrompt}\n\nRespond with ONLY a JSON object, no prose and no code fences, of the shape {"components": [{"file": string, "name": string, "category": string, "mock_props": string}]} where mock_props is a JSON object literal encoded as a string ("" when the component takes no props).`;

@@ -68,7 +68,7 @@ export async function generateSeed(
   context: AuthContext,
 ): Promise<string> {
   const userPrompt = buildSeedPrompt(context);
-  if (backend.kind === "claude-code") {
+  if (backend.kind === "cli") {
     return parseSeedReply(await backend.run(`${SYSTEM_PROMPT}\n\n${userPrompt}`));
   }
   const client = new Anthropic({

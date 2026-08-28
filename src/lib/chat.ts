@@ -82,7 +82,7 @@ export async function runChatPrompt(
   userPrompt: string,
   history: ChatTurn[] = [],
 ): Promise<string> {
-  if (backend.kind === "claude-code") {
+  if (backend.kind === "cli") {
     // Headless CLI is single-shot — embed the transcript in the prompt.
     const transcript =
       history.length > 0

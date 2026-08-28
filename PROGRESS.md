@@ -1081,6 +1081,34 @@ as a *bundler*; dedup works around it by launching webpack rather than by
 tagging under it.
 
 
+## Codex as a second AI backend (2026-08-29)
+
+`ai.rs` was a Claude Code bridge; it is now an agent bridge with two arms. The
+process plumbing (spawn, feed stdin on a thread so a large prompt can't
+deadlock against a child already writing, hard timeout, read the answer) was
+never Claude-specific — only the binary name, the flags meaning "headless, no
+tools, no session, touch nothing", and how the answer is framed. Those live in
+`Agent` and nowhere else.
+
+Codex is invoked as `codex exec --sandbox read-only --skip-git-repo-check
+--output-last-message <file> -`, prompt on stdin. Three of those are load-
+bearing: the prompt cannot be an argv entry (these carry whole source files),
+the sandbox is read-only because dedup wants words rather than edits, and the
+git check is skipped because dedup deliberately runs agents from a neutral temp
+directory, which is not a repo. The answer is read from the last-message file
+when there is one and scraped from stdout only as a fallback for an older CLI.
+
+The frontend's five Claude-specific store fields collapsed into
+`agents: Record<CliAgent, AgentState>`, and the AI switch renders a card per
+entry in `CLI_AGENTS` — a third agent is a row in that list.
+
+**Not verified end to end.** No `codex` binary exists on the machine this was
+written on, so the flags are from documentation, not from a run. The detection
+path *is* verified (an absent CLI reports "not installed"), and the Connect
+round-trip is what proves the rest on a machine that has it — now that a failed
+invocation reports the CLI's own words instead of a bare exit code, a wrong
+flag will name itself rather than looking like a hang.
+
 ## Interlude — the canvas becomes the app (2026-08-28)
 
 The chrome was docked columns with hairline dividers, squeezing the canvas into
@@ -1105,7 +1133,7 @@ Three things follow from that, and each is a real change rather than styling:
 
 ## Verification inventory
 
-- `cargo test` (src-tauri): 63 — URL/ANSI parsing, project detection,
+- `cargo test` (src-tauri): 69 — URL/ANSI parsing, project detection,
   instrumentation, tunnel (real TLS upstream, IPv6-only), sidecar (real node
   spawn E2E incl. the full-file parse gate and an edit program that is
   all-or-nothing), git branch/commit isolation, Next stale-lock parsing, scan

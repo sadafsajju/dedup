@@ -1,8 +1,8 @@
 import { create } from "zustand";
 import {
   captureCanvasThumbnail,
-  claudeCodeAvailable,
-  claudeCodePrompt,
+  agentAvailable,
+  agentPrompt,
   commitSession,
   gitStatus,
   inspectElement,
@@ -72,9 +72,12 @@ import {
   type InsertKind,
 } from "./palette";
 import { foldLine, type ParsedError } from "./errors";
+import { CLI_AGENTS } from "./types";
 import type {
+  AgentState,
   ChatMessage,
   ChatSession,
+  CliAgent,
   GateResult,
   HistoryEntry,
   MergeSession,
@@ -273,16 +276,12 @@ interface AppState {
   categorizeError: string | null;
   /** Anthropic API key (user-supplied, stored locally) — fallback backend. */
   anthropicKey: string;
-  /** Claude Code CLI detected on this machine (null = not yet checked). */
-  claudeCode: boolean | null;
+  /** Per coding-agent CLI: installed, connected, model, last error. One
+   * record rather than a set of fields per agent, so a third agent is a row
+   * in CLI_AGENTS rather than five more pieces of state. */
+  agents: Record<CliAgent, AgentState>;
   /** Which backend the user chose (persisted). null = not chosen yet. */
-  aiPref: "claude-code" | "api" | null;
-  /** User explicitly connected Claude Code (consent + live test passed). */
-  ccConsent: boolean;
-  ccConnecting: boolean;
-  ccError: string | null;
-  /** Claude Code model alias ("sonnet", "opus", …). null = CLI default. */
-  ccModel: string | null;
+  aiPref: CliAgent | "api" | null;
 
   // Guarded merge (FR-5.4 → FR-5.7). One at a time: a merge rewrites the
   // project behind gates, so a second one running underneath the first would
@@ -433,15 +432,17 @@ interface AppState {
   cancelVisualPass: () => void;
 
   setAnthropicKey: (key: string) => void;
-  /** Detect the Claude Code CLI once per app run. */
-  detectClaudeCode: () => Promise<void>;
+  /** Detect a coding-agent CLI once per app run. */
+  detectAgent: (agent: CliAgent) => Promise<void>;
   /** Pick the AI backend (persisted). */
-  setAiPref: (pref: "claude-code" | "api" | null) => void;
-  setCcModel: (model: string | null) => void;
+  setAiPref: (pref: CliAgent | "api" | null) => void;
+  setAgentModel: (agent: CliAgent, model: string | null) => void;
   /** Consent + live test: verifies Claude Code login and enables it. */
-  connectClaudeCode: () => Promise<void>;
+  /** Consent moment: a live round-trip that proves the CLI is installed and
+   * signed in. dedup never spends someone's subscription before it passes. */
+  connectAgent: (agent: CliAgent) => Promise<void>;
   /** The backend categorize() will actually use right now, if any. */
-  activeAiBackend: () => "claude-code" | "api" | null;
+  activeAiBackend: () => CliAgent | "api" | null;
   /** Categorize the current gallery with Claude; cached per project. */
   categorize: () => Promise<void>;
 
@@ -470,8 +471,7 @@ interface AppState {
 
 const KEY_STORAGE = "dedup:anthropic-key";
 const AI_PREF_STORAGE = "dedup:ai-pref";
-const CC_CONSENT_STORAGE = "dedup:claude-code-consent";
-const CC_MODEL_STORAGE = "dedup:claude-code-model";
+const AGENTS_STORAGE = "dedup:cli-agents";
 const PANEL_WIDTH_STORAGE = "dedup:panel-widths";
 
 /** Panel width bounds. Below the minimum the sidebar's three tabs stop fitting
@@ -488,6 +488,57 @@ export type Panel = keyof typeof PANEL_BOUNDS;
 /** Gap between adjacent page artboards in the canvas's pages row. */
 export const PAGE_GAP = 64;
 
+
+/** Per-agent consent + model, persisted together. Detection is not persisted
+ * — whether a binary exists is a fact about the machine right now, and a
+ * remembered "installed" would outlive an uninstall. */
+function loadAgents(): Record<CliAgent, AgentState> {
+  const blank = (): AgentState => ({
+    installed: null,
+    consent: false,
+    model: null,
+    connecting: false,
+    error: null,
+  });
+  const agents = Object.fromEntries(
+    CLI_AGENTS.map((a) => [a.id, blank()]),
+  ) as Record<CliAgent, AgentState>;
+  try {
+    const raw = localStorage.getItem(AGENTS_STORAGE);
+    if (!raw) return agents;
+    const saved = JSON.parse(raw) as Partial<
+      Record<CliAgent, { consent?: unknown; model?: unknown }>
+    >;
+    for (const agent of CLI_AGENTS) {
+      const entry = saved[agent.id];
+      if (!entry) continue;
+      agents[agent.id].consent = entry.consent === true;
+      agents[agent.id].model =
+        typeof entry.model === "string" && entry.model ? entry.model : null;
+    }
+  } catch {
+    // A corrupt blob just means everyone reconnects — never a broken app.
+  }
+  return agents;
+}
+
+function saveAgentPrefs(agents: Record<CliAgent, AgentState>) {
+  try {
+    localStorage.setItem(
+      AGENTS_STORAGE,
+      JSON.stringify(
+        Object.fromEntries(
+          Object.entries(agents).map(([id, a]) => [
+            id,
+            { consent: a.consent, model: a.model },
+          ]),
+        ),
+      ),
+    );
+  } catch {
+    // Session-only consent still works.
+  }
+}
 
 const clampPanel = (panel: Panel, px: number) =>
   Math.round(
@@ -781,6 +832,17 @@ type Getter = () => AppState;
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** Update one agent's slot without disturbing the others. */
+function patchAgent(
+  set: Setter,
+  get: Getter,
+  agent: CliAgent,
+  patch: Partial<AgentState>,
+) {
+  const agents = get().agents;
+  set({ agents: { ...agents, [agent]: { ...agents[agent], ...patch } } });
+}
+
 /**
  * Update the in-flight merge, and only that one. Every step of a merge is
  * async, so the session it started on may have been cancelled or replaced
@@ -796,10 +858,12 @@ function patchMerge(set: Setter, get: Getter, patch: Partial<MergeSession>) {
 /** The AI backend the user explicitly chose, or null (never a silent one). */
 function aiBackend(state: AppState): AiBackend | null {
   const kind = state.activeAiBackend();
-  if (kind === "claude-code") {
+  if (kind && kind !== "api") {
     return {
-      kind: "claude-code",
-      run: (p: string) => claudeCodePrompt(p, useStore.getState().ccModel),
+      kind: "cli",
+      agent: kind,
+      run: (p: string) =>
+        agentPrompt(kind, p, useStore.getState().agents[kind].model),
     };
   }
   if (kind === "api") return { kind: "api", apiKey: state.anthropicKey };
@@ -906,15 +970,11 @@ export const useStore = create<AppState>((set, get) => ({
   categorizeProgress: null,
   categorizeError: null,
   anthropicKey: localStorage.getItem(KEY_STORAGE) ?? "",
-  claudeCode: null,
+  agents: loadAgents(),
   aiPref:
-    (localStorage.getItem(AI_PREF_STORAGE) as "claude-code" | "api" | null) ??
+    (localStorage.getItem(AI_PREF_STORAGE) as CliAgent | "api" | null) ??
     // Existing key users keep working without re-choosing.
     (localStorage.getItem(KEY_STORAGE) ? "api" : null),
-  ccConsent: localStorage.getItem(CC_CONSENT_STORAGE) === "yes",
-  ccConnecting: false,
-  ccError: null,
-  ccModel: localStorage.getItem(CC_MODEL_STORAGE),
   panelWidths: loadPanelWidths(),
 
   merge: null,
@@ -1393,8 +1453,12 @@ export const useStore = create<AppState>((set, get) => ({
     if (!project || sessionBusy) return;
     const kind = get().activeAiBackend();
     const backend =
-      kind === "claude-code"
-        ? { kind: "claude-code" as const, run: (p: string) => claudeCodePrompt(p, get().ccModel) }
+      kind && kind !== "api"
+        ? {
+            kind: "cli" as const,
+            agent: kind,
+            run: (p: string) => agentPrompt(kind, p, get().agents[kind].model),
+          }
         : kind === "api"
           ? { kind: "api" as const, apiKey: get().anthropicKey }
           : null;
@@ -1930,10 +1994,11 @@ export const useStore = create<AppState>((set, get) => ({
 
     const kind = get().activeAiBackend();
     const backend =
-      kind === "claude-code"
+      kind && kind !== "api"
         ? {
-            kind: "claude-code" as const,
-            run: (p: string) => claudeCodePrompt(p, get().ccModel),
+            kind: "cli" as const,
+            agent: kind,
+            run: (p: string) => agentPrompt(kind, p, get().agents[kind].model),
           }
         : kind === "api"
           ? { kind: "api" as const, apiKey: get().anthropicKey }
@@ -2152,13 +2217,15 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  detectClaudeCode: async () => {
-    if (get().claudeCode !== null) return;
+  detectAgent: async (agent) => {
+    if (get().agents[agent].installed !== null) return;
+    let installed = false;
     try {
-      set({ claudeCode: await claudeCodeAvailable() });
+      installed = await agentAvailable(agent);
     } catch {
-      set({ claudeCode: false });
+      installed = false;
     }
+    patchAgent(set, get, agent, { installed });
   },
 
   setAiPref: (aiPref) => {
@@ -2171,57 +2238,57 @@ export const useStore = create<AppState>((set, get) => ({
     set({ aiPref });
   },
 
-  setCcModel: (ccModel) => {
-    try {
-      if (ccModel) localStorage.setItem(CC_MODEL_STORAGE, ccModel);
-      else localStorage.removeItem(CC_MODEL_STORAGE);
-    } catch {
-      // In-memory choice still applies this session.
-    }
-    set({ ccModel });
+  setAgentModel: (agent, model) => {
+    patchAgent(set, get, agent, { model });
+    saveAgentPrefs(get().agents);
   },
 
-  connectClaudeCode: async () => {
-    if (get().ccConnecting) return;
-    set({ ccConnecting: true, ccError: null });
+  connectAgent: async (agent) => {
+    if (get().agents[agent].connecting) return;
+    const meta = CLI_AGENTS.find((a) => a.id === agent);
+    const label = meta?.label ?? agent;
+    const command = meta?.command ?? agent;
+    patchAgent(set, get, agent, { connecting: true, error: null });
     try {
-      if (get().claudeCode === null) await get().detectClaudeCode();
-      if (!get().claudeCode) {
+      if (get().agents[agent].installed === null) await get().detectAgent(agent);
+      if (!get().agents[agent].installed) {
         throw new Error(
-          "Claude Code CLI not found. Install it and run `claude` once to log in.",
+          `${label} CLI not found. Install it and run \`${command}\` once to sign in.`,
         );
       }
-      // Live round-trip proves the login works and is the explicit consent
-      // moment — dedup never uses the subscription before this succeeds.
-      const reply = await claudeCodePrompt("Reply with exactly: ok", get().ccModel);
+      // A live round-trip is the consent moment *and* the proof: it is the
+      // only thing that distinguishes "installed" from "actually usable",
+      // which for a CLI that can be signed out is a real difference.
+      const reply = await agentPrompt(
+        agent,
+        "Reply with exactly: ok",
+        get().agents[agent].model,
+      );
       if (!/ok/i.test(reply)) {
-        throw new Error(`unexpected reply from Claude Code: ${reply.slice(0, 80)}`);
+        throw new Error(`unexpected reply from ${label}: ${reply.slice(0, 120)}`);
       }
-      try {
-        localStorage.setItem(CC_CONSENT_STORAGE, "yes");
-      } catch {
-        // Session-only consent still works.
-      }
-      set({ ccConsent: true });
-      get().setAiPref("claude-code");
+      patchAgent(set, get, agent, { consent: true, error: null });
+      saveAgentPrefs(get().agents);
+      get().setAiPref(agent);
       // Organize the current scan right away with the new backend.
       void get().categorize();
     } catch (e) {
       const msg = String(e instanceof Error ? e.message : e);
-      set({
-        ccError: /login|auth|credential|unauthorized/i.test(msg)
-          ? `${msg} — run \`claude\` in a terminal and complete /login, then retry.`
+      patchAgent(set, get, agent, {
+        error: /login|auth|credential|unauthorized|sign in/i.test(msg)
+          ? `${msg}\n\nRun \`${command}\` in a terminal, sign in, then retry.`
           : msg,
       });
     } finally {
-      set({ ccConnecting: false });
+      patchAgent(set, get, agent, { connecting: false });
     }
   },
 
   activeAiBackend: () => {
-    const { aiPref, ccConsent, claudeCode, anthropicKey } = get();
-    if (aiPref === "claude-code" && ccConsent && claudeCode !== false) {
-      return "claude-code";
+    const { aiPref, agents, anthropicKey } = get();
+    if (aiPref && aiPref !== "api") {
+      const state = agents[aiPref];
+      if (state?.consent && state.installed !== false) return aiPref;
     }
     if (aiPref === "api" && anthropicKey) return "api";
     return null;
@@ -2233,8 +2300,12 @@ export const useStore = create<AppState>((set, get) => ({
     // Backend is an explicit user choice (TopBar AI switch); no silent use.
     const kind = get().activeAiBackend();
     const backend: AiBackend | null =
-      kind === "claude-code"
-        ? { kind: "claude-code", run: (p) => claudeCodePrompt(p, get().ccModel) }
+      kind && kind !== "api"
+        ? {
+            kind: "cli",
+            agent: kind,
+            run: (p) => agentPrompt(kind, p, get().agents[kind].model),
+          }
         : kind === "api"
           ? { kind: "api", apiKey: anthropicKey }
           : null;

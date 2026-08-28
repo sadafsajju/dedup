@@ -1,72 +1,180 @@
-//! Claude Code CLI bridge — lets the AI features (categorization, mock
-//! props, later the Phase-4 merge proposals) run through the user's local
-//! Claude Code install and subscription instead of a raw API key. One-shot
-//! headless invocation: prompt on stdin, JSON envelope on stdout.
+//! Coding-agent CLI bridge — lets dedup's AI features (categorization, mock
+//! props, seed drafts, merge proposals) run through an agent the user already
+//! has installed and signed into, instead of a raw API key.
+//!
+//! One shape, two agents: spawn a headless single-shot invocation, feed the
+//! prompt on stdin, read one text answer back. Everything that differs
+//! between them — the binary's name, the flags that mean "no tools, no
+//! session, don't touch anything", and how the answer is framed in the output
+//! — lives in `Agent` and nowhere else, so adding a third is a match arm
+//! rather than a second copy of the process plumbing.
+//!
+//! Both are asked for a *text completion*. dedup does the file editing itself,
+//! through its own parse-gated write-back, so an agent is never given tools or
+//! write access here — it would be a second, unaudited path to the user's
+//! source.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A coding-agent CLI dedup can borrow for one prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Agent {
+    ClaudeCode,
+    Codex,
+}
+
+impl Agent {
+    pub fn parse(name: &str) -> Option<Agent> {
+        match name {
+            "claude-code" | "claude" => Some(Agent::ClaudeCode),
+            "codex" => Some(Agent::Codex),
+            _ => None,
+        }
+    }
+
+    fn binary(self) -> &'static str {
+        match self {
+            Agent::ClaudeCode => "claude",
+            Agent::Codex => "codex",
+        }
+    }
+
+    /// Where the installer usually puts it. A GUI-launched app inherits a
+    /// minimal PATH, so `which` alone finds nothing on a normal machine.
+    fn fallbacks(self, home: &str) -> Vec<String> {
+        match self {
+            Agent::ClaudeCode => vec![
+                format!("{home}/.claude/local/claude"),
+                "/opt/homebrew/bin/claude".into(),
+                "/usr/local/bin/claude".into(),
+                format!("{home}/.local/bin/claude"),
+            ],
+            Agent::Codex => vec![
+                format!("{home}/.codex/bin/codex"),
+                "/opt/homebrew/bin/codex".into(),
+                "/usr/local/bin/codex".into(),
+                format!("{home}/.local/bin/codex"),
+                format!("{home}/.bun/bin/codex"),
+            ],
+        }
+    }
+
+    /// The headless invocation. `answer_file` is where an agent that can write
+    /// its final message to a file should put it (Codex); None means the
+    /// answer is parsed out of stdout.
+    fn args(self, model: Option<&str>, answer_file: Option<&Path>) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        match self {
+            Agent::ClaudeCode => {
+                // Deliberately stripped down: no settings/CLAUDE.md, no MCP
+                // servers, no tools, no session files, no slash commands.
+                // Everything else is startup cost and, worse, a hang surface —
+                // an MCP server that blocks would stall the whole prompt.
+                args.extend(
+                    [
+                        "-p",
+                        "--output-format",
+                        "json",
+                        "--tools",
+                        "",
+                        "--strict-mcp-config",
+                        "--mcp-config",
+                        r#"{"mcpServers":{}}"#,
+                        "--setting-sources",
+                        "",
+                        "--no-session-persistence",
+                        "--disable-slash-commands",
+                    ]
+                    .map(String::from),
+                );
+                if let Some(model) = model {
+                    args.push("--model".into());
+                    args.push(model.into());
+                }
+            }
+            Agent::Codex => {
+                // `exec` is Codex's non-interactive mode. read-only sandbox
+                // because dedup wants words, not edits; skip-git-repo-check
+                // because we deliberately run from a neutral temp directory,
+                // which is not a repo.
+                args.extend(
+                    ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
+                        .map(String::from),
+                );
+                if let Some(model) = model {
+                    args.push("--model".into());
+                    args.push(model.into());
+                }
+                if let Some(path) = answer_file {
+                    args.push("--output-last-message".into());
+                    args.push(path.display().to_string());
+                }
+                // Read the prompt from stdin rather than argv: these prompts
+                // carry whole source files and would blow the arg limit.
+                args.push("-".into());
+            }
+        }
+        args
+    }
+
+    /// Does this agent want a file to write its final message into?
+    fn uses_answer_file(self) -> bool {
+        matches!(self, Agent::Codex)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Agent::ClaudeCode => "Claude Code",
+            Agent::Codex => "Codex",
+        }
+    }
+}
+
 /// Generous ceiling for one prompt (big files on a slow model are legitimate);
 /// the point is that the UI can never hang forever.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// `claude` from PATH, with the usual install locations as fallbacks
-/// (GUI-launched apps get a minimal PATH).
-pub fn find_claude() -> Option<PathBuf> {
-    if let Some(found) = crate::toolpath::which("claude") {
+/// The agent's binary: PATH first, then the usual install locations.
+pub fn find(agent: Agent) -> Option<PathBuf> {
+    if let Some(found) = crate::toolpath::which(agent.binary()) {
         return Some(found);
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    for candidate in [
-        format!("{home}/.claude/local/claude"),
-        "/opt/homebrew/bin/claude".into(),
-        "/usr/local/bin/claude".into(),
-        format!("{home}/.local/bin/claude"),
-    ] {
-        if Path::new(&candidate).exists() {
-            return Some(PathBuf::from(candidate));
-        }
-    }
-    None
+    agent
+        .fallbacks(&home)
+        .into_iter()
+        .find(|c| Path::new(c).exists())
+        .map(PathBuf::from)
 }
 
-pub fn available() -> bool {
-    find_claude().is_some()
+pub fn available(agent: Agent) -> bool {
+    find(agent).is_some()
 }
 
-/// Run one headless prompt through Claude Code and return the result text.
-/// `model` is a CLI alias or full id ("sonnet", "opus", …); None keeps the
-/// user's CLI default.
-///
-/// The invocation is deliberately stripped down: no settings/CLAUDE.md, no
-/// MCP servers, no tools, no session files, no skills. dedup only wants a
-/// text completion — everything else is startup cost and, worse, a hang
-/// surface (an MCP server that blocks stalls the whole prompt). A hard
-/// timeout kills the child so the UI can never wait forever.
-pub fn prompt(text: &str, model: Option<&str>) -> Result<String, String> {
-    let claude = find_claude().ok_or("Claude Code CLI not found")?;
+/// Run one headless prompt through `agent` and return the answer text.
+/// `model` is whatever that CLI calls a model ("sonnet", "gpt-5.6-sol", …);
+/// None keeps the user's own default. A hard timeout kills the child, so the
+/// UI can never wait forever on a wedged agent.
+pub fn prompt(agent: Agent, text: &str, model: Option<&str>) -> Result<String, String> {
+    let binary = find(agent).ok_or_else(|| format!("{} CLI not found", agent.label()))?;
 
-    let mut cmd = Command::new(claude);
+    // Codex writes its final message to a file when asked, which is far more
+    // robust than scraping a transcript off stdout.
+    let answer_file = agent.uses_answer_file().then(|| {
+        std::env::temp_dir().join(format!(
+            "dedup-agent-{}-{}.txt",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ))
+    });
+
+    let mut cmd = Command::new(binary);
     crate::toolpath::apply(&mut cmd);
-    cmd.args([
-        "-p",
-        "--output-format",
-        "json",
-        "--tools",
-        "",
-        "--strict-mcp-config",
-        "--mcp-config",
-        r#"{"mcpServers":{}}"#,
-        "--setting-sources",
-        "",
-        "--no-session-persistence",
-        "--disable-slash-commands",
-    ]);
-    if let Some(model) = model {
-        cmd.args(["--model", model]);
-    }
+    cmd.args(agent.args(model, answer_file.as_deref()));
     let mut child = cmd
         // Neutral cwd — never load project context from wherever dedup runs.
         .current_dir(std::env::temp_dir())
@@ -124,19 +232,54 @@ pub fn prompt(text: &str, model: Option<&str>) -> Result<String, String> {
     // "claude exited with Some(1): ": an error message containing no error,
     // while the CLI's own explanation sat unread in the envelope. Whenever
     // there is an envelope, it is the better source.
+    let file_answer = answer_file.as_ref().and_then(|path| {
+        let text = std::fs::read_to_string(path).ok();
+        let _ = std::fs::remove_file(path);
+        text
+    });
+
     if !status.success() {
-        return Err(match parse_result_envelope(&stdout) {
+        let binary = agent.binary();
+        return Err(match parse_answer(agent, &stdout, file_answer.as_deref()) {
             Err(reason) if !stdout.trim().is_empty() => with_hint(reason),
             _ if !stderr.trim().is_empty() => {
-                with_hint(format!("claude: {}", stderr.trim()))
+                with_hint(format!("{binary}: {}", stderr.trim()))
             }
             _ => format!(
-                "claude exited with {:?} and reported nothing — run `claude` in a terminal to check it starts and is signed in",
+                "{binary} exited with {:?} and reported nothing — run `{binary}` in a terminal to check it starts and is signed in",
                 status.code()
             ),
         });
     }
-    parse_result_envelope(&stdout)
+    parse_answer(agent, &stdout, file_answer.as_deref())
+}
+
+/// Pull the answer out of whatever the agent produced.
+fn parse_answer(
+    agent: Agent,
+    stdout: &str,
+    file_answer: Option<&str>,
+) -> Result<String, String> {
+    match agent {
+        Agent::ClaudeCode => parse_result_envelope(stdout),
+        Agent::Codex => {
+            // Preferred: the last-message file, which is exactly the answer
+            // and nothing else. Falling back to stdout means scraping a
+            // transcript, so it is only worth doing when the file is missing
+            // — an older CLI without --output-last-message.
+            if let Some(text) = file_answer.map(str::trim).filter(|t| !t.is_empty()) {
+                return Ok(text.to_string());
+            }
+            let text = stdout.trim();
+            if text.is_empty() {
+                return Err(
+                    "codex produced no output — run `codex exec` in a terminal to check it is signed in"
+                        .into(),
+                );
+            }
+            Ok(text.to_string())
+        }
+    }
 }
 
 /// Point at the fix when the message is one dedup can recognise. An expired
@@ -193,6 +336,70 @@ mod tests {
     /// reason in the envelope on stdout. Reporting stderr gave the user
     /// "claude exited with Some(1): " — a failure message with the failure
     /// removed, and no way to guess that they simply needed to sign in.
+    /// The two agents differ only in how they are invoked, so that is what
+    /// gets pinned: a prompt must never become an argv entry (these carry
+    /// whole source files), and neither may be handed tools or write access —
+    /// dedup does its own editing through the parse-gated write-back, and a
+    /// second path to the user's source would be an unaudited one.
+    #[test]
+    fn each_agent_is_invoked_headlessly_and_without_tools() {
+        let claude = Agent::ClaudeCode.args(Some("sonnet"), None);
+        assert!(claude.contains(&"-p".to_string()));
+        assert!(claude.contains(&"--tools".to_string()));
+        assert_eq!(
+            claude.iter().filter(|a| *a == "sonnet").count(),
+            1,
+            "the model must be passed through"
+        );
+
+        let answer = Path::new("/tmp/answer.txt");
+        let codex = Agent::Codex.args(Some("gpt-5.6-sol"), Some(answer));
+        assert_eq!(codex.first().unwrap(), "exec", "non-interactive mode");
+        assert!(
+            codex.windows(2).any(|w| w == ["--sandbox", "read-only"]),
+            "dedup wants words, not edits: {codex:?}"
+        );
+        assert!(
+            codex.contains(&"--skip-git-repo-check".to_string()),
+            "we run from a neutral temp dir, which is not a repo"
+        );
+        assert_eq!(
+            codex.last().unwrap(),
+            "-",
+            "the prompt goes on stdin — these carry whole files and would blow the arg limit"
+        );
+        assert!(codex.contains(&"/tmp/answer.txt".to_string()));
+    }
+
+    /// Codex's final message comes from the file when it wrote one; stdout is
+    /// only a fallback for a CLI too old to have the flag.
+    #[test]
+    fn codex_prefers_its_last_message_file_over_the_transcript() {
+        let transcript = "thinking...\nrunning...\nsome trailing chatter";
+        assert_eq!(
+            parse_answer(Agent::Codex, transcript, Some("  the answer  ")).unwrap(),
+            "the answer"
+        );
+        // No file (older CLI): fall back rather than fail.
+        assert_eq!(
+            parse_answer(Agent::Codex, "  the answer  ", None).unwrap(),
+            "the answer"
+        );
+        // An empty file is not an answer.
+        assert_eq!(
+            parse_answer(Agent::Codex, "from stdout", Some("   ")).unwrap(),
+            "from stdout"
+        );
+        assert!(parse_answer(Agent::Codex, "  ", None).is_err());
+    }
+
+    #[test]
+    fn agent_names_round_trip_from_the_frontend() {
+        assert_eq!(Agent::parse("claude-code"), Some(Agent::ClaudeCode));
+        assert_eq!(Agent::parse("codex"), Some(Agent::Codex));
+        assert_eq!(Agent::parse("gemini"), None);
+    }
+
     #[test]
     fn an_expired_login_reports_its_real_reason() {
         let envelope = r#"{"type":"result","is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#;

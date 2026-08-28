@@ -99,7 +99,7 @@ export async function runMergePrompt(
   plan: MergePlan,
 ): Promise<string> {
   const prompt = buildMergePrompt(plan);
-  if (backend.kind === "claude-code") {
+  if (backend.kind === "cli") {
     return backend.run(`${SYSTEM_PROMPT}\n\n${prompt}`);
   }
   const { default: Anthropic } = await import("@anthropic-ai/sdk");
