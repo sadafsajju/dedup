@@ -2,6 +2,7 @@
 //! process management, git-state probe, and the recent-projects list.
 
 mod ai;
+mod asset;
 mod devserver;
 mod git;
 mod instrument;
@@ -9,6 +10,7 @@ mod merge;
 mod project;
 mod proxy;
 mod recents;
+mod scaffold;
 mod scan;
 mod session;
 mod sidecar;
@@ -23,6 +25,18 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[tauri::command]
 fn detect_project(root: String) -> ProjectInfo {
     project::detect(&root)
+}
+
+/// Write a starter into an empty folder and make it a git repo (the "blank
+/// folder" open path). `kind` is "react" or "html". Progress streams as
+/// `scaffold://log`; the caller re-detects the folder afterwards.
+#[tauri::command]
+async fn scaffold_project(app: AppHandle, root: String, kind: String) -> Result<ProjectInfo, String> {
+    let detect_root = root.clone();
+    tauri::async_runtime::spawn_blocking(move || scaffold::create(&app, &root, &kind))
+        .await
+        .map_err(|e| format!("scaffold task failed: {e}"))??;
+    Ok(project::detect(&detect_root))
 }
 
 #[tauri::command]
@@ -49,6 +63,7 @@ fn start_dev_server(
     package_manager: PackageManager,
     framework: Framework,
     dev_script: Option<String>,
+    static_dir: Option<String>,
     custom_command: Option<String>,
 ) -> Result<(), String> {
     let (launch, instr_info): (devserver::Launch, InstrumentationEvent) =
@@ -161,6 +176,23 @@ fn start_dev_server(
                 },
             ),
         }
+    } else if framework == Framework::Static {
+        // There is no user dev server here — dedup *is* the dev server. So a
+        // failure to prepare it is fatal rather than a downgrade to "runs but
+        // uninstrumented": there would be nothing left running.
+        let instr = instrument::static_setup(&root, static_dir.as_deref())?;
+        (
+            ExecSpec::Direct {
+                program: instr.program,
+                args: instr.args,
+            }
+            .into(),
+            InstrumentationEvent {
+                active: true,
+                mode: "tagged",
+                detail: Some("static".to_string()),
+            },
+        )
     } else {
         (
             ExecSpec::Script(package_manager, Vec::new()).into(),
@@ -199,6 +231,32 @@ fn inspect_element(
     sidecar::inspect(&root, &file, index)
 }
 
+/// Copy a file the AI agent generated into the project — an image, which is
+/// the one output it cannot put in its reply. Gated in `asset.rs`: the source
+/// must be inside that agent's own output directory, must sniff as an image,
+/// and the destination must be a new path inside the project.
+#[tauri::command]
+fn import_agent_asset(
+    root: String,
+    agent: String,
+    source: String,
+    dest: String,
+) -> Result<asset::ImportedAsset, String> {
+    let agent = ai::Agent::parse(&agent).ok_or_else(|| format!("unknown agent: {agent}"))?;
+    asset::import(&root, agent, &source, &dest)
+}
+
+/// The source of the element at ordinal `index` in `file`, as a snippet that
+/// can be pasted somewhere else, plus the names it would need there.
+#[tauri::command]
+fn copy_element(
+    root: String,
+    file: String,
+    index: u32,
+) -> Result<serde_json::Value, String> {
+    sidecar::copy(&root, &file, index)
+}
+
 /// Apply one file's staged edit program — class, text, insert, remove, move —
 /// as a single AST-ranged write (FR-4.1).
 #[tauri::command]
@@ -232,6 +290,47 @@ async fn write_source(
     tauri::async_runtime::spawn_blocking(move || sidecar::write_file(&root, &file, &content))
         .await
         .map_err(|e| format!("write task failed: {e}"))?
+}
+
+/// Replace several source files as one all-or-nothing write (chat agent
+/// edits). The sidecar validates every file's new content before writing any
+/// of them, so a multi-file edit either lands whole or not at all.
+#[tauri::command]
+async fn write_sources(
+    root: String,
+    files: Vec<(String, String)>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || sidecar::write_files(&root, &files))
+        .await
+        .map_err(|e| format!("write task failed: {e}"))?
+}
+
+/// Put files back as dedup found them — discarding a previewed chat edit.
+/// A null content means the file didn't exist before and is removed.
+#[tauri::command]
+async fn revert_sources(
+    root: String,
+    files: Vec<(String, Option<String>)>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || sidecar::revert_files(&root, &files))
+        .await
+        .map_err(|e| format!("revert task failed: {e}"))?
+}
+
+/// Project file inventory for the chat agent's `list` tool.
+#[tauri::command]
+async fn list_project_files(root: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || sidecar::list_files(&root))
+        .await
+        .map_err(|e| format!("list task failed: {e}"))?
+}
+
+/// Line matches across the project for the chat agent's `grep` tool.
+#[tauri::command]
+async fn grep_project(root: String, pattern: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || sidecar::grep(&root, &pattern))
+        .await
+        .map_err(|e| format!("grep task failed: {e}"))?
 }
 
 /// Duplicate scan (FR-5.1/5.2): inventory + structural clustering. `files`
@@ -364,8 +463,17 @@ async fn capture_project_thumbnail(
 
 /// Page routes discovered from the project's files (no dev server needed).
 #[tauri::command]
-async fn detect_routes(root: String) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || sidecar::routes(&root))
+async fn detect_routes(
+    root: String,
+    framework: Option<Framework>,
+) -> Result<serde_json::Value, String> {
+    // Which discovery to run is the framework the compatibility card already
+    // settled on, not a second guess from inside the sidecar.
+    let kind = match framework {
+        Some(Framework::Static) => "static",
+        _ => "app",
+    };
+    tauri::async_runtime::spawn_blocking(move || sidecar::routes(&root, kind))
         .await
         .map_err(|e| format!("route scan failed: {e}"))?
 }
@@ -526,14 +634,21 @@ pub fn run() {
         .manage(Snapshots::default())
         .invoke_handler(tauri::generate_handler![
             detect_project,
+            scaffold_project,
             git_status,
             start_dev_server,
             stop_dev_server,
             dev_server_running,
             inspect_element,
+            copy_element,
+            import_agent_asset,
             apply_edits,
             read_source,
             write_source,
+            write_sources,
+            revert_sources,
+            list_project_files,
+            grep_project,
             scan_project,
             load_scan_result,
             load_categories,

@@ -5,17 +5,31 @@ import {
   buildBootScript,
   discoverRoutes,
   tagCode,
+  HOLD_FLAG,
+  OFFLINE_FLAG,
 } from "../src-tauri/assets/dedup-tagger.mjs";
 
 let passed = 0;
 function test(name, fn) {
-  try {
-    fn();
+  const ok = () => {
     passed++;
     console.log(`  ok — ${name}`);
-  } catch (e) {
+  };
+  const bad = (e) => {
     console.error(`  FAIL — ${name}\n${e.message}`);
     process.exitCode = 1;
+  };
+  try {
+    // Sync by default; an async body is awaited by its caller. (A rejected
+    // promise nobody waited for would pass silently, which is worse than
+    // failing.)
+    const result = fn();
+    if (result && typeof result.then === "function") {
+      return result.then(ok, bad);
+    }
+    ok();
+  } catch (e) {
+    bad(e);
   }
 }
 
@@ -316,6 +330,115 @@ test("wb: insert places a validated snippet, and refuses invalid ones", () => {
   }
 });
 
+test("wb: copy hands back an element's own source, de-indented", () => {
+  const file = fixture(
+    "Copy.tsx",
+    `export const C = () => (
+  <div>
+    <section className="card">
+      <h2>Title</h2>
+      <p>Body</p>
+    </section>
+  </div>
+);\n`,
+  );
+  const r = runWb({ cmd: "copy", file, index: 1 });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.lang, "jsx");
+  assert.equal(r.tag, "section");
+  // Verbatim, not re-printed: the user copies what their file says. Only the
+  // block's own base indentation goes, because insert re-applies whatever the
+  // destination's is.
+  assert.equal(
+    r.snippet,
+    `<section className="card">\n  <h2>Title</h2>\n  <p>Body</p>\n</section>`,
+    r.snippet,
+  );
+  // Everything it swallowed, so the editor can tell whether staged edits sit
+  // inside the copy: <section>, <h2>, <p>.
+  assert.deepEqual(r.contains, [1, 2, 3]);
+
+  // And the snippet it hands back is one the insert op will take.
+  const back = runWb({
+    cmd: "apply",
+    file,
+    ops: [{ op: "insert", target: 1, position: "after", snippet: r.snippet }],
+  });
+  assert.equal(back.ok, true, back.error);
+  const after = fs.readFileSync(file, "utf8");
+  assert.equal(
+    after.match(/<section className="card">/g).length,
+    2,
+    "the copy landed beside the original\n" + after,
+  );
+  assert.match(after, /\n    <section className="card">\n      <h2>/, after);
+});
+
+test("wb: copy reports the names a snippet cannot carry with it", () => {
+  const file = fixture(
+    "Refs.tsx",
+    `export const R = ({ items, title }) => (
+  <div>
+    <Card title={title} onPick={() => pick(items[0].id)}>
+      {items.map((item) => (
+        <Row key={item.id} label={item.label} />
+      ))}
+    </Card>
+  </div>
+);\n`,
+  );
+  const r = runWb({ cmd: "copy", file, index: 1 });
+  assert.equal(r.ok, true, r.error);
+  // Components it renders and variables its expressions read — everything the
+  // destination file has to already have.
+  assert.deepEqual(r.refs, ["Card", "Row", "items", "pick", "title"], String(r.refs));
+  // `item` is bound by the snippet's own arrow function, and `key`/`label` are
+  // attribute names, not references.
+  assert.ok(!r.refs.includes("item"));
+  assert.ok(!r.refs.includes("label"));
+});
+
+test("wb: a paste is refused when what it is placed against is being deleted", () => {
+  const src = `export const X = () => (
+  <div>
+    <a>one</a>
+    <b>two</b>
+  </div>
+);\n`;
+  // Cut-then-paste puts both ops in one program. Appending onto a chunk that
+  // the same program removes drops the content silently — the one failure a
+  // paste must never have, so it is refused instead.
+  for (const position of ["before", "after", "inside"]) {
+    const file = fixture("Cut.tsx", src);
+    const r = runWb({
+      cmd: "apply",
+      file,
+      ops: [
+        { op: "remove", index: 1 },
+        { op: "insert", target: 1, position, snippet: "<p>moved</p>" },
+      ],
+    });
+    assert.equal(r.ok, false, `${position} should be refused`);
+    assert.match(r.error, /being deleted/);
+    assert.equal(fs.readFileSync(file, "utf8"), src, "and nothing was written");
+  }
+
+  // A paste somewhere else in the same program is fine — that is a real move.
+  const file = fixture("Cut2.tsx", src);
+  const ok = runWb({
+    cmd: "apply",
+    file,
+    ops: [
+      { op: "remove", index: 1 },
+      { op: "insert", target: 2, position: "after", snippet: "<p>moved</p>" },
+    ],
+  });
+  assert.equal(ok.ok, true, ok.error);
+  const after = fs.readFileSync(file, "utf8");
+  assert.doesNotMatch(after, /<a>one<\/a>/);
+  assert.match(after, /<b>two<\/b>\n    <p>moved<\/p>/, after);
+});
+
 test("wb: move re-parents, re-indents, and carries edits made inside it", () => {
   const file = fixture(
     "M.tsx",
@@ -524,12 +647,35 @@ export const router = createBrowserRouter([
 
 // --- boot script: mock session + hold --------------------------------------
 
+/** A stand-in XMLHttpRequest: enough surface for the offline cut to wrap. */
+class StubXHR extends EventTarget {
+  constructor(sent) {
+    super();
+    this.readyState = 0;
+    this.status = 0;
+    this.sent = sent;
+  }
+  open(method, url) {
+    this.readyState = 1;
+    this.method = method;
+    this.url = url;
+  }
+  send(body) {
+    this.sent.push({ url: this.url, body });
+  }
+}
+
 /**
  * Run a boot script in a stand-in for a page. `search` is the frame URL's
- * query (that is how a hold is armed); `framed` says whether the page is
- * embedded, which gates everything.
+ * query (that is how a hold and the offline cut are armed); `framed` says
+ * whether the page is embedded, which gates everything.
+ *
+ * `net` adds the request APIs the offline cut wraps, plus the `location`
+ * fields it needs to tell the app's traffic from the dev server's. Left off,
+ * the window has none of them — which is itself worth exercising, since the
+ * cut has to install cleanly wherever a given API is missing.
  */
-function runBoot(out, { framed = true, search = "" } = {}) {
+function runBoot(out, { framed = true, search = "", net = false } = {}) {
   const warned = [];
   const timers = [];
   const win = {
@@ -546,17 +692,54 @@ function runBoot(out, { framed = true, search = "" } = {}) {
   };
   win.self = win;
   win.top = framed ? {} : win;
+
+  const origin = "http://localhost:5173";
+  // What actually reached the network, so a test can prove the dev server's
+  // own traffic still goes out while the app's does not.
+  const net_ = { fetched: [], sent: [], sockets: [], events: [] };
+  const listeners = new Map();
+  if (net) {
+    win.fetch = (input) => {
+      net_.fetched.push(String(input));
+      return Promise.resolve("real response");
+    };
+    win.XMLHttpRequest = class extends StubXHR {
+      constructor() {
+        super(net_.sent);
+      }
+    };
+    win.WebSocket = function (url, protocols) {
+      net_.sockets.push({ url: String(url), protocols });
+      this.real = true;
+    };
+    win.navigator = { onLine: true, sendBeacon: () => true };
+    win.addEventListener = (type, fn) => {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    };
+    win.dispatchEvent = (ev) => {
+      net_.events.push(ev.type);
+      for (const fn of listeners.get(ev.type) ?? []) fn(ev);
+      return true;
+    };
+  }
+
   const writes = [];
   const history = { pushState: () => writes.push(["pushState"]), replaceState: () => writes.push(["replaceState"]) };
   const localStorage = { setItem: (k, v) => writes.push([k, v]) };
   new Function("window", "history", "location", "localStorage", "console", out)(
     win,
     history,
-    { search },
+    { search, origin, href: `${origin}/page${search}` },
     localStorage,
     { warn: (...a) => warned.push(a) },
   );
-  return { win, history, warned, writes, timers };
+  /** Run the callbacks the cut queued (it uses 0ms timers, not real async). */
+  const flush = () => {
+    const pending = timers.splice(0, timers.length);
+    for (const t of pending) if (t.kind === "timeout") t.fn(...t.args);
+  };
+  return { win, history, warned, writes, timers, net: net_, listeners, flush };
 }
 
 test("boot: no seed, disabled seed, and empty script all serve a no-op", () => {
@@ -651,6 +834,165 @@ test("hold: releasing restores the page's own timers and history", () => {
   );
   history.pushState({}, "", "/next");
   assert.deepEqual(writes, [["pushState"]], "navigation must work again");
+});
+
+// --- boot script: the offline cut -------------------------------------------
+
+const OFFLINE = `?${OFFLINE_FLAG}=1`;
+
+test("offline: armed only by the flag, and only inside the canvas", () => {
+  const out = buildBootScript(null);
+
+  // No flag: the page is untouched. This is the ordinary case — every
+  // artboard that never asked for it.
+  const plain = runBoot(out, { net: true });
+  assert.equal(plain.win.__dedupOffline, undefined);
+  assert.equal(plain.win.navigator.onLine, true);
+
+  // Flagged but not framed: the user browsing their own dev server, where a
+  // URL they could type must never cut their network.
+  const direct = runBoot(out, { net: true, framed: false, search: OFFLINE });
+  assert.equal(direct.win.__dedupOffline, undefined);
+  assert.equal(direct.win.navigator.onLine, true);
+
+  // Flagged and framed: cut.
+  const off = runBoot(out, { net: true, search: OFFLINE });
+  assert.equal(off.win.__dedupOffline, true);
+  assert.equal(off.win.navigator.onLine, false, "the first thing an app checks");
+});
+
+test("offline: installs cleanly on a page missing any given request API", () => {
+  // `net: false` gives a window with no fetch, no XHR, no WebSocket and no
+  // navigator. Nothing may throw — this runs in <head>, and a throw there
+  // takes the app down with it.
+  const bare = runBoot(buildBootScript(null), { search: OFFLINE });
+  assert.deepEqual(bare.warned, [], `offline warned: ${JSON.stringify(bare.warned)}`);
+  assert.equal(bare.win.__dedupOffline, true);
+});
+
+await test("offline: the app's requests fail, the dev server's still go out", async () => {
+  const off = runBoot(buildBootScript(null), { net: true, search: OFFLINE });
+
+  // The app's own calls — same-origin API routes and anything cross-origin.
+  for (const url of [
+    "/api/session",
+    "http://localhost:5173/api/session",
+    "https://api.example.com/v1/me",
+    "//cdn.example.com/data.json",
+  ]) {
+    await assert.rejects(
+      () => off.win.fetch(url),
+      (e) => {
+        assert.ok(e instanceof TypeError, `${url} rejected with ${e}`);
+        // WebKit's own words: the canvas is a WKWebView, so this is what the
+        // app would really be handed.
+        assert.equal(e.message, "Load failed");
+        return true;
+      },
+      url,
+    );
+  }
+
+  // The dev server's and dedup's own traffic is not the app reaching the
+  // network — cutting it would take hot reload and the canvas down too.
+  for (const url of [
+    "/__dedup/session.js",
+    "/@vite/client",
+    "/@react-refresh",
+    "/__vite_ping",
+    "/node_modules/.vite/deps/react.js",
+    "/_next/static/chunks/main.js",
+  ]) {
+    assert.equal(await off.win.fetch(url), "real response", url);
+  }
+  assert.equal(off.net.fetched.length, 6, "only tooling requests were made");
+});
+
+test("offline: an XHR fails the way a real network failure does", () => {
+  const off = runBoot(buildBootScript(null), { net: true, search: OFFLINE });
+
+  const xhr = new off.win.XMLHttpRequest();
+  const seen = [];
+  xhr.addEventListener("readystatechange", () => seen.push("readystatechange"));
+  xhr.addEventListener("error", () => seen.push("error"));
+  xhr.addEventListener("loadend", () => seen.push("loadend"));
+  xhr.open("GET", "/api/session");
+  xhr.send();
+  assert.deepEqual(off.net.sent, [], "nothing may actually be sent");
+  assert.deepEqual(seen, [], "and it must not fail synchronously");
+
+  off.flush();
+  // readyState 4 with status 0, then error and loadend — what a library
+  // waiting on the request needs to see to call it a network error rather
+  // than sit on a spinner forever.
+  assert.equal(xhr.readyState, 4);
+  assert.equal(xhr.status, 0);
+  assert.deepEqual(seen, ["readystatechange", "error", "loadend"]);
+
+  // A tooling URL is really sent.
+  const tooling = new off.win.XMLHttpRequest();
+  tooling.open("GET", "/__dedup/routes");
+  tooling.send();
+  assert.deepEqual(off.net.sent, [{ url: "/__dedup/routes", body: undefined }]);
+});
+
+test("offline: a socket the app opens dies; Vite's HMR socket does not", () => {
+  const off = runBoot(buildBootScript(null), { net: true, search: OFFLINE });
+
+  const sock = new off.win.WebSocket("wss://realtime.example.com/feed");
+  const seen = [];
+  sock.onerror = () => seen.push("onerror");
+  sock.addEventListener("close", (e) => seen.push(`close:${e.code}`));
+  assert.equal(sock.readyState, 0, "it connects first, like a real one");
+  assert.deepEqual(off.net.sockets, [], "no socket was actually opened");
+
+  off.flush();
+  assert.equal(sock.readyState, 3);
+  assert.deepEqual(seen, ["onerror", "close:1006"], "1006 is abnormal closure");
+  // Sending on a dead socket throws, as it does in a browser.
+  assert.throws(() => sock.send("hi"), /CLOSING or CLOSED/);
+
+  // Hot reload is the dev server talking to itself, and it announces itself
+  // by protocol. Cutting it would mean an artboard that stops updating as
+  // soon as it goes offline.
+  const hmr = new off.win.WebSocket("ws://localhost:5173/", "vite-hmr");
+  assert.equal(hmr.real, true, "the HMR socket must be the real one");
+  assert.equal(off.net.sockets.length, 1);
+});
+
+test("offline: apps that listen for it are told, once the page can hear", () => {
+  const off = runBoot(buildBootScript(null), { net: true, search: OFFLINE });
+  // Not fired during <head>: nothing has attached a listener yet, so an event
+  // dispatched then would be shouted into an empty room.
+  assert.deepEqual(off.net.events, []);
+  for (const fn of off.listeners.get("load") ?? []) fn();
+  assert.deepEqual(off.net.events, ["offline"]);
+});
+
+test("offline: sendBeacon reports the failure it would really be", () => {
+  const off = runBoot(buildBootScript(null), { net: true, search: OFFLINE });
+  assert.equal(off.win.navigator.sendBeacon("/analytics", "x"), false);
+});
+
+test("offline and hold are independent, and compose", () => {
+  const out = buildBootScript(null);
+  const both = runBoot(out, {
+    net: true,
+    search: `?${HOLD_FLAG}=1&${OFFLINE_FLAG}=1`,
+  });
+  // The regression this guards: the hold ends the boot IIFE with a `return`,
+  // so anything added after it never runs — and an offline cut that silently
+  // stopped installing whenever a frame was also held would be invisible.
+  assert.equal(both.win.__dedupOffline, true, "offline still installed");
+  assert.equal(both.win.__dedupHeld, true, "and the hold still armed");
+
+  const heldOnly = runBoot(out, { net: true, search: `?${HOLD_FLAG}=1` });
+  assert.equal(heldOnly.win.__dedupOffline, undefined);
+  assert.equal(heldOnly.win.__dedupHeld, true);
+
+  const offOnly = runBoot(out, { net: true, search: OFFLINE });
+  assert.equal(offOnly.win.__dedupOffline, true);
+  assert.equal(offOnly.win.__dedupHeld, undefined);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

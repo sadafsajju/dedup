@@ -122,14 +122,64 @@ export function withText(markup: string, text: string): string | null {
   return serializeSimpleElement({ ...el, text });
 }
 
-/** The classes a snippet currently carries (JSX spelling). */
-export function classNameOf(markup: string): string {
+/**
+ * What the class attribute is called in each spelling.
+ *
+ * Staged palette markup is JSX, but a *pasted* snippet is a verbatim slice of
+ * whatever file it came from — so a staged insert can now be either, and every
+ * place that reads or rewrites its classes has to ask which. Assuming JSX put
+ * `className="…"` into an HTML page, where it is an unknown attribute that
+ * styles nothing: the restyle silently did nothing and the original classes
+ * stayed.
+ */
+export function classAttrFor(lang: "jsx" | "html"): "className" | "class" {
+  return lang === "html" ? "class" : "className";
+}
+
+/** The classes a snippet currently carries, in its own spelling. */
+export function classNameOf(markup: string, lang: "jsx" | "html" = "jsx"): string {
   const el = parseSimpleElement(markup);
-  return el?.attrs.find(([k]) => k === "className")?.[1] ?? "";
+  const attr = classAttrFor(lang);
+  return el?.attrs.find(([k]) => k === attr)?.[1] ?? "";
 }
 
 /** The text a snippet currently shows, or null when it holds none. */
 export function textOf(markup: string): string | null {
   const el = parseSimpleElement(markup);
   return el && !el.selfClosing ? (el.text ?? "") : null;
+}
+
+// --- writing a snippet into an HTML file --------------------------------------
+
+/** Elements HTML forbids a closing tag on. */
+const VOID_TAGS = new Set([
+  "area", "base", "br", "col", "embed", "hr", "img", "input",
+  "link", "meta", "param", "source", "track", "wbr",
+]);
+
+/**
+ * The staged snippet, respelled for a plain HTML file.
+ *
+ * Staging keeps one spelling — JSX — so the fold-into-the-snippet path above
+ * has exactly one shape to reason about. The translation happens once, here,
+ * on the way to a file that speaks the other one. Two things change and both
+ * matter: `className` becomes `class`, and a self-closing non-void element
+ * becomes a pair. `<div />` is not a self-closing div in HTML, it is a `<div>`
+ * that never closes — which would swallow every sibling after it. (The
+ * write-back refuses that snippet outright; this is what stops it arriving.)
+ *
+ * Null when the snippet isn't the simple shape this file authors, so the
+ * caller refuses the save rather than writing a guess.
+ */
+export function toHtmlSnippet(markup: string): string | null {
+  const el = parseSimpleElement(markup);
+  if (!el) return null;
+  const tag = el.tag.toLowerCase();
+  const isVoid = VOID_TAGS.has(tag);
+  return serializeSimpleElement({
+    ...el,
+    attrs: el.attrs.map(([k, v]) => [k === "className" ? "class" : k, v]),
+    selfClosing: isVoid,
+    text: isVoid ? null : (el.text ?? ""),
+  });
 }

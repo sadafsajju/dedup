@@ -107,12 +107,64 @@ pub fn ensure_session_branch(root: &str) -> Result<String, String> {
     Err("could not create a dedup session branch".into())
 }
 
+/// The paths in `paths` that git has never heard of — new files. NUL-separated
+/// so a path with a space or a non-ASCII character comes back verbatim rather
+/// than in git's quoted form.
+fn untracked_among(root: &str, paths: &[String]) -> Result<Vec<String>, String> {
+    let mut args: Vec<&str> = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    Ok(git(root, &args)?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Same, for paths git already tracks.
+fn tracked_among(root: &str, paths: &[String]) -> Result<Vec<String>, String> {
+    let mut args: Vec<&str> = vec!["ls-files", "-z", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    Ok(git(root, &args)?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Commit exactly the given paths (worktree state), leaving anything the user
 /// has staged for other files untouched (FR-4.5). Returns the short hash.
 pub fn commit_paths(root: &str, message: &str, paths: &[String]) -> Result<String, String> {
     if paths.is_empty() {
         return Err("nothing to commit".into());
     }
+
+    // `git commit -- <path>` takes a *pathspec*, and a pathspec only matches
+    // files git already knows: a file dedup just created matches nothing and
+    // the whole commit dies with "did not match any file(s) known to git".
+    // So new files are staged first — and only new ones, because for a tracked
+    // path the bare form is what leaves the user's own staged version of that
+    // file alone, which is the FR-4.5 guarantee above.
+    let untracked = untracked_among(root, paths)?;
+    if !untracked.is_empty() {
+        let mut args: Vec<&str> = vec!["add", "--"];
+        args.extend(untracked.iter().map(String::as_str));
+        git(root, &args)?;
+    }
+
+    // Anything neither tracked nor listed as untracked is ignored by the
+    // user's .gitignore. Force-adding it would be dedup overriding a decision
+    // the user wrote down, so say so instead — with the path, since the git
+    // pathspec error names it without ever explaining why.
+    let tracked = tracked_among(root, paths)?;
+    if let Some(ignored) = paths
+        .iter()
+        .find(|p| !tracked.contains(p) && !untracked.contains(p))
+    {
+        return Err(format!(
+            "{ignored} is ignored by this project's .gitignore, so dedup can't commit it. The change is on disk — un-ignore the path if you want it saved."
+        ));
+    }
+
     let mut args: Vec<&str> = vec!["commit", "-m", message, "--"];
     args.extend(paths.iter().map(String::as_str));
     git(root, &args)?;
@@ -172,6 +224,67 @@ mod tests {
         assert!(!show.contains("b.tsx"));
         let staged = git(root, &["diff", "--cached", "--name-only"]).unwrap();
         assert!(staged.contains("b.tsx"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The chat agent creates files (extracting a component, adding a page).
+    /// An untracked path is not a pathspec git can match, so committing one
+    /// without staging it first fails outright — and it fails *after* the
+    /// file is already on disk, which is the worst possible moment.
+    #[test]
+    fn commit_paths_can_commit_a_file_that_did_not_exist() {
+        let dir = temp_repo("newfile");
+        let root = dir.to_str().unwrap();
+        ensure_session_branch(root).unwrap();
+
+        // The user has staged their own unrelated change, as before.
+        std::fs::write(dir.join("b.tsx"), "b2-user-staged").unwrap();
+        git(root, &["add", "b.tsx"]).unwrap();
+
+        // dedup edits one existing file and creates two new ones, one nested.
+        std::fs::write(dir.join("a.tsx"), "a2-dedup").unwrap();
+        std::fs::write(dir.join("docs.html"), "<h1>docs</h1>").unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/Card.tsx"), "card").unwrap();
+
+        let hash = commit_paths(
+            root,
+            "dedup: add a docs page",
+            &["a.tsx".into(), "docs.html".into(), "src/Card.tsx".into()],
+        )
+        .unwrap();
+        assert!(!hash.is_empty());
+
+        let show = git(root, &["show", "--stat", "--name-only", "HEAD"]).unwrap();
+        assert!(show.contains("docs.html"), "the new file must land: {show}");
+        assert!(show.contains("src/Card.tsx"), "nested too: {show}");
+        assert!(show.contains("a.tsx"));
+        // The user's staged work for an untouched file is still only staged.
+        assert!(!show.contains("b.tsx"), "{show}");
+        assert!(git(root, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .contains("b.tsx"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A new file the user's .gitignore covers can't be committed, and the
+    /// reason has to survive to the message — git's own pathspec error names
+    /// the path and never says why.
+    #[test]
+    fn an_ignored_new_file_is_refused_with_a_reason() {
+        let dir = temp_repo("ignored");
+        let root = dir.to_str().unwrap();
+        ensure_session_branch(root).unwrap();
+        std::fs::write(dir.join(".gitignore"), "generated/\n").unwrap();
+        git(root, &["add", ".gitignore"]).unwrap();
+        git(root, &["commit", "-qm", "ignore"]).unwrap();
+
+        std::fs::create_dir_all(dir.join("generated")).unwrap();
+        std::fs::write(dir.join("generated/Card.tsx"), "card").unwrap();
+
+        let err = commit_paths(root, "dedup: x", &["generated/Card.tsx".into()]).unwrap_err();
+        assert!(err.contains("generated/Card.tsx"), "{err}");
+        assert!(err.contains(".gitignore"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

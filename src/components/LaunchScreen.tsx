@@ -12,7 +12,9 @@ import {
 import { useStore } from "../lib/store";
 import type { Framework, GitStatus, ProjectInfo, RecentProject } from "../lib/types";
 import { CompatCard } from "./CompatCard";
-import { CubeIcon, Cross2Icon } from "@radix-ui/react-icons";
+import { forgetOpen, prefFor, reasonToShowCard, rememberOpen } from "../lib/openPrefs";
+import { StarterPicker } from "./StarterPicker";
+import { CubeIcon, Cross2Icon, GearIcon } from "@radix-ui/react-icons";
 
 interface Candidate {
   info: ProjectInfo;
@@ -22,6 +24,7 @@ interface Candidate {
 const FRAMEWORK_LABEL: Record<Framework, string> = {
   vite: "Vite",
   next: "Next.js",
+  static: "HTML",
   unknown: "React",
 };
 
@@ -117,7 +120,12 @@ export function LaunchScreen() {
       .catch(() => {});
   }, [loadRecents]);
 
-  const inspect = useCallback(async (path: string) => {
+  /**
+   * Open a project. `force` shows the compatibility card even when dedup has
+   * nothing new to say about this project — the deliberate way back to the
+   * custom dev command and the verdict.
+   */
+  const inspect = useCallback(async (path: string, force = false) => {
     setError(null);
     setPending(path);
     try {
@@ -125,12 +133,23 @@ export function LaunchScreen() {
         detectProject(path),
         gitStatus(path),
       ]);
+      // The card exists to deliver a verdict and take two acknowledgements.
+      // When the user has already seen this exact verdict, showing it again
+      // teaches them to click through it — so go straight in, carrying the
+      // dev command they set last time.
+      if (!force && reasonToShowCard(info, git) === null) {
+        await confirmOpen(info, git, prefFor(info.root)?.customCommand ?? null);
+        return;
+      }
       setCandidate({ info, git });
     } catch (e) {
       setError(String(e));
     } finally {
       setPending(null);
     }
+    // confirmOpen is stable for the life of the screen (it only closes over
+    // store actions), so it is safe to leave out of the dep list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Native drag-and-drop of a folder onto the window (FR-1.1).
@@ -157,18 +176,30 @@ export function LaunchScreen() {
     if (path) inspect(path);
   }
 
+  /** A folder dedup just scaffolded: open it without a second verdict — the
+   *  user already chose what to build here. */
+  async function openFresh(info: ProjectInfo) {
+    await confirmOpen(info, await gitStatus(info.root), null);
+  }
+
   async function confirmOpen(
     info: ProjectInfo,
     git: GitStatus,
     customCommand: string | null,
   ) {
     await addRecentProject(info.root, info.name, info.framework);
+    // Remember the verdict they just accepted, so the next open is silent
+    // unless something about the project actually changed.
+    rememberOpen(info, git, customCommand);
     enterEditor(info, git, customCommand);
   }
 
   async function dropRecent(path: string, e: React.MouseEvent) {
     e.stopPropagation();
     e.preventDefault();
+    // Nothing about a forgotten project should outlive it — re-adding it
+    // later is a first open again, card included.
+    forgetOpen(path);
     await loadRecents(await removeRecentProject(path));
   }
 
@@ -187,7 +218,8 @@ export function LaunchScreen() {
             </div>
             <p className="text-ink-dim mt-1.5 text-[13px] leading-snug">
               Open a React&nbsp;+&nbsp;Tailwind project to inspect, tune, and
-              merge near-duplicate components.
+              merge near-duplicate components. A plain HTML site works too —
+              and an empty folder starts a new one.
             </p>
           </div>
           {!empty && (
@@ -223,7 +255,8 @@ export function LaunchScreen() {
               {pending ? "Inspecting project…" : "Open a project folder"}
             </div>
             <div className="text-2xs text-ink-faint mt-1">
-              Click to browse, or drag a folder onto the window
+              Click to browse, or drag a folder onto the window. An empty one
+              gets a starter.
             </div>
           </button>
         ) : (
@@ -260,7 +293,7 @@ export function LaunchScreen() {
                     New
                   </div>
                   <div className="mt-0.5 text-2xs text-ink-faint">
-                    Browse or drop a folder
+                    Browse, drop, or start in an empty folder
                   </div>
                 </button>
               </li>
@@ -307,6 +340,22 @@ export function LaunchScreen() {
                         {meta}
                       </div>
                     </button>
+                    {/* The card is skipped once its verdict has been seen,
+                        so it needs a deliberate way back — it is the only
+                        place the custom dev command lives. */}
+                    <span
+                      role="button"
+                      tabIndex={-1}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        void inspect(r.path, true);
+                      }}
+                      title="Project details — compatibility and dev command"
+                      className="absolute top-2 right-9 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 rounded bg-surface-0/80 text-ink-dim hover:text-ink p-1 backdrop-blur-sm transition-opacity cursor-default"
+                    >
+                      <GearIcon width={12} height={12} />
+                    </span>
                     <span
                       role="button"
                       tabIndex={-1}
@@ -334,13 +383,27 @@ export function LaunchScreen() {
         </div>
       )}
 
-      {candidate && (
-        <CompatCard
+      {/* An empty folder gets the starter picker, not a verdict — see
+          StarterPicker. Once it has written a starter the folder is a real
+          project, so it re-enters through the same open path as any other. */}
+      {candidate?.info.isEmpty ? (
+        <StarterPicker
           info={candidate.info}
-          git={candidate.git}
           onCancel={() => setCandidate(null)}
-          onConfirm={(cmd) => confirmOpen(candidate.info, candidate.git, cmd)}
+          onCreated={(info) => {
+            setCandidate(null);
+            void openFresh(info);
+          }}
         />
+      ) : (
+        candidate && (
+          <CompatCard
+            info={candidate.info}
+            git={candidate.git}
+            onCancel={() => setCandidate(null)}
+            onConfirm={(cmd) => confirmOpen(candidate.info, candidate.git, cmd)}
+          />
+        )
       )}
     </div>
   );

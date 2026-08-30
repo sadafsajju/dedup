@@ -59,7 +59,19 @@ function makeEl(tag, attrs = {}) {
     setAttribute: (k, v) => void (node.attrs[k] = String(v)),
     removeAttribute: (k) => void delete node.attrs[k],
     hasAttribute: (k) => k in node.attrs,
-    addEventListener() {},
+    // Element-level listeners are recorded, not swallowed: the resize grips
+    // are the first chrome to attach their own, and a test has to be able to
+    // fire one. Everything else in the overlay listens on document/window.
+    listeners: {},
+    addEventListener(type, fn) {
+      (node.listeners[type] ??= []).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const list = node.listeners[type];
+      if (list) node.listeners[type] = list.filter((f) => f !== fn);
+    },
+    setPointerCapture() {},
+    releasePointerCapture() {},
     focus() {},
     blur() {},
     getBoundingClientRect: () => ({ x: 0, y: 0, top: 0, left: 0, width: 20, height: 10 }),
@@ -102,6 +114,28 @@ function makeEl(tag, attrs = {}) {
     },
     querySelectorAll: (sel) => descendants(node).filter((n) => matches(n, parseSelector(sel))),
     querySelector: (sel) => node.querySelectorAll(sel)[0] ?? null,
+    // Enough of a clone + serializer for the copy path, which hands the
+    // editor a subtree's markup to preview a paste with.
+    get attributes() {
+      return Object.keys(node.attrs).map((name) => ({ name, value: node.attrs[name] }));
+    },
+    cloneNode() {
+      const copy = makeEl(tag, node.attrs);
+      copy.textContent = node.textContent;
+      for (const child of node.children) copy.appendChild(child.cloneNode(true));
+      return copy;
+    },
+    get outerHTML() {
+      const attrs = Object.entries(node.attrs)
+        .map(([k, v]) => ` ${k}="${v}"`)
+        .join("");
+      const name = tag.toLowerCase();
+      const inner =
+        node.children.length > 0
+          ? node.children.map((c) => c.outerHTML).join("")
+          : node.textContent;
+      return `<${name}${attrs}>${inner}</${name}>`;
+    },
     get nextSibling() {
       const kids = node.parentNode?.children ?? [];
       return kids[kids.indexOf(node) + 1] ?? null;
@@ -124,14 +158,32 @@ function makeEl(tag, attrs = {}) {
   return node;
 }
 
+/**
+ * A stand-in for CSSStyleDeclaration.
+ *
+ * A Proxy, because the previous plain object kept direct assignment
+ * (`style.width = "60px"`) and `removeProperty("width")` in two different
+ * places — so a removal silently did nothing and any test asserting that a
+ * style was cleared would have passed no matter what the overlay did. Real
+ * style objects back both with the same storage; so does this.
+ */
 function makeStyle() {
   const store = {};
-  return {
-    setProperty: (k, v) => void (store[k] = v),
+  const api = {
+    setProperty: (k, v) => void (store[k] = String(v)),
     removeProperty: (k) => void delete store[k],
     getPropertyValue: (k) => store[k] ?? "",
-    ...store,
   };
+  return new Proxy(store, {
+    get: (target, key) =>
+      key in api ? api[key] : typeof key === "string" ? (target[key] ?? "") : undefined,
+    set: (target, key, value) => {
+      target[key] = String(value);
+      return true;
+    },
+    deleteProperty: (target, key) => delete target[key],
+    has: (target, key) => key in api || key in target,
+  });
 }
 
 function matches(node, want) {
@@ -199,6 +251,12 @@ function loadOverlay() {
     document: documentStub,
     location: {
       pathname: "/",
+      // The frame's own flags live here (the hold, the offline cut) — the
+      // overlay has to carry them across any navigation it drives.
+      search: "",
+      get href() {
+        return `http://localhost:5173${sandbox.location.pathname}${sandbox.location.search}`;
+      },
       reloaded: 0,
       replaced: null,
       reload() {
@@ -226,7 +284,21 @@ function loadOverlay() {
     log: (...a) => sandbox.consoleCalls.push(["log", ...a]),
   };
   sandbox.globalThis = sandbox;
-  Object.assign(sandbox, { PopStateEvent: class {} });
+  // The overlay asks `e.target instanceof HTMLInputElement` before forwarding
+  // a keystroke as an editor shortcut. A real page has these constructors; the
+  // stub's plain-object nodes are never instances of them, which is the right
+  // answer for every node this harness builds.
+  // A fresh vm realm gets the JS built-ins but none of Node's globals, and
+  // URL/URLSearchParams are Node's rather than the language's. Every browser
+  // the overlay runs in has them, so the stub does too.
+  Object.assign(sandbox, {
+    URL,
+    URLSearchParams,
+    PopStateEvent: class {},
+    HTMLInputElement: class {},
+    HTMLTextAreaElement: class {},
+    HTMLElement: class {},
+  });
 
   vm.runInNewContext(fs.readFileSync(OVERLAY, "utf8"), sandbox, {
     filename: "dedup-overlay.js",
@@ -273,6 +345,82 @@ test("clicking a tagged element reports a selection with its markers", () => {
     Array.from(selected.payload.ancestry, (a) => a.dedupId),
     ["src/App.tsx@1", "src/App.tsx@0"],
   );
+});
+
+test("two inserts at one anchor preview in the order the save will write", () => {
+  const { send, nodes } = loadOverlay();
+  // What pasting twice stages: two inserts placed `after` the same element.
+  // The write-back appends them one behind the other, so the preview has to
+  // as well — replayed naively each new node would push the previous one down.
+  send({
+    type: "stage",
+    classes: {},
+    texts: {},
+    structural: [
+      { op: "insert", id: "src/App.tsx@1", pendingId: "pending:a", position: "after", html: "<p>one</p>" },
+      { op: "insert", id: "src/App.tsx@1", pendingId: "pending:b", position: "after", html: "<p>two</p>" },
+    ],
+  });
+  assert.deepEqual(
+    nodes.root.children.map((c) => c.getAttribute("data-dedup-id")),
+    ["src/App.tsx@1", "pending:a", "pending:b", "src/App.tsx@2"],
+  );
+});
+
+test("the AI-working grid covers the element, and stops when told to", () => {
+  const { sandbox, send, nodes } = loadOverlay();
+  // The stub's elements are 20×10, which correctly collapses to a single
+  // square — a tiny button cannot hold a grid. A section-sized one can.
+  nodes.title.getBoundingClientRect = () => ({
+    x: 0, y: 0, top: 0, left: 0, width: 320, height: 200,
+  });
+  const busy = () =>
+    nodes.html.children.find((c) => c.hasAttribute("data-dedup-busy"));
+  assert.ok(busy(), "the busy layer is mounted with the rest of the chrome");
+  assert.equal(busy().style.display, "none", "and is invisible until asked for");
+
+  send({ type: "set-busy", id: "src/App.tsx@1" });
+  assert.equal(busy().style.display, "grid");
+  assert.ok(busy().children.length > 1, "squares are laid out over the element");
+  // Neighbours are a beat apart, so the wave travels rather than blinking.
+  const delays = busy().children.map((c) => c.style.animationDelay);
+  assert.ok(new Set(delays).size > 1, `every square shares a delay: ${delays[0]}`);
+
+  // An element the frame doesn't have is not an error — every artboard hears
+  // the same broadcast, and only the one holding it draws anything.
+  send({ type: "set-busy", id: "src/Other.tsx@9" });
+  assert.equal(busy().style.display, "none");
+
+  send({ type: "set-busy", id: "src/App.tsx@1" });
+  assert.equal(busy().style.display, "grid");
+  send({ type: "set-busy", id: null });
+  assert.equal(busy().style.display, "none", "the turn ended; so does the grid");
+  assert.equal(sandbox.consoleCalls.length, 0);
+});
+
+test("copy-element reports the subtree's markup with dedup's stamps stripped", () => {
+  const { posted, send, nodes } = loadOverlay();
+  send({ type: "copy-element", id: "src/App.tsx@0" });
+  const answer = posted.find((m) => m.type === "element-html");
+  assert.ok(answer, "no element-html reported");
+  assert.equal(answer.id, "src/App.tsx@0");
+
+  const html = answer.html;
+  // The page's own markup survives — it is what the paste previews as.
+  assert.match(html, /^<div>/);
+  assert.match(html, /<h1 class="text-lg">Hello<\/h1>/);
+  // dedup's own stamps do not. `data-dedup-id` above all: left in, the pasted
+  // copy would answer to the same id as the element it came from, and every
+  // lookup in the overlay would start hitting whichever the DOM returned
+  // first — select, hover, staged class patches, the layer tree.
+  assert.doesNotMatch(html, /data-dedup-/, html);
+
+  // Reporting is by id and silent when a frame doesn't hold it: every
+  // artboard hears the broadcast, and only the one with the element answers.
+  const before = posted.length;
+  send({ type: "copy-element", id: "src/Other.tsx@9" });
+  assert.equal(posted.length, before, "a frame without the element stays quiet");
+  assert.ok(nodes.root.getAttribute("data-dedup-id"), "the original keeps its id");
 });
 
 test("a click inside an untagged child selects the nearest tagged ancestor", () => {
@@ -408,6 +556,55 @@ test("double-click asks the editor before putting a caret anywhere", () => {
   fire("keydown", { target: nodes.title, key: "Escape", preventDefault() {} });
   assert.equal(posted.filter((m) => m.type === "text-input").pop().text, "Hello");
   assert.equal(nodes.title.getAttribute("contenteditable"), null);
+});
+
+test("the overlay reports when a caret lands on, and leaves, the canvas", () => {
+  // The editor shows a text mode while one is on screen, and it cannot see the
+  // caret: only this side knows, because Escape, Enter, a click elsewhere and
+  // a re-render all end an edit without the editor being asked.
+  const { posted, fire, send, nodes } = loadOverlay();
+  const editing = () => posted.filter((m) => m.type === "text-editing");
+
+  send({ type: "text-edit-begin", id: "src/App.tsx@1" });
+  assert.equal(editing().pop()?.id, "src/App.tsx@1");
+
+  // A repeat begin on the element already being typed into is a no-op: ending
+  // and restarting would reselect all its text and lose the caret position.
+  const before = editing().length;
+  send({ type: "text-edit-begin", id: "src/App.tsx@1" });
+  assert.equal(editing().length, before, "a repeat begin must not restart the edit");
+
+  fire("keydown", { target: nodes.title, key: "Enter", shiftKey: false, preventDefault() {} });
+  assert.equal(editing().pop()?.id, null);
+  assert.equal(nodes.title.getAttribute("contenteditable"), null);
+});
+
+test("the editor can take the caret back off the canvas", () => {
+  // Leaving the text tool: a caret still blinking in a page the user is now
+  // panning would be a lie about the mode.
+  const { posted, send, nodes } = loadOverlay();
+  send({ type: "text-edit-begin", id: "src/App.tsx@1" });
+  assert.equal(nodes.title.getAttribute("contenteditable"), "plaintext-only");
+  send({ type: "text-edit-end" });
+  assert.equal(nodes.title.getAttribute("contenteditable"), null);
+  assert.equal(posted.filter((m) => m.type === "text-editing").pop()?.id, null);
+});
+
+test("the text tool's shortcut is forwarded, but never while typing", () => {
+  const { posted, fire, send, nodes } = loadOverlay();
+  const keys = () => posted.filter((m) => m.type === "key").map((m) => m.key);
+
+  fire("keydown", { target: nodes.body, key: "t", preventDefault() {} });
+  assert.ok(keys().includes("t"), "T reaches the editor's one keyboard handler");
+
+  // With a caret in an element, letters are text — forwarding them would let
+  // typing "the" switch tools and delete the selection.
+  send({ type: "text-edit-begin", id: "src/App.tsx@1" });
+  const before = keys().length;
+  for (const key of ["t", "v", "b", "h", "Backspace"]) {
+    fire("keydown", { target: nodes.title, key, preventDefault() {} });
+  }
+  assert.equal(keys().length, before, "typing must not reach the tool shortcuts");
 });
 
 test("a staged insert places the palette's preview markup", () => {
@@ -569,6 +766,29 @@ test("reload refreshes in place, but reloads AT a path when given one", () => {
   assert.equal(athome.sandbox.location.replaced, null);
 });
 
+test("a driven navigation keeps the frame's dedup flags", () => {
+  // The flags that change how a frame behaves ride in its query string,
+  // because they must reach the page before the app boots. Sending the frame
+  // to a bare path would drop them — an offline artboard would quietly come
+  // back online and the editor, drawing its label from its own state, would
+  // still say "offline". Matched by prefix, so a new flag needs no change here.
+  const bounced = loadOverlay();
+  bounced.sandbox.location.pathname = "/login";
+  bounced.sandbox.location.search = "?__dedup_offline=1&__dedup_hold=1&tab=two";
+  bounced.send({ type: "reload", path: "/settings" });
+  assert.equal(
+    bounced.sandbox.location.replaced,
+    "/settings?__dedup_offline=1&__dedup_hold=1",
+    "the app's own query does not follow, but dedup's flags do",
+  );
+
+  // A frame with no flags navigates to exactly what it was given.
+  const plain = loadOverlay();
+  plain.sandbox.location.pathname = "/login";
+  plain.send({ type: "reload", path: "/settings" });
+  assert.equal(plain.sandbox.location.replaced, "/settings");
+});
+
 test("hover-id draws and clears the hover box without a pointer", () => {
   const { send, nodes } = loadOverlay();
   const chrome = nodes.html.children.filter((c) => c.hasAttribute("data-dedup-ui"));
@@ -582,6 +802,203 @@ test("hover-id draws and clears the hover box without a pointer", () => {
     !chrome.some((c) => c.style.display === "block"),
     "hover chrome not cleared",
   );
+});
+
+// --- resize grips -----------------------------------------------------------
+//
+// The gesture itself needs real hit-testing and stays manual, but three things
+// about the grips are pure state and belong here: that they never appear on an
+// element the write-back would refuse, that they track the canvas zoom (a 4px
+// target at 50% is not a target), and that they are the one piece of chrome
+// that must be clickable.
+
+const handlesOf = (nodes) =>
+  nodes.html.children.filter((c) => c.hasAttribute("data-dedup-handle"));
+
+const shownHandles = (nodes) =>
+  handlesOf(nodes).filter((h) => h.style.display === "block");
+
+test("there are eight grips, and they are the only clickable chrome", () => {
+  const { nodes } = loadOverlay();
+  const handles = handlesOf(nodes);
+  assert.equal(handles.length, 8);
+  assert.deepEqual(
+    handles.map((h) => h.getAttribute("data-dedup-handle")).sort(),
+    ["e", "n", "ne", "nw", "s", "se", "sw", "w"],
+  );
+  // Every other overlay surface must stay transparent to elementFromPoint.
+  assert.ok(
+    handles.every((h) => h.style.pointerEvents === "auto"),
+    "a grip you cannot grab is not a grip",
+  );
+  const others = nodes.html.children.filter(
+    (c) => c.hasAttribute("data-dedup-ui") && !c.hasAttribute("data-dedup-handle"),
+  );
+  assert.ok(
+    others.every((c) => c.style.pointerEvents !== "auto"),
+    "only the grips may capture the pointer",
+  );
+});
+
+test("no grips until the editor says the element's classes are editable", () => {
+  const { send, nodes } = loadOverlay();
+  send({ type: "select-id", id: "src/App.tsx@1" });
+  assert.equal(
+    shownHandles(nodes).length,
+    0,
+    "a selection alone must not offer resize — className may be dynamic",
+  );
+
+  send({ type: "set-resizable", id: "src/App.tsx@1", enabled: true });
+  assert.equal(shownHandles(nodes).length, 8, "grips should be up");
+
+  // The write-back's verdict changing is the same as it never being given.
+  send({ type: "set-resizable", id: "src/App.tsx@1", enabled: false });
+  assert.equal(shownHandles(nodes).length, 0, "grips must retract");
+});
+
+test("grips belong to the selected element, not a stale one", () => {
+  const { send, nodes } = loadOverlay();
+  send({ type: "select-id", id: "src/App.tsx@1" });
+  send({ type: "set-resizable", id: "src/App.tsx@1", enabled: true });
+  assert.equal(shownHandles(nodes).length, 8);
+
+  // Selecting elsewhere leaves the permission pointing at the old id.
+  send({ type: "select-id", id: "src/App.tsx@2" });
+  assert.equal(
+    shownHandles(nodes).length,
+    0,
+    "grips must not linger on a different element than the one they were granted for",
+  );
+});
+
+test("grips keep a constant on-screen size as the canvas zooms", () => {
+  const { send, nodes } = loadOverlay();
+  send({ type: "select-id", id: "src/App.tsx@1" });
+  send({ type: "set-resizable", id: "src/App.tsx@1", enabled: true });
+
+  const sizeAt = (zoom) => {
+    send({ type: "set-zoom", zoom });
+    return parseFloat(shownHandles(nodes)[0].style.width);
+  };
+  const full = sizeAt(1);
+  const half = sizeAt(0.5);
+  const double = sizeAt(2);
+  assert.ok(full > 0, "grips should have a size");
+  assert.ok(
+    Math.abs(half - full * 2) < 0.01,
+    `at 50% zoom a grip must be drawn twice as large in page units (got ${half} vs ${full})`,
+  );
+  assert.ok(
+    Math.abs(double - full / 2) < 0.01,
+    `at 200% it must be half (got ${double} vs ${full})`,
+  );
+  // A nonsense zoom must not collapse the grips to nothing.
+  send({ type: "set-zoom", zoom: 0 });
+  assert.equal(parseFloat(shownHandles(nodes)[0].style.width), full);
+});
+
+test("dragging a grip reports the dragged size, and never drops the last move", () => {
+  const { send, fire, posted, nodes } = loadOverlay();
+  send({ type: "select-id", id: "src/App.tsx@1" });
+  send({ type: "set-resizable", id: "src/App.tsx@1", enabled: true });
+  send({ type: "set-zoom", zoom: 1 });
+
+  // The stub's rects are 100×20 at (0,0) — see makeEl.
+  const start = nodes.title.getBoundingClientRect();
+  const se = nodes.html.children.find(
+    (c) => c.getAttribute("data-dedup-handle") === "se",
+  );
+  const ev = (x, y) => ({
+    button: 0,
+    clientX: x,
+    clientY: y,
+    target: se,
+    pointerId: 1,
+    preventDefault() {},
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+  });
+
+  se.listeners.pointerdown.forEach((fn) => fn(ev(start.width, start.height)));
+  assert.equal(
+    posted.filter((m) => m.type === "resize-start").length,
+    1,
+    "the gesture should announce itself",
+  );
+
+  // Drag the south-east grip 40px right and 10px down.
+  fire("pointermove", ev(start.width + 40, start.height + 10));
+  fire("pointerup", ev(start.width + 40, start.height + 10));
+
+  const sizes = posted.filter((m) => m.type === "resize");
+  assert.ok(sizes.length >= 1, "no size was reported");
+  const last = sizes[sizes.length - 1];
+  assert.equal(last.width, start.width + 40, "width should follow the pointer");
+  assert.equal(last.height, start.height + 10, "height should follow too");
+  assert.ok(last.group, "every report needs a group id to fold undo into one step");
+  assert.ok(
+    sizes.every((m) => m.group === last.group),
+    "one gesture is one undo step",
+  );
+  assert.equal(
+    posted.filter((m) => m.type === "resize-end").length,
+    1,
+    "the gesture should end exactly once",
+  );
+
+  // The inline size used for live feedback must be handed back afterwards, or
+  // it would mask whatever the staged class actually resolves to.
+  assert.equal(nodes.title.style.width, "", "inline width must be released");
+  assert.equal(nodes.title.style.height, "", "inline height must be released");
+});
+
+test("a side grip never reports the axis it did not drag", () => {
+  const { send, fire, posted, nodes } = loadOverlay();
+  send({ type: "select-id", id: "src/App.tsx@1" });
+  send({ type: "set-resizable", id: "src/App.tsx@1", enabled: true });
+
+  const start = nodes.title.getBoundingClientRect();
+  const east = nodes.html.children.find(
+    (c) => c.getAttribute("data-dedup-handle") === "e",
+  );
+  const ev = (x, y) => ({
+    button: 0, clientX: x, clientY: y, target: east, pointerId: 1,
+    preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {},
+  });
+  east.listeners.pointerdown.forEach((fn) => fn(ev(start.width, 10)));
+  // Move diagonally: the vertical component must be ignored entirely.
+  fire("pointermove", ev(start.width + 25, 90));
+  fire("pointerup", ev(start.width + 25, 90));
+
+  const last = posted.filter((m) => m.type === "resize").pop();
+  assert.equal(last.width, start.width + 25);
+  assert.equal(
+    last.height,
+    null,
+    "a side grip must leave the other axis unset — pinning a content-sized height is a bug the user can't see until the content changes",
+  );
+});
+
+test("a grip cannot drag an element smaller than nothing", () => {
+  const { send, fire, posted, nodes } = loadOverlay();
+  send({ type: "select-id", id: "src/App.tsx@1" });
+  send({ type: "set-resizable", id: "src/App.tsx@1", enabled: true });
+
+  const start = nodes.title.getBoundingClientRect();
+  const se = nodes.html.children.find(
+    (c) => c.getAttribute("data-dedup-handle") === "se",
+  );
+  const ev = (x, y) => ({
+    button: 0, clientX: x, clientY: y, target: se, pointerId: 1,
+    preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {},
+  });
+  se.listeners.pointerdown.forEach((fn) => fn(ev(start.width, start.height)));
+  fire("pointermove", ev(-9999, -9999));
+  fire("pointerup", ev(-9999, -9999));
+
+  const last = posted.filter((m) => m.type === "resize").pop();
+  assert.ok(last.width > 0 && last.height > 0, `got ${last.width}x${last.height}`);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

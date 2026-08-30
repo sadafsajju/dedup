@@ -220,6 +220,24 @@ export function stepSpacing(value: string | null, dir: 1 | -1): string {
   return SPACING_SCALE[next];
 }
 
+/**
+ * The class for a dragged pixel size — always an arbitrary value.
+ *
+ * Snapping to the spacing scale (`w-64` for 256px) would read better, and is
+ * wrong: Tailwind v4's scale is a multiple of `--spacing`, which a project can
+ * redefine. Snapping under an assumed 4px step would silently resize the
+ * element to something other than what was dragged, and "silently a different
+ * size" is the one outcome a direct-manipulation gesture must never produce.
+ * An arbitrary value is exactly the size the user dragged, in every project.
+ * The inspector's Size steppers are there to convert it to a scale value.
+ */
+export function sizeClass(
+  axis: "w" | "h",
+  px: number,
+): string {
+  return `${axis}-[${Math.max(0, Math.round(px))}px]`;
+}
+
 /** Resolve a Tailwind colour token (the part after `bg-`/`text-`/`border-`) to
  * something CSS can paint, for the inspector's swatches. Palette names ride the
  * app's own `--color-*` theme vars (styles.css imports the theme `static` so

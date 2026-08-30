@@ -59,6 +59,8 @@ export function Canvas() {
   const devUrl = useStore((s) => s.devUrl);
   const viewportId = useStore((s) => s.viewportId);
   const zoom = useStore((s) => s.zoom);
+  const selected = useStore((s) => s.selected);
+  const sourceInfo = useStore((s) => s.sourceInfo);
   const pan = useStore((s) => s.pan);
   const setPan = useStore((s) => s.setPan);
   const exitCode = useStore((s) => s.exitCode);
@@ -73,6 +75,7 @@ export function Canvas() {
   const frameOrigins = useStore((s) => s.frameOrigins);
   const sessionModes = useStore((s) => s.sessionModes);
   const heldRoutes = useStore((s) => s.heldRoutes);
+  const offlineRoutes = useStore((s) => s.offlineRoutes);
 
   // Every discovered route is its own page artboard, Figma-style, in a row.
   // Each frame shows its full page: at least the device height, grown to the
@@ -90,6 +93,7 @@ export function Canvas() {
   const editorTab = useStore((s) => s.editorTab);
   const selectedRoute = useStore((s) => s.selectedRoute);
   const setSelectedRoute = useStore((s) => s.setSelectedRoute);
+  const clearSelection = useStore((s) => s.clearSelection);
   const closeRoute = useStore((s) => s.closeRoute);
   // Opening/closing the code panel changes how much canvas is visible, so the
   // artboards re-centre for it the same way they do for a viewport change.
@@ -190,11 +194,32 @@ export function Canvas() {
           s.insertElement(s.insertKind, m.id as string, m.position as DropPosition);
         }
       } else if (m.type === "text-edit-request") {
-        useStore.getState().requestTextEdit(m.id as string);
+        void useStore.getState().requestTextEdit(m.id as string);
+      } else if (m.type === "text-editing") {
+        // The caret landed in, or left, an element on the canvas. Only the
+        // overlay knows — Escape, Enter, a click elsewhere and a re-render all
+        // end an edit without the editor being asked.
+        useStore.getState().setTextEditing((m.id as string | null) ?? null);
       } else if (m.type === "text-input") {
         // Typed on the canvas — staged exactly like a Content-field edit.
         const s = useStore.getState();
         if (s.selected?.dedupId === m.id) s.applyTextEdit(m.text as string);
+      } else if (m.type === "resize") {
+        // Each report is a staged class edit; they share a group id, so the
+        // whole drag collapses into one undo step.
+        useStore
+          .getState()
+          .resizeSelected(
+            typeof m.width === "number" ? m.width : null,
+            typeof m.height === "number" ? m.height : null,
+            String(m.group ?? "resize"),
+          );
+      } else if (m.type === "resize-start" || m.type === "resize-end") {
+        // Suppress hover chrome for the duration, the same way a reparent
+        // drag does — the pointer is busy and a hover box would flicker.
+        useStore.getState().setDragging(
+          m.type === "resize-start" ? String(m.id ?? "") : null,
+        );
       } else if (m.type === "drag-start") {
         useStore.getState().setDragging(m.id as string);
       } else if (m.type === "drag-end") {
@@ -231,6 +256,12 @@ export function Canvas() {
         // from window.innerHeight.
         const vp = VIEWPORTS.find((v) => v.id === viewportId)!;
         sendToOverlay({ type: "set-viewport", height: vp.height ?? 800 });
+        // A fresh overlay knows nothing about a chat turn already in flight,
+        // and would leave the section it is working on looking idle.
+        const s = useStore.getState();
+        if (s.chatBusy && s.selected) {
+          sendToOverlay({ type: "set-busy", id: s.selected.dedupId });
+        }
       } else if (m.type === "wheel") {
         const s = useStore.getState();
         if (m.zoomMod) {
@@ -353,6 +384,24 @@ export function Canvas() {
     };
   }, [devUrl]);
 
+  // Tell the overlay whether the selection may be resized. Driven off the
+  // write-back's own verdict (`sourceInfo.editable`) and sent from here — one
+  // declarative place — rather than from each of the four store paths that can
+  // land a `sourceInfo`, which would drift the moment a fifth appeared.
+  useEffect(() => {
+    sendToOverlay({
+      type: "set-resizable",
+      id: selected?.dedupId ?? null,
+      enabled: !!selected && !!sourceInfo?.editable,
+    });
+  }, [selected?.dedupId, sourceInfo?.editable]);
+
+  // Grips are drawn in page units inside the frame but must read as a fixed
+  // size on screen, so the overlay needs the canvas scale.
+  useEffect(() => {
+    sendToOverlay({ type: "set-zoom", zoom });
+  }, [zoom]);
+
   // Keep the overlay's vh-freeze in sync with the selected device viewport.
   useEffect(() => {
     if (!devUrl) return;
@@ -387,6 +436,19 @@ export function Canvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [devUrl, viewportId, codePanelOpen]);
 
+  // Where a press started, and whether it started on empty canvas — a click
+  // means "deselect" only when both ends of it landed on the background.
+  const pressRef = useRef<{ x: number; y: number; background: boolean } | null>(
+    null,
+  );
+
+  /** Empty canvas: the pannable surface itself, or the container behind it.
+   *  Artboards, their labels and every floating control are their own targets
+   *  and are deliberately not this. */
+  const isBackground = (t: EventTarget | null) =>
+    t instanceof HTMLElement &&
+    (t === containerRef.current || t.dataset.canvasSurface !== undefined);
+
   function startDrag(e: React.PointerEvent<HTMLElement>) {
     dragRef.current = { x: e.clientX, y: e.clientY };
     setDragging(true);
@@ -410,10 +472,7 @@ export function Canvas() {
     setDevStatus("starting");
     try {
       await startDevServer(
-        project.root,
-        project.packageManager,
-        project.framework,
-        project.devScript,
+        project,
         useStore.getState().customCommand ?? undefined,
       );
     } catch {
@@ -459,6 +518,11 @@ export function Canvas() {
         touchAction: "none",
       }}
       onPointerDown={(e) => {
+        pressRef.current = {
+          x: e.clientX,
+          y: e.clientY,
+          background: isBackground(e.target),
+        };
         if (e.button === 1) {
           e.preventDefault();
           startDrag(e);
@@ -467,6 +531,24 @@ export function Canvas() {
       onPointerMove={moveDrag}
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
+      // Clicking empty canvas drops the selection, the way it does in every
+      // canvas tool. Both ends of the click have to be on the background: a
+      // pan that happens to finish over it is a drag, not a click, and the
+      // 4px allowance is for the hand that moves a little while pressing.
+      // Clicks inside an artboard never reach here at all — they happen in
+      // another document, and the overlay reports them as selections.
+      onClick={(e) => {
+        const press = pressRef.current;
+        pressRef.current = null;
+        if (e.button !== 0 || !press?.background || !isBackground(e.target)) {
+          return;
+        }
+        if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 4) return;
+        clearSelection();
+        // "Nothing selected" includes the artboard the scan was pointed at —
+        // it is drawn as a selection (the accent ring) and reads as one.
+        setSelectedRoute(null);
+      }}
     >
       {crashed ? (
         <CenteredPanel>
@@ -607,6 +689,17 @@ export function Canvas() {
                   held
                 </span>
               )}
+              {/* Same rule, and it matters more here: an artboard whose
+                  requests are all failing looks exactly like an app that is
+                  broken. The label is the difference between the two. */}
+              {offlineRoutes[route] && (
+                <span
+                  className="rounded bg-warn/15 px-1 text-warn shrink-0"
+                  title="dedup is cutting this page's network — the app's requests fail so its offline state renders."
+                >
+                  offline
+                </span>
+              )}
               {i === 0 && (
                 <span className="text-ink-faint shrink-0">
                   {viewport.label} · {viewport.width}
@@ -640,6 +733,7 @@ export function Canvas() {
               the live, navigable app), off-screen siblings unmount so a
               route-heavy project doesn't run 20 live copies of itself. */}
           <div
+            data-canvas-surface
             className="absolute top-0 left-0 will-change-transform"
             style={{
               transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
@@ -685,7 +779,10 @@ export function Canvas() {
                           devUrl,
                           devAltUrl,
                         }) ?? devUrl,
-                        !!heldRoutes[route],
+                        {
+                          held: !!heldRoutes[route],
+                          offline: !!offlineRoutes[route],
+                        },
                       )}
                       title={`page ${route}`}
                       className="w-full h-full border-0 bg-white"

@@ -19,10 +19,12 @@ pnpm test:scan          # duplicate-scan bundle tests
 pnpm test:tw            # tailwind class⇄knob mapping tests
 pnpm test:errors        # dev-server output → build-error parsing
 pnpm test:origins       # which session (origin) a page artboard renders under
-pnpm test:chat          # AI chat edit-block parse/apply
+pnpm test:chat          # chat agent: tool protocol + multi-file edit parse/apply
 pnpm test:merge         # guarded-merge codemod (tests the BUILT bundle)
 pnpm test:proposal      # merge proposal parse + review diff + gate rules
 pnpm test:highlight     # code-panel syntax colouring (round-trip invariant)
+pnpm test:html          # static sites: HTML walk/stamp/write-back + the server
+pnpm test:prompts       # chat composer: ↑/↓ prompt history state machine
 cargo test              # from src-tauri/ — all Rust tests
 ```
 
@@ -33,6 +35,8 @@ cargo test              # from src-tauri/ — all Rust tests
   Everything agent-specific — binary name, install fallbacks, the flags that
   mean "headless, no tools, no session", how the answer is framed — lives in
   `Agent`; adding one is a match arm plus a row in `CLI_AGENTS` (lib/types).
+  That now includes `asset_dir` — where the agent leaves files it generates,
+  which is the whole trust boundary for importing one (see `asset.rs`).
   They are asked for *text*, never given tools or write access: dedup edits
   through its own parse-gated write-back, and a second path to the user's
   source would be an unaudited one.
@@ -47,27 +51,51 @@ cargo test              # from src-tauri/ — all Rust tests
   branch + scoped commits), `session.rs` (mock-session seed for zero-login
   editing + the auth-context scanner that feeds its AI draft), `merge.rs`
   (guarded-merge sidecar runner, the typecheck/build gates, session history +
-  rollback), `visual.rs` (PNG diff for the regression gate, perceptual hash
+  rollback), `asset.rs` (the gated copy of an agent-generated image into the
+  project), `scaffold.rs` (the two starters written into an empty folder),
+  `visual.rs` (PNG diff for the regression gate, perceptual hash
   for the visual similarity signal).
+- **Two kinds of project.** A *node* project (Vite/Next) runs the user's own
+  dev server with dedup's tagger injected into the build. A *static* project (a
+  folder of `.html` files, `Framework::Static`) has no build to inject into, so
+  **dedup is the dev server**: `plugin-src/serve.mjs` serves the folder and runs
+  every HTML response through the stamper on the way out. Same guarantee — ids
+  exist only in what the browser receives — reached by a shorter road. It
+  announces its URL in Vite's format on purpose, so `devserver.rs` needs no
+  second code path for it.
+- An empty folder is not an unsupported project, it is a project that does not
+  exist yet: `project::detect` reports `is_empty` before any heuristic runs, and
+  the launch screen offers a starter (`scaffold.rs`) instead of a verdict.
 - `plugin-src/` — JS that runs *inside the user's project*: `jsxwalk.mjs` (the
   shared JSX traversal defining element ids + what may be done to each node),
   `tagcode.mjs` (the one stamping transform, shared by both build pipelines),
   `tagger.mjs` (Vite plugin + harness/routes/session routes), `next.mjs` +
   `next-loader.mjs` (the Next config wrapper and its webpack loader),
   `overlay.js` (in-iframe hover/select/staged-program preview/drag-to-reparent
-  + postMessage bridge), `writeback.mjs` (AST inspect + edit programs:
-  class/text/insert/remove/move), `files.mjs` (the one project traversal the
+  + postMessage bridge), `writeback.mjs` (AST inspect + copy + edit
+  programs: class/text/insert/remove/move), `files.mjs` (the one project traversal the
   scan and the merge share), `resolve.mjs` (import-specifier resolution:
   relative, tsconfig `paths`, `baseUrl`), `merge.mjs` (the guarded-merge
   codemod). Bundled self-contained by `build.mjs` — never depends on the
   user's node_modules.
+- `plugin-src/` (static sites): `htmlwalk.mjs` (the shared HTML traversal —
+  htmlwalk is to HTML exactly what jsxwalk is to JSX), `htmltag.mjs` (the
+  stamper), `htmlback.mjs` (the HTML write-back, which `writeback.mjs`
+  dispatches to by file extension), `serve.mjs` (the static dev server), plus
+  `boot.mjs` and `srcedit.mjs` — extracted because two callers each need one
+  copy of what they hold (the head-injected boot script; the
+  line/indent/re-indent helpers every write-back path needs).
 - `src/` — editor frontend (React 19 + Tailwind v4 + zustand):
   `lib/store.ts` (all state incl. the staged edit program), `lib/types.ts`
   (`EditAction` — the one description of an edit, previewed/undone/reviewed/
   written), `lib/tailwind.ts` (class⇄knob mapping + `mergeClasses`),
   `lib/errors.ts` (dev-server stream → build errors), `lib/palette.ts`
-  (insertable elements), `lib/bridge.ts` (iframe messaging),
+  (insertable elements + the one-element snippet rewriter), `lib/bridge.ts`
+  (iframe messaging),
   `lib/mergeProposal.ts` (the model boundary: prompt + strict reply parsing),
+  `lib/chat.ts` + `lib/chatEdits.ts` (the chat agent's boundary: prompt, tool
+  protocol, and the strict parse of what comes back),
+  `lib/promptHistory.ts` (the composer's ↑/↓ walk, pure so it can be tested),
   `lib/mergeFlow.ts` (the gate runner), `lib/diff.ts` (the review diff),
   `lib/visualPass.ts` (perceptual-hash similarity over the rendered gallery),
   `components/` (LaunchScreen/Editor/Canvas/Inspector/StylePanel/ReviewPanel/
@@ -113,18 +141,174 @@ cargo test              # from src-tauri/ — all Rust tests
   pinned route) reload or relocate the frame, which destroys any in-memory
   state a multi-step flow is holding — a phone-OTP login restarts. The
   gesture flag is a 1.5s heuristic and is *not* reliable for async flows.
-- One head-injected boot script (`buildBootScript` in the tagger) carries
-  everything that must run *before the app boots*: the mock-session seed and
-  the hold. Both are gated to framed pages by the wrapper, never by their own
+- One head-injected boot script (`buildBootScript`, now in `boot.mjs` — the
+  Vite tagger and the static server both inject it) carries
+  everything that must run *before the app boots*: the mock-session seed, the
+  offline cut and the hold. Both are gated to framed pages by the wrapper, never by their own
   content — neither may run when the user opens their dev server in a
   browser. The seed writes browser storage only; it never mocks the render,
-  because the user edits what they see.
+  because the user edits what they see. Both servers **serve** it at
+  `/__dedup/session.js` rather than inlining it: a seed is user-authored script
+  text, and the string `</script>` anywhere inside an inline tag would close it
+  and spill the rest of the boot script into the page as markup.
+- **Offline** renders the app's no-internet state by cutting the *app's*
+  network and nothing else: `fetch`/XHR/WebSocket/EventSource/`sendBeacon` fail
+  and `navigator.onLine` reads false, while same-origin requests under the
+  `TOOLING` prefixes (dedup's routes, `/@vite/`, `/node_modules/`, `/_next/
+  static/`, …) and the `vite-hmr` socket still go out — cut those and the
+  artboard stops hot-reloading the moment it goes offline. Nothing is mocked:
+  every blocked request fails the way one fails with no network (WebKit's
+  "Load failed", XHR readyState 4 + status 0, close code 1006), so what renders
+  is the app's real behaviour. Armed by `?__dedup_offline=1` (`OFFLINE_FLAG`)
+  and installed **before** the hold, which ends the boot script with an early
+  return. Limitation worth knowing: it blocks requests the app *makes*, not
+  subresources the browser fetches, so a remote `<img>` still loads.
+- **Every frame flag lives in the query string and wears the `__dedup`
+  prefix.** They have to reach the page before the app boots and the URL is
+  the only channel that early, so anything sending a frame to a bare path
+  drops them — an offline artboard silently comes back online while the
+  editor's label still says otherwise. `withFlags` in the overlay carries them
+  across any navigation it drives, matched by prefix rather than by name
+  because the overlay is a third separately bundled world (after `boot.mjs`
+  and `lib/origins.ts`) and one more list to sync is one more way to lose one.
 - **Hold** freezes a frame on its first screen (splash/interstitial editing)
   by queueing timers ≥400ms and freezing `history`. Never hold short timers:
   React's scheduler falls back to `setTimeout`, so stalling it hangs the page
   instead of pausing it. It is armed by `?__dedup_hold=1` on the frame URL
   (`HOLD_FLAG`, duplicated in `lib/origins.ts` and the tagger because they
   are separately bundled — `test:origins` asserts they agree).
+- **Double-click-to-edit has to wait for the write-back, not read it.** The two
+  clicks of a double-click both select, and "may I type into this?" comes from
+  a sidecar spawn that usually has not returned when `dblclick` fires. Reading
+  `sourceInfo` and giving up on a null made the gesture work about half the
+  time. `sourceInfoPending` (module scope in `lib/store.ts`, deliberately not
+  store state — nothing renders it) holds the in-flight lookup so
+  `requestTextEdit` can await it; `setSelected` short-circuits a re-select of
+  the same element so the second click cannot throw the answer away.
+- **The text tool follows the caret, not the other way round.** Only the
+  overlay knows when an edit ends — Escape, Enter, a click elsewhere and a
+  re-render all end one without the editor being asked — so it posts
+  `text-editing {id|null}` and the store's `setTextEditing` owns the mode.
+  `setTool` starts an edit and `setTextEditing` sets the tool *directly* rather
+  than calling `setTool`, because routing it back through would bounce between
+  the two. `textToolSticky` is the difference between the two ways in: T (or
+  the toolbar button) is chosen and stays; a double-click borrows the tool for
+  one edit and hands it back. `clearSelection` ends an edit in flight, because
+  the overlay's `clear` does not and neither does the iframe losing focus (its
+  blur handler only ends drags) — the element would otherwise stay
+  contenteditable while the editor believed nothing was selected.
+- **The chat agent has no tools — it has a protocol.** It replies `TOOL: read
+  <path>` / `grep <pattern>` / `list`, dedup runs the read-only sidecar and
+  feeds the results back as the next turn (`MAX_TOOL_ROUNDS` caps the loop).
+  That is deliberate and load-bearing: a CLI agent given real file access would
+  be a second, unaudited path to the user's source. Everything it can see,
+  dedup fetched. Two rules keep it safe and each has a test — a SEARCH block
+  naming a file the model never read is refused (a quote written from memory is
+  what exact-match exists to catch), and a file over 120KB is never sent, because
+  a truncated reply written back would delete the rest of the module.
+- **A chat reply is a proposal, and a proposal is previewed on the canvas.**
+  A diff says what changed; it cannot say how it *looks*, and looking is the
+  reason dedup renders the app at all. So `sendChat` writes the proposal out —
+  parse-gated, through `writeSources`, and **uncommitted** — and the running
+  dev server shows it. The commit is the decision: `acceptChatEdit` commits to
+  the session branch, `rejectChatEdit` calls `revertSources` to put every file
+  back byte-for-byte (`before` in `pendingEdit`, `null` for a file the edit
+  created, which is then removed). The safety line is *committed vs not*, not
+  *written vs not* — same bargain Cursor makes, and the same one that makes the
+  preview possible at all. Three consequences worth keeping: the revert path is
+  the one write that is **not** content-gated (it restores bytes dedup read,
+  and a file that was already broken must still be restorable — that is the
+  case where the user asked the agent for help); leaving the project reverts a
+  live preview, because closing is not a decision to keep it; and the top bar
+  shows a live preview, because a user who switched off the chat tab otherwise
+  has uncommitted AI edits with nothing on screen saying so.
+- **An ASSET block is the one thing the model can say that names a path
+  outside the project**, and it exists because an image is the one output an
+  agent cannot type out as text. So it is a *request*, answered by `asset.rs`
+  under gates of its own: the source must resolve (through symlinks —
+  canonicalize both sides) inside that agent's `asset_dir` and nowhere else,
+  it must sniff as PNG/JPEG/GIF/WebP by **magic bytes** rather than by the
+  extension the model chose, the destination extension must agree with those
+  bytes, and the destination must be a new path inside the root. A model
+  naming `~/.ssh/id_rsa` is the case every one of those is written against.
+  The prompt only mentions the directive for a backend whose `generatesAssets`
+  is true — inviting one that could only fail is worse than not having it.
+  Marker paths go through `undecoratePath`: the prompt writes placeholders as
+  `<project-relative path>` and models copy the brackets, which reached the
+  import gate as a file whose extension was `png>`. Angle brackets are stripped
+  even unpaired (illegal in a path, so always decoration); quotes only in
+  balanced pairs, because `it's.png` is a real filename.
+  Imports run *before* the text write in `sendChat`, because a new file can be
+  taken back cleanly and a landed text write cannot; and they ride the same
+  proposal lifecycle as everything else (previewed uncommitted, committed on
+  accept, removed on discard — `revertSources` with a null content).
+- Keep the proposal's file *contents* out of the persisted transcript (chat
+  sessions are saved per project; source snapshots don't belong there), and
+  keep it to one unresolved proposal: a second is computed against the contents
+  the first put on disk, so both cannot be right. Superseding one reverts its
+  preview first.
+- **The composer's arrow keys are shared with the caret.** It is a textarea
+  (Shift+Enter makes a line), so ↑ inside a multi-line draft must move the
+  caret or the box cannot be edited — history only moves from the edges (↑ on
+  the first line, ↓ on the last, nothing selected). `stepHistory` returns null
+  for "not ours", and returns the *same* state for the ↑ at the oldest entry:
+  swallowed, because a caret jumping to the top reads as a recall that failed.
+  A half-written draft is stashed on the first ↑ and returned by the last ↓ —
+  losing typed text to a keystroke is the failure that shape exists to
+  prevent.
+- **A selection is chat context, not a gate.** The composer works with nothing
+  selected — that is the case where a user most needs it (a build error means
+  there may be nothing on the canvas to click). Anything that re-adds a
+  `!selected` guard to a chat path is re-breaking it; the same reasoning
+  un-gated the console drawer's Ask AI button.
+- `sidecar::resolve_in_root` canonicalizes the file, so it only ever names
+  something that exists. Creating a file (the agent extracting a component)
+  goes through `resolve_new_in_root`, which canonicalizes the nearest existing
+  ancestor instead. Don't relax the first one to cover the second — the
+  containment check is the whole point of both.
+- **A copy is two renderings of one element, like a palette entry.** The
+  *source* comes from the write-back's `copy` command (the file is the truth
+  about what a paste writes) and the *picture* from the overlay's
+  `copy-element` (only the page knows what that source rendered as) — deriving
+  either from the other would mean a JSX renderer in the overlay. So a copy is
+  what the **file** says, not what the screen shows: `copy` reports the
+  ordinals it swallowed and the editor names the staged edits inside that the
+  copy therefore doesn't carry. The overlay strips every `data-dedup-` stamp
+  out of the markup it hands back — `data-dedup-id` above all, or the pasted
+  preview answers to the same id as its original and every lookup in that file
+  starts hitting whichever the DOM returns first.
+- **A staged program must never be able to strand itself.** An edit addressed
+  to a `pending:` insert is refused by `opsForFile` once that insert is gone —
+  correctly, and *permanently*: every later save throws, and the chat refuses
+  while any edit targets the file, so there is no way forward and no way back.
+  `withoutAction` is why discarding an insert takes its edits with it (the rule
+  `removeSelected` always had, which the review panel's per-row discard did
+  not), and `discardAllEdits` is the escape hatch for a program that is already
+  stuck. Anything new that drops actions individually needs the same rule.
+- **`stage` is the one gate on what may be staged**, and it returns false when
+  it refuses — a program is only ever invalid as a *combination*, so the check
+  belongs where every action arrives rather than at each call site.
+  `stagingConflict` holds the rule: an element on its way out cannot also be a
+  party to another structural edit (something inserted against it, or a move in
+  or out of it). Without it, paste-beside-a-section-then-delete-it built a
+  program that could never be saved and blocked the chat too. Callers that
+  chain off a stage — selecting a pasted element, clearing the selection after
+  a delete — must check the return rather than assume.
+- **A staged snippet carries its language** (`SnippetLang`). Palette markup is
+  one element, so `toHtmlSnippet` can respell it for an HTML page; an arbitrary
+  copied subtree has no such translation, and a mismatch is refused at paste
+  time and again in `opsForFile`. For the same reason a pasted section is
+  read-only until saved — the fold-into-the-snippet rewriter parses one element
+  with quoted attributes, and `pendingNodeInfo` says so rather than accepting
+  edits the save would refuse. Everything that reads or rewrites a staged
+  snippet's classes must ask that language first (`classAttrFor`): writing
+  `className` into an HTML page is an unknown attribute that styles nothing,
+  so the restyle silently does not happen.
+- **A cut and its paste land in one program.** Appending content onto a chunk
+  the same program removes drops it silently, so both write-backs resolve what
+  a program deletes *before* the op loop and refuse an insert whose anchor is
+  being deleted or whose insertion point falls inside something that is. Before
+  the loop, not during it: the two ops arrive in either order.
 - **A merge is the one place a bug corrupts a codebase.** Its rules are not
   negotiable and are each covered by a test: every output file is re-parsed
   *before any file is written* (all-or-nothing across files, the same guarantee
@@ -137,6 +321,17 @@ cargo test              # from src-tauri/ — all Rust tests
   verdict with a reason attached (no typecheck script, no build script, no
   artboard on screen), and it must survive into the summary line. Rounding it
   up to a pass is the failure mode the whole phase exists to prevent.
+- **`git commit -- <path>` takes a pathspec, and a pathspec only matches files
+  git already knows.** Any dedup path that can be a *new* file — a chat agent
+  creating a component or a page, a merge writing into a new file — must be
+  `git add`ed first or the whole commit dies with "did not match any file(s)
+  known to git", after the file is already on disk. `git::commit_paths` stages
+  exactly the untracked paths in the set and no others: for a tracked path the
+  bare pathspec form is what leaves the user's own staged version of that file
+  alone, which is the FR-4.5 guarantee. A path that is neither tracked nor
+  listed as untracked is `.gitignore`d, and is refused with that reason rather
+  than force-added — overriding an ignore rule the user wrote down is not
+  dedup's call.
 - Merge rollback restores the commit's own paths and commits that — never
   `git revert`, which demands a clean tree and would involve the user's
   in-flight work.
@@ -157,6 +352,36 @@ cargo test              # from src-tauri/ — all Rust tests
   `DEDUP_TAGGING=1`, so it changes nothing about the user's own `next dev`,
   CI or production build. The convention forbids *silent* mutation; this is
   the opposite of silent.
+- **HTML5 has no such thing as invalid input**, so "the output still parses"
+  proves nothing about an HTML edit — a class attribute with a stray quote
+  becomes a very long class attribute that ate the rest of the page, and the
+  parser reports no error. The HTML write-back's gate is therefore *structural*:
+  for a content-only program the output's tag sequence (depth + tag, in walk
+  order) must be **identical**; for a structural one the element count must be
+  exactly what the ops said; and either way the output may introduce no HTML5
+  parse error the input did not already have. The snippet validator is part of
+  the same rule — an unclosed `<div>` is a legal fragment that would swallow
+  every sibling after it, so it is refused where the intent is still visible.
+  Each rule has a test in `test:html`; add the refusal and its test first.
+- The JSX palette snippet is respelled for HTML exactly once, at the boundary
+  (`toHtmlSnippet` in `lib/palette.ts`, called from `opsForFile`). Staging keeps
+  one spelling so the fold-into-the-snippet path has one shape. `<div />` is not
+  a self-closing div in HTML — it is a `<div>` that never closes — so the
+  translation pairs non-void tags as well as renaming `className`.
+- **A static site has no node_modules to hide in.** `node_modules/.dedup` was
+  chosen because it is git-invisible by construction; creating one in a static
+  site purely to hide files would put an untracked folder in the user's repo.
+  `sidecar::support_dir` is the single answer to "where do dedup's files for
+  this project go" — `node_modules/.dedup` when there is a package.json, the
+  app cache dir keyed by project path otherwise. Never hardcode the path again.
+- The static server takes both `--root` (the folder it serves) and `--base`
+  (the project root). They differ when the pages live in `site/`, `www/`,
+  `public/`. Ids are always relative to `--base`, because that is the path the
+  write-back opens — one project, one path vocabulary. `test:html` pins the
+  round-trip across the two separately-bundled halves.
+- **The bundle tests test the built bundles.** After editing anything under
+  `plugin-src/`, run `pnpm build:plugin` before the suites, or you will be
+  testing the previous build and drawing conclusions from it.
 - The visual similarity hash is median-thresholded aHash, **not** dHash. dHash
   only sees horizontal gradients, so a component with a dark left column and
   one with a dark top row hash identically — and UI is mostly flat,
@@ -170,6 +395,18 @@ cargo test              # from src-tauri/ — all Rust tests
 - The code panel paints highlight tokens *behind* a transparent textarea, so
   `tokenize` must round-trip its input exactly. A dropped or added character
   moves the caret away from the text under it. `test:highlight` pins it.
+- Overlay chrome is drawn in **screen** pixels (`position: fixed`), not page
+  ones — the element-name badge and the resize grips both rely on it, so they
+  stay legible however far the canvas is zoomed out. The busy grid is the
+  exception that proves it: it is sized *from* the element's rect, because it
+  is meant to cover the thing it is about.
+- **Clicks inside an artboard never reach the canvas root** — they happen in
+  another document and arrive as overlay messages instead. So the canvas root's
+  own click handler only ever sees empty canvas or its floating chrome, which
+  is what makes click-to-deselect a two-part rule: the target must be the
+  container or the pannable surface (`data-canvas-surface`), and *both ends* of
+  the click must be there, or a pan finishing over the background reads as a
+  click on it.
 - The chrome floats over a full-bleed canvas. Anything that positions content
   on the canvas (initial pan, focus-a-route, the Components gallery) must inset
   by the live panel widths, or it lands under a panel. `.panel` in `styles.css`
@@ -203,7 +440,12 @@ cargo test              # from src-tauri/ — all Rust tests
   branches, commit per save touching only dedup's files, output re-parsed
   before any file write. One corrupted user codebase kills the product.
 - User's source/config are never mutated for tooling — everything injected
-  lives in `node_modules/.dedup/` or served virtually.
+  lives in `sidecar::support_dir` (see the gotcha) or is served virtually.
+  Scaffolding a starter into an **empty** folder is not an exception to that
+  rule but its opposite: the user asked for those files by name and they are
+  the project from the moment they land, not tooling smuggled into one. It
+  refuses any folder that isn't empty, and the starter is the repo's initial
+  commit so every dedup edit afterwards has a clean baseline behind it.
 - Honesty over magic: what can't be edited safely is read-only with a reason.
 - Commit style: imperative subject, body explains the *why* and mechanism;
   update `PROGRESS.md` at phase completion and for significant decisions.

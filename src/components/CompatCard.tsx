@@ -54,7 +54,13 @@ export function CompatCard({ info, git, onCancel, onConfirm }: Props) {
       ? "Next.js"
       : info.framework === "vite"
         ? "Vite"
-        : "Unknown framework";
+        : info.framework === "static"
+          ? "Static HTML"
+          : "Unknown framework";
+  // dedup *is* the dev server for a static site, so there is no command of
+  // theirs to override — offering the box would only let someone replace the
+  // one server that does the tagging.
+  const isStatic = info.framework === "static";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm px-8">
@@ -80,10 +86,12 @@ export function CompatCard({ info, git, onCancel, onConfirm }: Props) {
         <div className="px-5 py-3 flex flex-wrap gap-1.5 border-t border-line">
           <Badge ok label={fwLabel} />
           <Badge ok={info.hasTailwind} label="Tailwind" />
-          <Badge ok={info.hasTypescript} label="TypeScript" />
+          {/* TypeScript and a package manager are not things a hand-written
+              site is missing — they are things it doesn't have. */}
+          {!isStatic && <Badge ok={info.hasTypescript} label="TypeScript" />}
           <Badge ok={info.hasGit} label="git" />
           <span className="inline-flex items-center rounded px-1.5 py-0.5 text-2xs font-medium bg-surface-3 text-ink">
-            {info.packageManager}
+            {isStatic ? "no build step" : info.packageManager}
           </span>
         </div>
 
@@ -102,6 +110,13 @@ export function CompatCard({ info, git, onCancel, onConfirm }: Props) {
           </ul>
         )}
 
+        {isStatic ? (
+          <div className="px-5 py-3 border-t border-line text-2xs text-ink-faint leading-snug">
+            dedup serves this folder itself and stamps the pages on the way out,
+            so element inspection works with no build step and nothing is
+            written into your files.
+          </div>
+        ) : (
         <div className="px-5 py-3 border-t border-line">
           <button
             onClick={() => setShowAdvanced((v) => !v)}
@@ -126,6 +141,7 @@ export function CompatCard({ info, git, onCancel, onConfirm }: Props) {
             </div>
           )}
         </div>
+        )}
 
         {needsAck && (
           <div className="px-5 py-3 border-t border-line">

@@ -121,6 +121,24 @@ impl Agent {
         args
     }
 
+    /// Where this agent writes files it generates, if it generates any.
+    ///
+    /// An image is the one output an agent cannot put in its reply — it can
+    /// only say where it left it. That makes this directory the whole trust
+    /// boundary for importing one: `asset.rs` will fetch from inside it and
+    /// nowhere else, so what belongs here is the agent's own output directory
+    /// and never a parent of it. `None` means the agent generates nothing,
+    /// and dedup does not offer the import at all rather than offering one
+    /// that could only fail.
+    pub fn asset_dir(self) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        match self {
+            // Claude Code writes no files of its own for dedup to import.
+            Agent::ClaudeCode => None,
+            Agent::Codex => Some(PathBuf::from(format!("{home}/.codex/generated_images"))),
+        }
+    }
+
     /// Does this agent want a file to write its final message into?
     fn uses_answer_file(self) -> bool {
         matches!(self, Agent::Codex)

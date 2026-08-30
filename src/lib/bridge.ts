@@ -35,12 +35,25 @@ type OverlayCommand =
     }
   /** Arm/disarm canvas gestures: dragging elements, click-to-insert. */
   | { type: "set-edit-mode"; drag: boolean; insert: boolean }
+  /** Whether the selected element may be resized by its corner grips — the
+   * write-back's own verdict on whether its className is editable, so a grip
+   * never appears on something a size edit would be refused for. */
+  | { type: "set-resizable"; id: string | null; enabled: boolean }
+  /** Canvas zoom, so the grips keep a constant on-screen size. */
+  | { type: "set-zoom"; zoom: number }
   /** Permission to put the caret in an element (answers text-edit-request). */
   | { type: "text-edit-begin"; id: string }
+  /** Take the caret back off the canvas (leaving the text tool). */
+  | { type: "text-edit-end" }
   /** Highlight an element as if hovered on the canvas (Layers tree rows). */
   | { type: "hover-id"; id: string | null }
   /** Force a layer-tree report (they otherwise push on DOM mutations). */
   | { type: "list-layers" }
+  /** Ask for one element's rendered HTML — a copy's staged preview. */
+  | { type: "copy-element"; id: string }
+  /** Mark an element as the one the AI is currently working on, or null to
+   * stop. The canvas draws it; the editor is the only side that knows. */
+  | { type: "set-busy"; id: string | null }
   /** Let a held frame resume: flushes the timers the hold queued. */
   | { type: "release-hold" }
   | { type: "list-files" }
@@ -142,5 +155,38 @@ export function requestFrameSizes(
     }
     window.addEventListener("message", onMessage);
     sendToFrame(route, { type: "list-sizes" });
+  });
+}
+
+/**
+ * One element's rendered HTML — the picture half of a copy (the source half
+ * comes from the write-back).
+ *
+ * Broadcast, not addressed to a route: an element can be on any artboard, and
+ * the one holding it is the one that answers. Frames without it stay silent
+ * rather than racing a null back, so the only way to get null here is that no
+ * frame has it — a dev server that is down, or an id the canvas has since
+ * re-rendered away.
+ */
+export function requestElementHtml(
+  id: string,
+  timeoutMs = 1500,
+): Promise<string | null> {
+  if (frames.size === 0) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const finish = (html: string | null) => {
+      clearTimeout(timer);
+      window.removeEventListener("message", onMessage);
+      resolve(html);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    function onMessage(e: MessageEvent) {
+      const m = e.data;
+      if (!m || m.__dedup !== true || m.type !== "element-html") return;
+      if (m.id !== id || typeof m.html !== "string") return;
+      finish(m.html as string);
+    }
+    window.addEventListener("message", onMessage);
+    sendToOverlay({ type: "copy-element", id });
   });
 }

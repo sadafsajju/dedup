@@ -169,6 +169,7 @@ function age(scannedAt: number | undefined): string | null {
 
 /** Sidebar tab body: scan state, then the ranked cluster list. */
 export function DuplicatesTab() {
+  const framework = useStore((s) => s.project?.framework);
   const scanning = useStore((s) => s.scanning);
   const progress = useStore((s) => s.scanProgress);
   const result = useStore((s) => s.scanResult);
@@ -184,6 +185,22 @@ export function DuplicatesTab() {
   const dismissedCount = result
     ? result.clusters.length - clusters.length
     : 0;
+
+  // Read-only with a reason, rather than a Scan button that finds nothing:
+  // the duplicate engine reads React components, and a plain HTML site has
+  // none to read. Everything else on the canvas works there.
+  if (framework === "static") {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center px-6 text-center gap-2">
+        <CopyIcon width={22} height={22} className="text-ink-faint" />
+        <div className="text-2xs text-ink-dim leading-relaxed">
+          Duplicate detection compares React components, so it has nothing to
+          read in a static site. Inspection, styling, structure and the Pages
+          tab all work here.
+        </div>
+      </div>
+    );
+  }
 
   if (scanning) {
     const pct =

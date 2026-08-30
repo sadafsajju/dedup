@@ -6,7 +6,7 @@
 // control still names the literal Tailwind class it writes in its `title`, so
 // the panel keeps teaching the vocabulary instead of hiding it.
 import { useEffect, useRef, useState } from "react";
-import { ChevronDownIcon } from "@radix-ui/react-icons";
+import { CheckIcon, ChevronDownIcon, CopyIcon } from "@radix-ui/react-icons";
 import { cssColor } from "../lib/tailwind";
 
 /** Structural shape of a Radix icon — narrow on purpose: the package's own
@@ -16,6 +16,78 @@ export type IconType = React.ComponentType<{
   height?: number | string;
   className?: string;
 }>;
+
+/**
+ * Put text on the system clipboard, and say whether it landed.
+ *
+ * Two paths because either can be the one that works: `navigator.clipboard`
+ * needs a secure context and can be refused outright, and the textarea +
+ * `execCommand` route is deprecated and still the only thing left when it is.
+ * Returns false rather than throwing, so a caller can leave its button alone
+ * instead of showing a tick for a copy that never happened.
+ */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Refused or unavailable — try the old way before giving up.
+  }
+  try {
+    const scratch = document.createElement("textarea");
+    scratch.value = text;
+    scratch.setAttribute("readonly", "");
+    // Off-screen but not display:none, which would make it unselectable.
+    scratch.style.cssText = "position:fixed;top:-1000px;opacity:0";
+    document.body.appendChild(scratch);
+    scratch.select();
+    const ok = document.execCommand("copy");
+    scratch.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Copy something, and show that it happened.
+ *
+ * The tick is the feature, not decoration: a clipboard write makes no sound
+ * and changes nothing on screen, so a button that looks identical afterwards
+ * reads as one that did nothing. It only appears when the write actually
+ * succeeded.
+ */
+export function CopyButton({
+  text,
+  title = "Copy",
+  className = "",
+}: {
+  text: string;
+  title?: string;
+  className?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 1200);
+    return () => clearTimeout(t);
+  }, [copied]);
+
+  const Icon = copied ? CheckIcon : CopyIcon;
+  return (
+    <button
+      onClick={() => void copyText(text).then(setCopied)}
+      title={copied ? "Copied" : title}
+      aria-label={title}
+      className={`shrink-0 rounded p-1 text-ink-faint hover:text-ink hover:bg-surface-2 ${
+        copied ? "text-positive hover:text-positive" : ""
+      } ${className}`}
+    >
+      <Icon width={11} height={11} />
+    </button>
+  );
+}
 
 // --- sections / groups -------------------------------------------------------
 

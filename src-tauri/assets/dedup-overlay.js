@@ -28,6 +28,12 @@
   // and click-to-place for the insert palette.
   let dragEnabled = false;
   let insertArmed = false;
+  // Gesture state, declared up here rather than beside the handlers that own
+  // them: `repaint` reads both, and it runs from listeners registered above
+  // that code. A `let` read in its temporal dead zone throws, and a throw in
+  // this IIFE silently kills every listener after it.
+  let drag = null;
+  let resizing = null;
 
   // The staged (unsaved) program, as state — see the `stage` message. Kept
   // whole rather than as deltas so it can be re-applied verbatim whenever
@@ -63,12 +69,18 @@
     pointerEvents: "none",
     background: ACCENT,
     color: "#fff",
-    font: "500 11px -apple-system, system-ui, sans-serif",
-    padding: "2px 6px",
-    borderRadius: "3px",
+    // Drawn in screen pixels, not page ones: it is a label *about* the page
+    // rather than part of it, so it stays the same size however far the
+    // canvas is zoomed out — which is exactly when a name is hardest to read.
+    font: "600 13px/16px -apple-system, system-ui, sans-serif",
+    padding: "3px 7px",
+    borderRadius: "4px",
     zIndex: String(Z + 1),
     whiteSpace: "nowrap",
   });
+  /** Height of the badge as styled above (16px line + 3px padding each side),
+   *  so it can be parked exactly above an element instead of guessed at. */
+  const BADGE_H = 22;
 
   // Drop affordances for drag/insert: a line between siblings, a box for
   // "inside". Both are pointer-events:none so elementFromPoint sees through.
@@ -87,6 +99,86 @@
   const dropBox = makeBox("rgba(76,127,255,0.12)");
   dropBox.style.borderStyle = "dashed";
   dropBox.style.zIndex = String(Z + 2);
+
+  // --- "the AI is working on this" ------------------------------------------
+  // A chat turn can take a minute, and the only sign of it was a spinner in a
+  // side panel the user may have scrolled away from — while the thing being
+  // worked on sat there looking idle. Squares lighting up across the element
+  // say where the work is happening, and say it without implying a
+  // percentage: there is no progress to report, only that something is
+  // running. Drawn over the element rather than replacing it, because the
+  // user is still entitled to look at what they asked about.
+  const busyStyle = document.createElement("style");
+  busyStyle.setAttribute("data-dedup-ui", "");
+  busyStyle.textContent =
+    "@keyframes dedup-busy{0%,100%{opacity:.08}50%{opacity:.5}}" +
+    "[data-dedup-busy]>i{display:block;border-radius:2px;background:" +
+    ACCENT +
+    ";animation:dedup-busy 1.6s ease-in-out infinite}" +
+    // Someone who has asked for less motion gets a still wash instead of a
+    // pulse — the point is "work is happening here", not the animation.
+    "@media (prefers-reduced-motion:reduce){[data-dedup-busy]>i{animation:none;opacity:.22}}";
+
+  const busyBox = document.createElement("div");
+  busyBox.setAttribute("data-dedup-ui", "");
+  busyBox.setAttribute("data-dedup-busy", "");
+  Object.assign(busyBox.style, {
+    position: "fixed",
+    display: "none",
+    pointerEvents: "none",
+    zIndex: String(Z),
+    boxSizing: "border-box",
+    overflow: "hidden",
+    gap: "3px",
+    padding: "3px",
+  });
+
+  // --- resize handles -------------------------------------------------------
+  // Figma's eight grips on the selection. Two things make these different from
+  // every other piece of chrome here:
+  //
+  //  * they are the only chrome with `pointerEvents: auto` — everything else
+  //    is transparent to `elementFromPoint` on purpose, but a grip you cannot
+  //    grab is not a grip;
+  //  * they are sized in *screen* px, so they divide by the canvas zoom. At
+  //    50% a handle drawn in page px would be 4px on screen, which is not a
+  //    target anyone can hit.
+  //
+  // A handle only ever changes width/height. On a canvas the north-west grip
+  // moves the element's origin; in document flow the element's position is the
+  // layout's to decide, so dragging any grip resizes and lets the layout
+  // re-anchor. The result is visible live, which is the honest version of a
+  // gesture that cannot mean exactly what it means in Figma.
+  const HANDLES = [
+    ["nw", 0, 0, "nwse-resize"], ["n", 0.5, 0, "ns-resize"],
+    ["ne", 1, 0, "nesw-resize"], ["e", 1, 0.5, "ew-resize"],
+    ["se", 1, 1, "nwse-resize"], ["s", 0.5, 1, "ns-resize"],
+    ["sw", 0, 1, "nesw-resize"], ["w", 0, 0.5, "ew-resize"],
+  ];
+  const handleEls = HANDLES.map(([dir, , , cursor]) => {
+    const el = document.createElement("div");
+    el.setAttribute("data-dedup-ui", "");
+    el.setAttribute("data-dedup-handle", dir);
+    Object.assign(el.style, {
+      position: "fixed",
+      display: "none",
+      pointerEvents: "auto",
+      background: "#fff",
+      border: `1.5px solid ${ACCENT}`,
+      borderRadius: "2px",
+      boxSizing: "border-box",
+      cursor,
+      zIndex: String(Z + 3),
+    });
+    return el;
+  });
+
+  /** Canvas zoom, so handles keep a constant on-screen size. */
+  let canvasZoom = 1;
+  /** Which element the editor says may be resized — null when the selection's
+   * className is not statically editable, which is the same gate the
+   * inspector uses. No grips on something the write-back would refuse. */
+  let resizableId = null;
 
   // Staged-class preview rules (see applyValues). Declared here with the rest
   // of the chrome because mount() runs during script evaluation — anything it
@@ -121,6 +213,9 @@
     document.documentElement.appendChild(previewStyle);
     document.documentElement.appendChild(dropLine);
     document.documentElement.appendChild(dropBox);
+    document.documentElement.appendChild(busyStyle);
+    document.documentElement.appendChild(busyBox);
+    for (const el of handleEls) document.documentElement.appendChild(el);
   }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", mount);
@@ -251,6 +346,34 @@
     return v.replace(/["\\]/g, "\\$&");
   }
 
+  /**
+   * A path with this frame's dedup flags kept on it.
+   *
+   * The flags that change how a frame behaves — the hold, the offline cut —
+   * ride in its query string, because they have to reach the page before the
+   * app boots and the URL is the only channel that early. So any time the
+   * overlay sends the frame to a bare path, they would be dropped: an offline
+   * artboard would quietly come back online, a held one would run. The editor
+   * would have no idea, because the label it draws comes from its own state.
+   *
+   * Matched by prefix rather than by name on purpose. The names live in the
+   * boot script and in lib/origins.ts, two separately bundled worlds this file
+   * is a third of — one more copy of a list to keep in sync is one more way to
+   * lose a flag silently. `__dedup` is the convention; anything wearing it
+   * belongs to dedup and travels with the frame.
+   */
+  function withFlags(path) {
+    try {
+      const url = new URL(path, location.href);
+      new URLSearchParams(location.search).forEach((value, key) => {
+        if (key.indexOf("__dedup") === 0) url.searchParams.set(key, value);
+      });
+      return url.pathname + url.search + url.hash;
+    } catch {
+      return path;
+    }
+  }
+
   // --- structural edits (insert / remove / move) ----------------------------
 
   /** Inverses of the structural ops we applied, newest last. */
@@ -290,6 +413,13 @@
 
   function applyStructural() {
     resetStructural();
+    // The node the last insert put down at a given anchor. Two inserts placed
+    // `after` the same element are written into source one behind the other,
+    // but replayed naively they would land in the DOM the other way round —
+    // each one going directly after the anchor pushes the previous one along.
+    // A preview that disagrees with what the save writes is worse than no
+    // preview, and pasting twice in a row is the ordinary way to reach it.
+    const lastAfter = new Map();
     for (const op of program.structural) {
       if (op.op === "remove") {
         // Every instance: the source element is gone after save, so all of its
@@ -305,8 +435,12 @@
         applied.push({ kind: "move", ...origin(el) });
         placeNode(el, ref, op.position);
       } else if (op.op === "insert") {
-        const ref = byId(op.id);
+        let ref = byId(op.id);
         if (!ref) continue;
+        if (op.position === "after") {
+          const previous = lastAfter.get(op.id);
+          if (previous && previous.isConnected) ref = previous;
+        }
         const host = document.createElement("div");
         host.innerHTML = op.html;
         const node = host.firstElementChild;
@@ -318,8 +452,42 @@
         if (op.pendingId) node.setAttribute("data-dedup-id", op.pendingId);
         applied.push({ kind: "insert", node });
         placeNode(node, ref, op.position);
+        if (op.position === "after") lastAfter.set(op.id, node);
       }
     }
+  }
+
+  /**
+   * The rendered HTML of one element, for a copy's staged preview.
+   *
+   * A paste needs two renderings of the same thing, exactly as the palette
+   * does: the *source* comes from the write-back (the file is the truth about
+   * what will be written) and the *picture* comes from here, because only the
+   * page knows what that source turned into. Taken from the live DOM, so what
+   * the user sees pasted is what they were looking at when they copied.
+   *
+   * Stripped of dedup's own stamps on the way out. `data-dedup-id` especially:
+   * left in, the preview copy would answer to the same id as the element it
+   * came from, and every lookup in this file — select, hover, staged class
+   * patches, the layer tree — would start hitting whichever one the DOM
+   * happened to return first.
+   */
+  function reportElementHtml(id) {
+    const el = byId(id);
+    if (!el) return;
+    const clone = el.cloneNode(true);
+    for (const node of [clone, ...clone.querySelectorAll("*")]) {
+      // Overlay chrome never belongs to the page's own markup.
+      if (node !== clone && node.hasAttribute("data-dedup-ui")) {
+        node.remove();
+        continue;
+      }
+      for (const attr of [...node.attributes]) {
+        if (attr.name.startsWith("data-dedup-")) node.removeAttribute(attr.name);
+      }
+      node.removeAttribute("contenteditable");
+    }
+    post("element-html", { id: id, html: clone.outerHTML });
   }
 
   // --- inline text editing (FR-3.8) ---------------------------------------
@@ -338,6 +506,9 @@
   function beginTextEdit(id) {
     const el = byId(id);
     if (!el) return;
+    // Already typing into this one: re-running would end the edit and reselect
+    // all of its text, throwing away where the caret was.
+    if (el === editingEl) return;
     endTextEdit();
     editingEl = el;
     editingOriginal = el.textContent;
@@ -353,6 +524,11 @@
     } catch {
       // Selection APIs are best-effort; the caret still lands in the element.
     }
+    // The editor cannot see the caret, and it has a mode to show while one is
+    // on the canvas. Editing starting and stopping is reported from here —
+    // this is the only place that knows, since Escape, Enter, a click
+    // elsewhere and a re-render all end it without the editor being involved.
+    post("text-editing", { id: id });
     repaint();
   }
 
@@ -362,6 +538,7 @@
     editingEl.removeAttribute("data-dedup-editing");
     if (editingEl.blur) editingEl.blur();
     editingEl = null;
+    post("text-editing", { id: null });
   }
 
   document.addEventListener(
@@ -627,23 +804,102 @@
     return r;
   }
 
+  /** The element the editor says is being worked on, and the grid currently
+   *  laid out over it. */
+  let busyId = null;
+  let busyGrid = { cols: 0, rows: 0 };
+
+  /**
+   * Lay squares over an element, sized so they stay roughly square whatever
+   * the element's shape is, and capped so a full-page section does not become
+   * a thousand animated nodes.
+   *
+   * Rebuilt only when the count changes: repaint runs on every scroll, and
+   * re-creating the grid each time would restart every animation and leave
+   * the wave stuttering instead of travelling.
+   */
+  function paintBusy(r) {
+    const cols = Math.max(1, Math.min(18, Math.round(r.width / 26)));
+    const rows = Math.max(1, Math.min(12, Math.round(r.height / 26)));
+    if (busyGrid.cols === cols && busyGrid.rows === rows) return;
+    busyGrid = { cols: cols, rows: rows };
+    busyBox.style.gridTemplateColumns = "repeat(" + cols + ",1fr)";
+    busyBox.style.gridTemplateRows = "repeat(" + rows + ",1fr)";
+    busyBox.textContent = "";
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        const cell = document.createElement("i");
+        // Diagonal wave: neighbours are a beat apart, so it reads as movement
+        // across the section rather than every square blinking together.
+        cell.style.animationDelay = (((x + y) * 110) % 1600) + "ms";
+        busyBox.appendChild(cell);
+      }
+    }
+  }
+
   function repaint() {
+    const busyEl = busyId ? byId(busyId) : null;
+    if (busyEl && busyEl.isConnected) {
+      const r = position(busyBox, busyEl);
+      busyBox.style.display = "grid";
+      paintBusy(r);
+    } else {
+      busyBox.style.display = "none";
+    }
     if (hoverEl && hoverEl.isConnected) {
       const r = position(hoverBox, hoverEl);
       badge.textContent = labelOf(hoverEl);
       badge.style.display = "block";
-      const above = r.y >= 24;
+      // Above the element when there is room, tucked inside its top-left when
+      // it is against the top of the frame.
+      const above = r.y >= BADGE_H + 4;
       badge.style.left = r.x + "px";
-      badge.style.top = (above ? r.y - 22 : r.y + 2) + "px";
+      badge.style.top = (above ? r.y - BADGE_H - 2 : r.y + 2) + "px";
     } else {
       hoverBox.style.display = "none";
       badge.style.display = "none";
     }
     if (selectedEl && selectedEl.isConnected) {
-      position(selectBox, selectedEl);
+      const r = position(selectBox, selectedEl);
+      positionHandles(r);
     } else {
       selectBox.style.display = "none";
+      hideHandles();
     }
+  }
+
+  function hideHandles() {
+    for (const el of handleEls) el.style.display = "none";
+  }
+
+  /** Lay the eight grips on the selection's rect, sized in screen px. */
+  function positionHandles(r) {
+    // A resize in flight keeps its grips no matter what: they are under the
+    // pointer, and hiding one mid-gesture drops its pointer capture.
+    if (!resizing) {
+      const id = selectedEl && selectedEl.getAttribute("data-dedup-id");
+      // No grips unless the editor said this element's classes are editable,
+      // and none while a reparent drag owns the pointer.
+      if (!resizableId || id !== resizableId || (drag && drag.active)) {
+        hideHandles();
+        return;
+      }
+    }
+    // Constant on-screen size: the page is drawn at `canvasZoom`, so a grip
+    // that should read as 9px on screen is 9/zoom in page units.
+    const size = 9 / (canvasZoom || 1);
+    const half = size / 2;
+    handleEls.forEach((el, i) => {
+      const [, fx, fy] = HANDLES[i];
+      Object.assign(el.style, {
+        display: "block",
+        width: size + "px",
+        height: size + "px",
+        left: r.x + r.width * fx - half + "px",
+        top: r.y + r.height * fy - half + "px",
+        borderWidth: Math.max(1, 1.5 / (canvasZoom || 1)) + "px",
+      });
+    });
   }
 
   // --- messaging ------------------------------------------------------------
@@ -738,10 +994,23 @@
       applyProgram();
     } else if (m.type === "text-edit-begin") {
       beginTextEdit(m.id);
+    } else if (m.type === "text-edit-end") {
+      endTextEdit();
     } else if (m.type === "set-edit-mode") {
       dragEnabled = !!m.drag;
       insertArmed = !!m.insert;
       if (!insertArmed) hideDropIndicator();
+    } else if (m.type === "set-resizable") {
+      // The editor answers "may this element's size be edited?" from the
+      // write-back's own report, so the grips appear on exactly the elements
+      // a class edit would land on.
+      resizableId = m.id && m.enabled ? m.id : null;
+      repaint();
+    } else if (m.type === "set-zoom") {
+      // Handles are drawn in page units but must read as a fixed size on
+      // screen, so they need to know how far the canvas is scaled.
+      canvasZoom = typeof m.zoom === "number" && m.zoom > 0 ? m.zoom : 1;
+      repaint();
     } else if (m.type === "set-mode") {
       mode = m.mode === "browse" ? "browse" : "inspect";
       if (mode === "browse") {
@@ -761,6 +1030,13 @@
       repaint();
     } else if (m.type === "list-layers") {
       reportLayers(true);
+    } else if (m.type === "set-busy") {
+      busyId = typeof m.id === "string" ? m.id : null;
+      // The grid is rebuilt for whatever it lands on next.
+      if (!busyId) busyGrid = { cols: 0, rows: 0 };
+      repaint();
+    } else if (m.type === "copy-element") {
+      reportElementHtml(m.id);
     } else if (m.type === "list-files") {
       // Source files behind everything currently rendered (FR-5.1 canvas
       // scope). dedupId is "file@ordinal" — strip the ordinal.
@@ -805,7 +1081,7 @@
       // Snap this frame back to its pinned route after a navigation spawned
       // a new artboard. Soft first (react-router listens to popstate, no
       // reload); hard fallback if the router didn't take it.
-      const target = String(m.path || "/");
+      const target = withFlags(String(m.path || "/"));
       try {
         history.replaceState(null, "", target);
         window.dispatchEvent(new PopStateEvent("popstate", { state: null }));
@@ -834,7 +1110,7 @@
       // refresh /login. Both forms are a fresh document load, which is what
       // the session seed needs (it runs before the app boots).
       const target = typeof m.path === "string" ? m.path : null;
-      if (target && location.pathname !== target) location.replace(target);
+      if (target && location.pathname !== target) location.replace(withFlags(target));
       else location.reload();
     }
   });
@@ -920,10 +1196,128 @@
     dropBox.style.display = "none";
   }
 
+  // --- resize ---------------------------------------------------------------
+  //
+  // A resize is a class edit like any other: the editor turns the size this
+  // reports into `w-[…]`/`h-[…]` and stages it, so it previews, undoes, saves
+  // and commits exactly the way dragging a padding stepper does. Nothing here
+  // writes to the page permanently — the inline size below is live feedback
+  // for the duration of the gesture and is handed back to the staged-class
+  // preview on release.
+  const MIN_SIZE = 8;
+  /** ~60/sec: fast enough to feel continuous, slow enough that a drag is not
+   * hundreds of staged edits and postMessage round trips. */
+  const RESIZE_THROTTLE_MS = 16;
+  let resizeSeq = 0;
+
+  function startResize(e, dir) {
+    if (!selectedEl || !selectedEl.isConnected) return;
+    const r = selectedEl.getBoundingClientRect();
+    resizing = {
+      dir,
+      el: selectedEl,
+      x: e.clientX,
+      y: e.clientY,
+      w: r.width,
+      h: r.height,
+      // One id for the whole gesture: the editor folds every step into a
+      // single undo entry, the way a scrub does.
+      group: "resize-" + ++resizeSeq,
+      sent: null,
+      pending: null,
+      lastSent: 0,
+    };
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      e.target.setPointerCapture(e.pointerId);
+    } catch {
+      // Capture is an optimisation; the document listeners still fire.
+    }
+    post("resize-start", { id: selectedEl.getAttribute("data-dedup-id") });
+  }
+
+  function moveResize(e) {
+    const g = resizing;
+    const dx = e.clientX - g.x;
+    const dy = e.clientY - g.y;
+    const west = g.dir.includes("w");
+    const east = g.dir.includes("e");
+    const north = g.dir.includes("n");
+    const south = g.dir.includes("s");
+
+    let width = g.w;
+    let height = g.h;
+    if (east) width = g.w + dx;
+    if (west) width = g.w - dx;
+    if (south) height = g.h + dy;
+    if (north) height = g.h - dy;
+    width = Math.max(MIN_SIZE, Math.round(width));
+    height = Math.max(MIN_SIZE, Math.round(height));
+
+    // Immediate feedback, inline: waiting for the editor to stage a class and
+    // echo a preview rule back is a full postMessage round trip per pointer
+    // move, and the gesture would visibly trail the cursor.
+    if (east || west) g.el.style.width = width + "px";
+    if (north || south) g.el.style.height = height + "px";
+
+    // Throttle: pointermove fires far faster than the editor needs, and every
+    // report costs a staged edit plus a round trip back to every frame.
+    // Deliberately a clock rather than requestAnimationFrame — one less global
+    // to depend on, and the pending value below is what makes it safe.
+    g.pending = {
+      width: east || west ? width : null,
+      height: north || south ? height : null,
+    };
+    const now = Date.now();
+    if (now - g.lastSent < RESIZE_THROTTLE_MS) return;
+    flushResize(g, now);
+  }
+
+  /** Send the pending size, if it differs from the last one sent. */
+  function flushResize(g, now) {
+    const next = g.pending;
+    if (!next) return;
+    if (g.sent && g.sent.width === next.width && g.sent.height === next.height) {
+      return;
+    }
+    g.sent = next;
+    g.lastSent = now || Date.now();
+    post("resize", {
+      id: g.el.getAttribute("data-dedup-id"),
+      group: g.group,
+      width: next.width,
+      height: next.height,
+    });
+  }
+
+  function endResize() {
+    const g = resizing;
+    resizing = null;
+    if (!g) return;
+    // The throttle can swallow the last move, and the last move is the size
+    // the user actually chose — always commit it before letting go.
+    flushResize(g, 0);
+    // Hand the element back to the staged-class preview: the editor has by now
+    // staged `w-[…]`, and leaving an inline size on top would mask whatever it
+    // actually resolved to — including a size the class could not express.
+    g.el.style.removeProperty("width");
+    g.el.style.removeProperty("height");
+    post("resize-end", {});
+    repaint();
+  }
+
+  for (let i = 0; i < handleEls.length; i++) {
+    const dir = HANDLES[i][0];
+    handleEls[i].addEventListener("pointerdown", (e) => {
+      if (mode !== "inspect" || e.button !== 0) return;
+      startResize(e, dir);
+    });
+  }
+
   // Drag begins only after the pointer travels a few px, so a plain click on
   // an element still selects it.
   const DRAG_THRESHOLD = 4;
-  let drag = null;
 
   document.addEventListener(
     "pointerdown",
@@ -940,6 +1334,13 @@
   document.addEventListener(
     "pointermove",
     (e) => {
+      if (resizing) {
+        e.preventDefault();
+        e.stopPropagation();
+        moveResize(e);
+        repaint();
+        return;
+      }
       if (insertArmed && mode === "inspect") {
         showDropIndicator(dropTargetAt(e.clientX, e.clientY, null));
         return;
@@ -964,6 +1365,12 @@
   document.addEventListener(
     "pointerup",
     (e) => {
+      if (resizing) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        endResize();
+        return;
+      }
       if (insertArmed && mode === "inspect") {
         const target = dropTargetAt(e.clientX, e.clientY, null);
         hideDropIndicator();
@@ -1030,15 +1437,24 @@
         (e.target instanceof HTMLElement && e.target.isContentEditable);
       if (typing) return;
       const meta = e.metaKey || e.ctrlKey;
+      // ⌘C/⌘X/⌘V only when the page holds no text selection of its own: the
+      // browser's copy is what someone highlighting a paragraph means, and
+      // taking it would be the wrong answer to an unambiguous gesture.
+      const textSelected = !(window.getSelection()?.isCollapsed ?? true);
       const forwarded =
-        (meta && (e.key === "s" || e.key === "z" || /^[123]$/.test(e.key))) ||
+        (meta &&
+          (e.key === "s" ||
+            e.key === "z" ||
+            (!textSelected && (e.key === "c" || e.key === "x" || e.key === "v")) ||
+            /^[123]$/.test(e.key))) ||
         (!meta &&
           (e.key === "Escape" ||
             e.key === "Delete" ||
             e.key === "Backspace" ||
             e.key === "v" ||
             e.key === "h" ||
-            e.key === "b"));
+            e.key === "b" ||
+            e.key === "t"));
       if (!forwarded) return;
       if (drag?.active && e.key === "Escape") {
         drag = null;

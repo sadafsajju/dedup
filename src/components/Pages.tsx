@@ -41,6 +41,8 @@ export function PagesTab() {
   const devAltUrl = useStore((s) => s.devAltUrl);
   const heldRoutes = useStore((s) => s.heldRoutes);
   const toggleHold = useStore((s) => s.toggleHold);
+  const offlineRoutes = useStore((s) => s.offlineRoutes);
+  const toggleOffline = useStore((s) => s.toggleOffline);
 
   useEffect(() => {
     if (devUrl && detectedRoutes === null) void fetchDetectedRoutes();
@@ -152,6 +154,24 @@ export function PagesTab() {
                     }`}
                   >
                     {heldRoutes[route] ? "held" : "hold"}
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleOffline(route);
+                    }}
+                    title={
+                      offlineRoutes[route]
+                        ? "Put this page back on the network — its requests reach the world again."
+                        : "Render this page with no internet: the app's own requests fail, so its offline and error states show. The dev server keeps working, so the frame still reloads as you edit."
+                    }
+                    className={`shrink-0 rounded px-1 ${
+                      offlineRoutes[route]
+                        ? "bg-warn/15 text-warn"
+                        : "text-ink-faint opacity-0 group-hover:opacity-100 hover:text-ink"
+                    }`}
+                  >
+                    {offlineRoutes[route] ? "offline" : "cut net"}
                   </button>
                   <SessionToggle
                     mode={sessionModes[route] ?? "auto"}

@@ -13,7 +13,9 @@ export function ConsoleDrawer() {
   const clearLogs = useStore((s) => s.clearLogs);
   const errors = useStore((s) => s.errors);
   const askAiToFix = useStore((s) => s.askAiToFix);
-  const canAsk = useStore((s) => s.selected !== null);
+  // No selection needed: the agent reads the project itself, which is the
+  // only workable answer when the error is *why* nothing rendered.
+  const canAsk = useStore((s) => s.activeAiBackend() !== null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
 
@@ -95,8 +97,8 @@ export function ConsoleDrawer() {
                   disabled={!canAsk}
                   title={
                     canAsk
-                      ? "Send this error to the inspector chat"
-                      : "Select an element first — the chat edits one file at a time"
+                      ? "Send this error to the chat"
+                      : "Connect an AI backend first (top-bar AI switch)"
                   }
                   className="shrink-0 rounded border border-line px-1.5 py-0.5 text-2xs text-ink-dim hover:text-ink disabled:opacity-40"
                 >

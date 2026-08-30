@@ -19,7 +19,10 @@
     "test:origins": "node plugin-src/run-ts.mjs plugin-src/origins.test.mts",
     "test:merge": "node plugin-src/merge.test.mjs",
     "test:proposal": "node plugin-src/run-ts.mjs plugin-src/merge.proposal.test.mts",
-    "test:highlight": "node plugin-src/run-ts.mjs plugin-src/highlight.test.mts"
+    "test:highlight": "node plugin-src/run-ts.mjs plugin-src/highlight.test.mts",
+    "test:html": "node plugin-src/html.test.mjs",
+    "test:openprefs": "node plugin-src/run-ts.mjs plugin-src/openprefs.test.mts",
+    "test:prompts": "node plugin-src/run-ts.mjs plugin-src/prompthistory.test.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
@@ -41,6 +44,7 @@
     "@vitejs/plugin-react": "^4.6.0",
     "esbuild": "^0.28.1",
     "magic-string": "^0.30.21",
+    "parse5": "^8.0.1",
     "tailwindcss": "^4.1.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"

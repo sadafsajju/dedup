@@ -44,7 +44,11 @@ export function TopBar() {
   const actions = useStore((s) => s.actions);
   const saving = useStore((s) => s.saving);
   const saveError = useStore((s) => s.saveError);
+  const notice = useStore((s) => s.notice);
+  const discardAllEdits = useStore((s) => s.discardAllEdits);
   const lastSave = useStore((s) => s.lastSave);
+  const pendingEdit = useStore((s) => s.pendingEdit);
+  const setInspectorTab = useStore((s) => s.setInspectorTab);
   const saveAll = useStore((s) => s.saveAll);
   const scanning = useStore((s) => s.scanning);
   const categorizing = useStore((s) => s.categorizing);
@@ -94,9 +98,27 @@ export function TopBar() {
       <div className="flex items-center gap-2 min-w-0">
         <span className="text-[13px] font-medium truncate">{project?.name}</span>
         {git?.isRepo && (
-          <span className="inline-flex items-center gap-1 text-2xs text-ink-dim bg-surface-2 rounded px-1.5 py-0.5 shrink-0">
+          <span
+            className="inline-flex items-center gap-1 text-2xs text-ink-dim bg-surface-2 rounded px-1.5 py-0.5 shrink-0"
+            title={
+              git.isDirty
+                ? `${git.changedFiles} uncommitted change${git.changedFiles === 1 ? "" : "s"} in this repo. dedup commits only its own files, on its own branch.`
+                : "Working tree is clean"
+            }
+          >
             <Share2Icon width={11} height={11} />
             <span className="font-mono">{git.branch ?? "?"}</span>
+            {/* The compatibility card used to be the only place the dirty
+                tree was ever mentioned, and it is now skipped on a project
+                whose verdict the user has already seen. The signal moves
+                here, where it stays visible for the whole session instead of
+                flashing past once. */}
+            {git.isDirty && (
+              <span className="text-warn tabular-nums">
+                {git.changedFiles}
+                <span className="ml-0.5">●</span>
+              </span>
+            )}
           </span>
         )}
       </div>
@@ -164,14 +186,58 @@ export function TopBar() {
 
       {/* Save state + staged-diff review (FR-3.7, FR-4.5) */}
       <div className="relative flex items-center gap-1.5">
-        {saveError ? (
-          <button
-            onClick={saveAll}
-            className="rounded-lg px-2.5 py-1 text-2xs bg-danger/15 text-danger hover:bg-danger/25"
-            title={saveError}
+        {/* Whatever the last gesture had to say — what was copied, or why it
+            couldn't be. Its own slot, not part of the chain below: a paste
+            says something *and* leaves an edit staged, so both must show. */}
+        {notice ? (
+          <span
+            className="max-w-[24rem] truncate rounded-lg bg-surface-2 px-2.5 py-1 text-2xs text-ink-dim"
+            title={notice}
           >
-            Save failed — retry
+            {notice}
+          </span>
+        ) : null}
+        {/* A previewed chat edit is on disk and on the canvas but committed
+            to nothing. It has to be visible from outside the chat tab, or a
+            user who switched away has uncommitted AI edits and no sign of it. */}
+        {pendingEdit?.previewing ? (
+          <button
+            onClick={() => setInspectorTab("chat")}
+            className="rounded-lg px-2.5 py-1 text-2xs bg-accent/15 text-accent hover:bg-accent/25"
+            title={`${pendingEdit.summary} — previewing ${pendingEdit.files.length} file${
+              pendingEdit.files.length === 1 ? "" : "s"
+            }, not committed`}
+          >
+            AI preview — keep or discard
           </button>
+        ) : saveError ? (
+          // The reason, not just the fact. It used to live in the button's
+          // tooltip, which is where a save that can never succeed became
+          // indistinguishable from one worth retrying — and the staged edits
+          // block the chat too, so "retry" was the only thing on offer and it
+          // was the one thing that could not work.
+          <>
+            <span
+              className="max-w-[22rem] truncate text-2xs text-danger"
+              title={saveError}
+            >
+              Save failed: {saveError}
+            </span>
+            <button
+              onClick={saveAll}
+              disabled={saving}
+              className="rounded-lg px-2.5 py-1 text-2xs bg-danger/15 text-danger hover:bg-danger/25 disabled:opacity-60"
+            >
+              Retry
+            </button>
+            <button
+              onClick={discardAllEdits}
+              title="Throw the staged edits away. Nothing was written, so there is nothing to put back."
+              className="rounded-lg px-2.5 py-1 text-2xs bg-surface-2 text-ink-dim hover:text-ink"
+            >
+              Discard edits
+            </button>
+          </>
         ) : dirtyCount > 0 ? (
           <>
             <button

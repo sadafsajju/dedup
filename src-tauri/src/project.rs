@@ -15,6 +15,14 @@ pub struct ProjectInfo {
     pub has_tailwind: bool,
     pub has_typescript: bool,
     pub has_git: bool,
+    /// True when the folder holds nothing to open — the launch screen offers
+    /// to scaffold a starter into it instead of a compatibility verdict.
+    pub is_empty: bool,
+    /// For a static site whose pages don't sit at the root (`site/`, `www/`,
+    /// `public/`), the folder the dev server serves — relative to `root`.
+    /// Element ids stay relative to `root` regardless, so one project has one
+    /// path vocabulary.
+    pub static_dir: Option<String>,
     /// The script we'll run to start the dev server, if we found one.
     pub dev_script: Option<String>,
     /// Overall verdict + the one-line summary rendered on the compat card.
@@ -51,6 +59,10 @@ impl PackageManager {
 pub enum Framework {
     Vite,
     Next,
+    /// A plain HTML site: no build step, no package manager. dedup serves it
+    /// itself and stamps the served markup — the file *is* the source, so the
+    /// element↔source mapping is 1:1 rather than compiled.
+    Static,
     Unknown,
 }
 
@@ -65,6 +77,73 @@ pub enum SupportLevel {
     Unsupported,
 }
 
+/// Entries that don't count as content: a folder holding only these is one
+/// the user just made, not a project they want opened read-only.
+const IGNORABLE: [&str; 6] = [
+    ".git",
+    ".DS_Store",
+    ".idea",
+    ".vscode",
+    "Thumbs.db",
+    ".gitkeep",
+];
+
+/// True when there is nothing here to open. A fresh `git init` counts as
+/// empty: the repo is dedup's safety model, not the user's work.
+fn is_empty_folder(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false; // unreadable is a different problem, reported as unsupported
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !IGNORABLE.contains(&name.as_ref()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Folders a hand-built site's pages commonly live in, in the order we'd
+/// guess. `""` (the project root) is tried first.
+const STATIC_DIRS: [&str; 6] = ["", "public", "site", "www", "docs", "src"];
+
+/// Where this project's static pages are, relative to the root — `Some("")`
+/// for the root itself — or None when there is no HTML site here.
+fn find_static_dir(root: &Path) -> Option<String> {
+    STATIC_DIRS
+        .iter()
+        .find(|d| root.join(d).join("index.html").exists())
+        .map(|d| d.to_string())
+}
+
+/// Tailwind in a site with no package manager: the Play CDN, or a stylesheet
+/// that was built from it. Read from the pages themselves, since there is no
+/// dependency list to consult.
+fn detect_static_tailwind(root: &Path, dir: &str) -> bool {
+    let base = root.join(dir);
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return false;
+    };
+    for entry in entries.flatten().take(200) {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "html" | "htm" | "css") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Only look at the head of a stylesheet — a compiled Tailwind build is
+        // megabytes, and its banner is in the first few lines.
+        let head: String = text.chars().take(8192).collect();
+        if head.contains("tailwindcss") || head.contains("@tailwind") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Inspect `root` and return a compatibility report. Never fails hard — an
 /// unreadable or non-project folder comes back as `Unsupported` with reasons.
 pub fn detect(root: &str) -> ProjectInfo {
@@ -73,16 +152,107 @@ pub fn detect(root: &str) -> ProjectInfo {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
+    let has_git = root_path.join(".git").exists();
+
+    // An empty folder isn't an unsupported project — it's a project that
+    // doesn't exist yet, and the launch screen offers to start one. Answered
+    // before anything else so no detection heuristic gets to call it a
+    // failure.
+    if is_empty_folder(&root_path) {
+        return ProjectInfo {
+            root: root.to_string(),
+            name,
+            package_manager: detect_package_manager(&root_path),
+            framework: Framework::Unknown,
+            has_tailwind: false,
+            has_typescript: false,
+            has_git,
+            is_empty: true,
+            static_dir: None,
+            dev_script: None,
+            support: SupportLevel::Unsupported,
+            summary: "Empty folder — pick something to start here.".to_string(),
+            warnings: Vec::new(),
+        };
+    }
 
     let pkg_path = root_path.join("package.json");
     let pkg = read_package_json(&pkg_path);
 
     let package_manager = detect_package_manager(&root_path);
     let framework = detect_framework(&root_path, pkg.as_ref());
+
+    // A plain HTML site takes a different route through everything: dedup
+    // serves it, so there is no dev script to find, no package manager to
+    // drive, and no typecheck to gate on. Reported on its own terms rather
+    // than as a JS project missing most of its parts.
+    if framework == Framework::Static {
+        let dir = find_static_dir(&root_path).unwrap_or_default();
+        let has_tailwind = detect_static_tailwind(&root_path, &dir);
+        let mut warnings = Vec::new();
+        if !dir.is_empty() {
+            warnings.push(format!(
+                "Pages found in `{dir}/` — dedup serves that folder as the site root."
+            ));
+        }
+        if !has_tailwind {
+            warnings.push(
+                "No Tailwind in this site. Inspection, text and structure edits work as \
+                 normal, but the Style panel writes Tailwind classes, which won't render \
+                 until Tailwind is on the page."
+                    .into(),
+            );
+        }
+        warnings.push(
+            "Duplicate detection reads React components, so the Scan tab is off for a \
+             static site. Everything else on the canvas works."
+                .into(),
+        );
+        warnings.push(
+            "No typecheck or build script to run, so those safety gates report `skipped` \
+             rather than passed."
+                .into(),
+        );
+        if !has_git {
+            warnings.push(
+                "No git repository. dedup's safety model requires git for write operations."
+                    .into(),
+            );
+        }
+        let support = if has_git {
+            SupportLevel::Full
+        } else {
+            SupportLevel::Partial
+        };
+        let summary = format!(
+            "Static HTML{} — {}",
+            if has_tailwind { " + Tailwind" } else { "" },
+            if support == SupportLevel::Full {
+                "dedup serves and edits it directly"
+            } else {
+                "partially supported"
+            },
+        );
+        return ProjectInfo {
+            root: root.to_string(),
+            name,
+            package_manager,
+            framework,
+            has_tailwind,
+            has_typescript: false,
+            has_git,
+            is_empty: false,
+            static_dir: (!dir.is_empty()).then_some(dir),
+            dev_script: None,
+            support,
+            summary,
+            warnings,
+        };
+    }
+
     let has_tailwind = detect_tailwind(&root_path, pkg.as_ref());
     let has_typescript = root_path.join("tsconfig.json").exists()
         || dep_present(pkg.as_ref(), "typescript");
-    let has_git = root_path.join(".git").exists();
     let dev_script = pkg
         .as_ref()
         .and_then(|p| p.scripts.get("dev").cloned())
@@ -170,6 +340,8 @@ pub fn detect(root: &str) -> ProjectInfo {
         has_tailwind,
         has_typescript,
         has_git,
+        is_empty: false,
+        static_dir: None,
         dev_script,
         support,
         summary,
@@ -190,6 +362,7 @@ fn build_summary(
     let fw = match framework {
         Framework::Vite => "Vite",
         Framework::Next => "Next.js",
+        Framework::Static => "Static HTML",
         Framework::Unknown => "Unknown",
     };
     let mut parts = vec![fw.to_string()];
@@ -258,6 +431,12 @@ fn detect_framework(root: &Path, pkg: Option<&PackageJson>) -> Framework {
         || root.join("vite.config.mjs").exists()
     {
         return Framework::Vite;
+    }
+    // Last, and only last: a folder with pages but no bundler is a site dedup
+    // can serve itself. Checked after Vite and Next so their own index.html
+    // never gets mistaken for one.
+    if find_static_dir(root).is_some() {
+        return Framework::Static;
     }
     Framework::Unknown
 }
@@ -375,6 +554,102 @@ mod tests {
         );
         let info = detect(dir.to_str().unwrap());
         assert_eq!(info.framework, Framework::Next);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An empty folder is not a failed project — it is a project that does
+    /// not exist yet, and the launch screen offers to start one.
+    #[test]
+    fn an_empty_folder_reports_itself_as_empty_not_as_a_failure() {
+        let dir = temp_dir("blank");
+        let info = detect(dir.to_str().unwrap());
+        assert!(info.is_empty);
+        assert!(info.warnings.is_empty(), "nothing is wrong with an empty folder");
+
+        // A fresh `git init` is still empty: the repo is dedup's safety model,
+        // not the user's work.
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".DS_Store"), "").unwrap();
+        assert!(detect(dir.to_str().unwrap()).is_empty);
+
+        // One real file and it is a project to be judged on its merits.
+        write(&dir, "notes.md", "mine");
+        assert!(!detect(dir.to_str().unwrap()).is_empty);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detects_a_plain_html_site() {
+        let dir = temp_dir("site");
+        write(&dir, "index.html", "<h1>hi</h1>");
+        write(&dir, "style.css", "body{}");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Static);
+        assert!(!info.is_empty);
+        assert_eq!(info.static_dir, None, "pages at the root need no subfolder");
+        assert_eq!(info.support, SupportLevel::Full);
+        assert!(info.summary.starts_with("Static HTML"), "{}", info.summary);
+        // TypeScript's absence is not a complaint to make about a static site.
+        assert!(
+            !info.warnings.iter().any(|w| w.contains("TypeScript")),
+            "{:?}",
+            info.warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finds_pages_in_a_subfolder_and_says_so() {
+        let dir = temp_dir("subsite");
+        std::fs::create_dir_all(dir.join("www")).unwrap();
+        std::fs::write(dir.join("www/index.html"), "<h1>hi</h1>").unwrap();
+
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Static);
+        assert_eq!(info.static_dir.as_deref(), Some("www"));
+        assert!(
+            info.warnings.iter().any(|w| w.contains("`www/`")),
+            "{:?}",
+            info.warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Play CDN is how a hand-written page gets Tailwind, and it is the
+    /// difference between the Style panel doing something and doing nothing.
+    #[test]
+    fn reads_tailwind_off_the_page_when_there_is_no_dependency_list() {
+        let dir = temp_dir("cdnsite");
+        write(
+            &dir,
+            "index.html",
+            "<script src=\"https://cdn.tailwindcss.com\"></script><h1 class=\"p-4\">hi</h1>",
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Static);
+        assert!(info.has_tailwind);
+        assert!(
+            !info.warnings.iter().any(|w| w.contains("No Tailwind")),
+            "{:?}",
+            info.warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Vite project has an index.html too. Static detection must never win
+    /// that race, or every React app would be served as flat files.
+    #[test]
+    fn a_vite_projects_index_html_is_not_a_static_site() {
+        let dir = temp_dir("viteindex");
+        write(&dir, "index.html", "<div id=\"root\"></div>");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^5"}}"#,
+        );
+        assert_eq!(detect(dir.to_str().unwrap()).framework, Framework::Vite);
         std::fs::remove_dir_all(&dir).ok();
     }
 

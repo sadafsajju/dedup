@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# TypeScript build output and incremental caches. `pnpm build` runs tsc, which
+# emits these next to their sources; they are derived from vite.config.ts and
+# the tsconfigs and have no business in the tree.
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts

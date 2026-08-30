@@ -66,7 +66,56 @@ export function discoverNextRoutes(root) {
   return [...routes];
 }
 
-export function discoverRoutes(root) {
+/**
+ * Routes of a plain static site: every `.html` file is its own URL. Unlike
+ * the framework scanners above this needs no heuristics — the filesystem is
+ * the routing table, exactly, which is the one thing a static site makes easy.
+ *
+ * `index.html` becomes the directory's route ("/", "/docs/"), everything else
+ * keeps its extension because that is genuinely the URL the browser asks for.
+ */
+export function discoverStaticRoutes(root) {
+  const routes = new Set();
+  const stack = [""];
+  let seen = 0;
+  while (stack.length) {
+    const sub = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(path.join(root, sub), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (/^\.|^(node_modules|dist|build|coverage|vendor)$/.test(e.name)) continue;
+      const rel = sub ? `${sub}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (rel.split("/").length < 4) stack.push(rel);
+        continue;
+      }
+      if (!e.name.endsWith(".html") || ++seen > 200) continue;
+      const route =
+        e.name === "index.html" ? `/${sub ? sub + "/" : ""}` : `/${rel}`;
+      routes.add(route);
+    }
+  }
+  return [...routes];
+}
+
+/**
+ * The project's routes. `kind` is the framework the Rust core already
+ * detected — passed in rather than re-guessed here, because "does this folder
+ * have a router or a pile of .html files" is exactly the question detection
+ * already answered, and a second opinion could disagree with the first.
+ */
+export function discoverRoutes(root, kind) {
+  if (kind === "static") {
+    const statics = discoverStaticRoutes(root);
+    return (statics.length ? statics : ["/"])
+      .sort((a, b) => (a === "/" ? -1 : b === "/" ? 1 : a.localeCompare(b)))
+      .slice(0, 40);
+  }
+
   const routes = new Set(["/", ...discoverNextRoutes(root)]);
   const srcDir = path.join(root, "src");
   const stack = [fs.existsSync(srcDir) ? srcDir : root];

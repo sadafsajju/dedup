@@ -5,10 +5,16 @@ import {
   agentPrompt,
   commitSession,
   gitStatus,
+  copyElement,
+  importAgentAsset,
   inspectElement,
   loadCategories,
   loadScanResult,
   readSource,
+  writeSources,
+  revertSources,
+  listProjectFiles,
+  grepProject,
   saveCategories,
   scanProject,
   applyEdits,
@@ -40,8 +46,22 @@ import {
 } from "./visualPass";
 import { generateSeed } from "./session";
 import { resolveOrigin } from "./origins";
-import { buildEditPrompt, runChatPrompt } from "./chat";
-import { applyEditBlocks, parseChatReply } from "./chatEdits";
+import {
+  buildTurnPrompt,
+  formatToolResult,
+  isHtmlFile,
+  runChatPrompt,
+  systemPromptFor,
+  type ChatAttachment,
+  type ChatTurn,
+} from "./chat";
+import {
+  MAX_TOOL_ROUNDS,
+  applyProgram,
+  parseChatReply,
+  type ChatReply,
+  type ToolCall,
+} from "./chatEdits";
 import {
   categorizeComponents,
   needingCategorization,
@@ -50,6 +70,7 @@ import {
   type CategoryCache,
 } from "./categorize";
 import {
+  requestElementHtml,
   requestFrameFiles,
   requestFrameSizes,
   sendToFrame,
@@ -59,16 +80,28 @@ import {
   isPendingId,
   isValueAction,
   opsForFile,
+  stagingConflict,
+  withoutAction,
   PENDING_PREFIX,
   SCAN_SCHEMA,
   targetOf,
   VIEWPORTS,
 } from "./types";
 import {
+  KNOBS,
+  fromTokens,
+  setKnob,
+  sizeClass,
+  toTokens,
+} from "./tailwind";
+import {
+  classAttrFor,
   classNameOf,
   PALETTE,
   parseSimpleElement,
   textOf,
+  withAttr,
+  withText,
   type InsertKind,
 } from "./palette";
 import { foldLine, type ParsedError } from "./errors";
@@ -76,11 +109,13 @@ import { CLI_AGENTS } from "./types";
 import type {
   AgentState,
   ChatMessage,
+  Clipboard,
   ChatSession,
   CliAgent,
   GateResult,
   HistoryEntry,
   MergeSession,
+  PendingEdit,
   TrashEntry,
   DevServerStatus,
   GitStatus,
@@ -95,7 +130,9 @@ import type {
   ScanResult,
   SelectedElement,
   SessionSeed,
+  SnippetLang,
   SidebarTab,
+  Tool,
   DropPosition,
   EditAction,
   EditTarget,
@@ -140,7 +177,7 @@ interface AppState {
   viewportId: Viewport["id"];
   /** Active canvas tool (FR-6.1): select = inspect on click, hand = drag to
    * pan, browse = clicks pass through so the user can navigate their app. */
-  tool: "select" | "hand" | "browse";
+  tool: Tool;
   zoom: number;
   /** Canvas pan offset in px — where the frame's origin sits (FR-6.1). */
   pan: { x: number; y: number };
@@ -174,6 +211,11 @@ interface AppState {
   /** Artboards frozen on their first screen, so a splash or interstitial can
    * be inspected and edited instead of vanishing (FR-6.3). */
   heldRoutes: Record<string, true>;
+  /** Artboards rendering with the app's network cut, so its no-internet
+   * state — the error and empty screens nobody can otherwise reach — is on
+   * the canvas to look at and style. The dev server's own traffic is left
+   * alone, so the frame still hot-reloads while the app inside it fails. */
+  offlineRoutes: Record<string, true>;
   /** Rendered element tree per page artboard (FR-6.2), pushed by each
    * frame's overlay on DOM mutations — what the Layers tab draws. */
   layers: Record<string, LayerNode[]>;
@@ -231,9 +273,18 @@ interface AppState {
   draggingId: string | null;
   /** Palette entry armed for the next canvas click (insert tool). */
   insertKind: InsertKind | null;
+  /** What a copy or a cut put down, until the next one replaces it. Not
+   * the system clipboard: what is being carried is a piece of the user's
+   * source with a rendering attached, and neither half survives a round trip
+   * through plain text. */
+  clipboard: Clipboard | null;
   saving: boolean;
   lastSave: { branch: string; hash: string } | null;
   saveError: string | null;
+  /** A passing message about the gesture just made — what was copied, or why
+   * it could not be. Distinct from `saveError`, which is specifically a save
+   * that failed and offers a retry. Clears itself. */
+  notice: string | null;
 
   sidebarTab: SidebarTab;
 
@@ -244,6 +295,11 @@ interface AppState {
   chatSessions: ChatSession[];
   activeChatId: string | null;
   chatBusy: boolean;
+  /** The edit the agent has proposed and the user hasn't resolved yet — a
+   *  diff on screen, nothing on disk. One at a time: a second proposal is
+   *  computed against file contents the first one would have changed, so
+   *  holding two would mean holding one that is quietly wrong. */
+  pendingEdit: PendingEdit | null;
 
   // Duplicate scan (FR-5.x).
   scanning: boolean;
@@ -313,7 +369,7 @@ interface AppState {
   askAiToFix: () => void;
   toggleConsole: (open?: boolean) => void;
   setViewport: (id: Viewport["id"]) => void;
-  setTool: (tool: "select" | "hand" | "browse") => void;
+  setTool: (tool: Tool) => void;
   setZoom: (zoom: number) => void;
   setPan: (pan: { x: number; y: number }) => void;
   /** Atomic zoom+pan update so zoom-toward-cursor never flickers. */
@@ -336,6 +392,9 @@ interface AppState {
   /** Freeze an artboard on its first screen (reloads it into the hold), or
    * let a frozen one continue. */
   toggleHold: (route: string) => void;
+  /** Cut (or restore) one artboard's network. Takes effect on the reload the
+   * flag change causes — it has to be armed before the app boots. */
+  toggleOffline: (route: string) => void;
   /** Dev-server origin a route's frame should load from — the one place the
    * explicit choice and the automatic fallback are reconciled. */
   originForRoute: (route: string) => string | null;
@@ -378,27 +437,61 @@ interface AppState {
   effectiveText: () => string | null;
   /** Append one action to the staged program and re-sync the canvas.
    * `collapse` folds it into the previous action instead (drag scrubs). */
-  stage: (action: EditAction, collapse?: (prev: EditAction) => boolean) => void;
+  /** Add one action to the staged program. Returns false when it was refused
+   *  — a program the write-back could not save is never staged in the first
+   *  place (see `stagingConflict`), so callers that chain off a stage must
+   *  check rather than assume. */
+  stage: (action: EditAction, collapse?: (prev: EditAction) => boolean) => boolean;
   /** Stage a class edit + live-patch the canvas (FR-3.7). `group` ties the
    * edit to one drag gesture so scrubbing costs a single undo step. */
   applyClassEdit: (next: string, group?: string) => void;
   /** Stage a static-text edit on the selection. */
   applyTextEdit: (next: string) => void;
+  /** Size the selection from a canvas resize gesture. `group` collapses the
+   * whole drag into one undo step, the way a scrub does. */
+  resizeSelected: (
+    width: number | null,
+    height: number | null,
+    group: string,
+  ) => void;
   /** Stage deletion of the selected element (Delete/⌫). */
   removeSelected: () => void;
   /** Stage a move/reparent, as reported by a canvas drag. */
   moveElement: (fromId: string, toId: string, position: DropPosition) => void;
   /** Stage an insert of a palette element against a reference node. */
   insertElement: (kind: InsertKind, toId: string, position: DropPosition) => void;
+  /** Put the selected element on dedup's clipboard (⌘C). */
+  copySelected: () => Promise<void>;
+  /** Copy the selection, then stage its deletion (⌘X). */
+  cutSelected: () => Promise<void>;
+  /** Stage an insert of whatever is on the clipboard, against the selection
+   * (⌘V). Placed as a sibling after it, or inside it when a sibling is not a
+   * legal place for the copy to go. */
+  pasteClipboard: () => Promise<void>;
+  /** Say something in passing, and take it back after a few seconds. */
+  setNotice: (message: string | null) => void;
   setDragging: (dedupId: string | null) => void;
+  /** The element the caret is currently in on the canvas, or null. Reported
+   * by the overlay, which is the only side that knows: Escape, Enter, a click
+   * elsewhere and a re-render all end an edit without the editor's help. */
+  textEditing: string | null;
+  /** True when the user chose the text tool deliberately (the T button or
+   * shortcut), so it stays put after an edit ends. A double-click borrows the
+   * tool for one edit and hands it back — the gesture was "edit this", not
+   * "switch modes". */
+  textToolSticky: boolean;
+  setTextEditing: (dedupId: string | null) => void;
   /** A canvas double-click asking to type into an element — allowed only when
    * the write-back says that element's text is editable. */
-  requestTextEdit: (dedupId: string) => void;
+  requestTextEdit: (dedupId: string) => Promise<void>;
   setInsertKind: (kind: InsertKind | null) => void;
   /** Re-send the staged program to the canvas (a frame reloaded). */
   resyncCanvas: () => void;
   /** Discard one staged action by list position (review panel), redoable. */
   revertAction: (index: number) => void;
+  /** Throw the whole staged program away. The way out of a program that
+   * cannot be saved — every other exit from one goes through a save. */
+  discardAllEdits: () => void;
   undo: () => void;
   redo: () => void;
   /** Write staged edits to source, commit on the session branch (FR-4.x). */
@@ -412,6 +505,10 @@ interface AppState {
   /** Chat instruction for the selected element → AI edit → gated write +
    * commit on the session branch. */
   sendChat: (instruction: string) => Promise<void>;
+  /** Commit the previewed proposal to the session branch. */
+  acceptChatEdit: () => Promise<void>;
+  /** Put the files back exactly as they were and drop the proposal. */
+  rejectChatEdit: () => Promise<void>;
   /** Start a fresh chat (created for real on the first message). */
   newChatSession: () => void;
   selectChatSession: (id: string | null) => void;
@@ -467,6 +564,84 @@ interface AppState {
   emptyTrash: () => Promise<void>;
   /** Apply cached categories (no API call) for the current scan result. */
   applyCachedCategories: () => Promise<void>;
+}
+
+/**
+ * The `inspect` call behind the current selection, while it is still in
+ * flight. Not store state — nothing renders it; it exists so an action can
+ * *wait* for the selection's capabilities rather than read a null and give up.
+ *
+ * That matters for exactly one gesture. A double-click's two clicks both
+ * select, and the answer to "may I type into this?" comes from a node sidecar
+ * spawn that usually has not returned by the time `dblclick` fires. Dropping
+ * the request there made double-click-to-edit work intermittently, which read
+ * as broken.
+ */
+let sourceInfoPending: { id: string; done: Promise<void> } | null = null;
+
+/**
+ * The element's capabilities as the write-back reports them, waiting for an
+ * in-flight lookup when there is one. Null when the selection moved on.
+ */
+async function sourceInfoFor(
+  get: () => AppState,
+  dedupId: string,
+): Promise<NodeInfo | null> {
+  const now = get();
+  if (now.selected?.dedupId === dedupId && now.sourceInfo) return now.sourceInfo;
+  if (sourceInfoPending?.id === dedupId) {
+    await sourceInfoPending.done;
+    const after = get();
+    return after.selected?.dedupId === dedupId ? after.sourceInfo : null;
+  }
+  return null;
+}
+
+/**
+ * Take a previewed edit back off the disk. Returns an error string when some
+ * file could not be restored, so the caller can say so rather than leaving the
+ * user believing their tree is clean when it isn't.
+ */
+async function revertPreview(
+  root: string,
+  edit: PendingEdit,
+): Promise<string | null> {
+  if (!edit.previewing) return null;
+  try {
+    const res = await revertSources(root, [
+      ...edit.files.map((f) => [f.file, f.before] as [string, string | null]),
+      // An imported image is a new file by construction — dedup refuses to
+      // import over an existing one — so putting the tree back means removing
+      // it, which is what a null restores to.
+      ...edit.assets.map((a) => [a.file, null] as [string, string | null]),
+    ]);
+    return res.ok ? null : (res.error ?? "restore failed");
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
+ * Rewrite one message in the active chat session — how a proposal records
+ * what became of it (accepted with its commit, rejected, superseded). The
+ * transcript is the audit trail for AI edits, so an outcome that never got
+ * written back would leave it claiming a change that did not happen.
+ */
+function patchChatMessage(
+  set: (fn: (s: AppState) => Partial<AppState>) => void,
+  messageId: string,
+  patch: Partial<ChatMessage>,
+) {
+  set((s) => {
+    const sessions = s.chatSessions.map((session) => ({
+      ...session,
+      messages: session.messages.map((m) =>
+        m.id === messageId ? { ...m, ...patch } : m,
+      ),
+    }));
+    if (s.project) saveChatSessions(s.project.root, sessions);
+    return { chatSessions: sessions };
+  });
 }
 
 const KEY_STORAGE = "dedup:anthropic-key";
@@ -754,12 +929,42 @@ function pendingInsert(actions: EditAction[], dedupId: string) {
  * to ask, so the snippet itself is the source of truth — and it says honestly
  * that the element can't be moved until it exists on disk.
  */
-function pendingNodeInfo(snippet: string): NodeInfo {
+function pendingNodeInfo(snippet: string, lang: SnippetLang): NodeInfo {
   const parsed = parseSimpleElement(snippet);
+  if (!parsed) {
+    // A pasted section rather than a palette element: a whole subtree, which
+    // the single-element rewriter that folds edits into a staged snippet
+    // cannot touch. Read-only with a reason until a save gives it real nodes
+    // — the alternative is a style panel that accepts edits the save refuses.
+    const tag = snippet.trim().match(/^<\s*([A-Za-z][\w.]*)/)?.[1] ?? "div";
+    const unsaved = "this pasted section isn't saved yet — save to edit it";
+    return {
+      editable: false,
+      className: null,
+      reason: unsaved,
+      line: 0,
+      col: 0,
+      tag,
+      component: null,
+      dynamic: null,
+      core: null,
+      parentIndex: null,
+      canRemove: true,
+      canMove: false,
+      structuralReason: "this element isn't saved yet — save to move it",
+      canAcceptChildren: false,
+      canEditText: false,
+      textReason: unsaved,
+      text: null,
+    };
+  }
   const text = textOf(snippet);
   return {
     editable: true,
-    className: classNameOf(snippet),
+    // In the snippet's own spelling: a pasted one carries the class attribute
+    // of the file it came from, and reading `className` off HTML markup
+    // reports no classes for an element that plainly has some.
+    className: classNameOf(snippet, lang),
     reason: null,
     line: 0,
     col: 0,
@@ -794,6 +999,110 @@ function stagedValue(
     if (a.kind === kind && a.target.dedupId === dedupId) value = a.after;
   }
   return value;
+}
+
+/** Live timer behind `setNotice` — module scope, because nothing renders it. */
+let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * The copy that both ⌘C and ⌘X go through.
+ *
+ * A copied section needs the same two renderings a palette entry has, and they
+ * come from the two places that actually know: the *source* from the
+ * write-back, because the file is the truth about what a paste will write, and
+ * the *picture* from the overlay, because only the page knows what that source
+ * rendered as. Deriving one from the other would mean shipping a JSX renderer
+ * into the overlay — the same reason the palette writes both by hand.
+ *
+ * Which also means the copy is what the file says, not what the screen shows.
+ * Staged edits inside the copied section are not in it, and that difference is
+ * said out loud rather than papered over.
+ *
+ * Returns whether anything was copied — a cut only deletes if it did.
+ */
+async function copyToClipboard(
+  get: () => AppState,
+  set: (partial: Partial<AppState>) => void,
+  cut: boolean,
+): Promise<boolean> {
+  const { selected, project, actions } = get();
+  if (!selected) {
+    get().setNotice("Select something on the canvas first.");
+    return false;
+  }
+  const preview = await requestElementHtml(selected.dedupId);
+  if (!preview) {
+    get().setNotice("Couldn't read that element from the canvas.");
+    return false;
+  }
+
+  // A staged insert has no node in any file — its snippet *is* its source, so
+  // the edits made to it since have to be folded in exactly as a save would.
+  const staged = pendingInsert(actions, selected.dedupId);
+  if (staged) {
+    let snippet = staged.snippet;
+    const className = stagedValue(actions, "class", staged.id);
+    const text = stagedValue(actions, "text", staged.id);
+    if (className !== null) {
+      snippet = withAttr(snippet, classAttrFor(staged.lang), className) ?? snippet;
+    }
+    if (text !== null) snippet = withText(snippet, text) ?? snippet;
+    set({
+      clipboard: {
+        snippet,
+        lang: staged.lang,
+        preview,
+        label: staged.label,
+        file: staged.target.file,
+        refs: [],
+        cut,
+      },
+    });
+    get().setNotice(`${cut ? "Cut" : "Copied"} ${staged.label}.`);
+    return true;
+  }
+
+  const target = targetOf(selected.dedupId);
+  if (!target || !project) return false;
+  const result = await copyElement(project.root, target.file, target.index).catch(
+    (e) => ({ ok: false, error: String(e instanceof Error ? e.message : e) }) as const,
+  );
+  if (!result.ok || !("snippet" in result) || !result.snippet || !result.lang) {
+    get().setNotice(
+      ("error" in result && result.error) || "That element can't be copied.",
+    );
+    return false;
+  }
+
+  const label = labelOfElement(selected);
+  set({
+    clipboard: {
+      snippet: result.snippet,
+      lang: result.lang,
+      preview,
+      label,
+      file: target.file,
+      refs: result.refs ?? [],
+      cut,
+    },
+  });
+
+  // Ordinals the copy swallowed, from the same parse that produced it — an
+  // exact answer to "is there staged work in here?", which the DOM cannot give
+  // (an element staged for deletion is already off the screen but still in the
+  // file, and therefore still in the copy).
+  const inside = new Set(result.contains ?? [target.index]);
+  const unsaved = actions.filter(
+    (a) => a.target.file === target.file && inside.has(a.target.index),
+  ).length;
+  get().setNotice(
+    unsaved > 0
+      ? `${cut ? "Cut" : "Copied"} ${label} as it is saved — ${unsaved} unsaved edit${
+          unsaved === 1 ? "" : "s"
+        } inside it ${unsaved === 1 ? "isn't" : "aren't"} included.`
+      : `${cut ? "Cut" : "Copied"} ${label}.`,
+  );
+  return true;
 }
 
 /** Human summary of a staged program, for the commit subject. */
@@ -914,6 +1223,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   viewportId: "desktop",
   tool: "select",
+  textEditing: null,
+  textToolSticky: false,
   zoom: 1,
   // Clears the floating chrome: the sidebar sits at left-3 with a ~200px
   // default width, and the top bar occupies the first ~60px. Starting the
@@ -927,6 +1238,7 @@ export const useStore = create<AppState>((set, get) => ({
   frameOrigins: {},
   sessionModes: {},
   heldRoutes: {},
+  offlineRoutes: {},
   layers: {},
   pageMeta: null,
   selectedRoute: null,
@@ -944,15 +1256,18 @@ export const useStore = create<AppState>((set, get) => ({
   redoStack: [],
   draggingId: null,
   insertKind: null,
+  clipboard: null,
   saving: false,
   lastSave: null,
   saveError: null,
+  notice: null,
 
   sidebarTab: "layers",
   inspectorTab: "design",
   chatSessions: [],
   activeChatId: null,
   chatBusy: false,
+  pendingEdit: null,
   scanning: false,
   scanProgress: null,
   scanResult: null,
@@ -993,6 +1308,7 @@ export const useStore = create<AppState>((set, get) => ({
       chatSessions,
       activeChatId: chatSessions[chatSessions.length - 1]?.id ?? null,
       chatBusy: false,
+      pendingEdit: null,
       scanning: false,
       scanProgress: null,
       scanResult: null,
@@ -1017,10 +1333,12 @@ export const useStore = create<AppState>((set, get) => ({
       sessionBusy: false,
       sessionError: null,
       authProvider: null,
-      // Per-project: one project's artboard session choices must not leak
-      // into the next one opened.
+      // Per-project: one project's artboard choices must not leak into the
+      // next one opened — every project has a "/" for them to land on.
       frameOrigins: {},
       sessionModes: {},
+      heldRoutes: {},
+      offlineRoutes: {},
       project,
       git,
       customCommand,
@@ -1033,14 +1351,20 @@ export const useStore = create<AppState>((set, get) => ({
       logs: [],
       errors: [],
       tool: "select",
+      textEditing: null,
+      textToolSticky: false,
       selected: null,
       sourceInfo: null,
       actions: [],
       redoStack: [],
       draggingId: null,
       insertKind: null,
+      // A copied snippet is a piece of one project's source; carrying it into
+      // another one would paste markup from a codebase that isn't open.
+      clipboard: null,
       lastSave: null,
       saveError: null,
+      notice: null,
       merge: null,
       history: [],
       historyOpen: false,
@@ -1048,12 +1372,17 @@ export const useStore = create<AppState>((set, get) => ({
     });
   },
 
-  backToLaunch: () =>
+  backToLaunch: () => {
+    // A previewed edit is uncommitted work the user never accepted. Closing
+    // the project is not a decision to keep it, so it comes back off first.
+    const { project, pendingEdit } = get();
+    if (project && pendingEdit) void revertPreview(project.root, pendingEdit);
     set({
       sidebarTab: "pages",
       chatSessions: [],
       activeChatId: null,
       chatBusy: false,
+      pendingEdit: null,
       scanning: false,
       scanProgress: null,
       scanResult: null,
@@ -1082,10 +1411,12 @@ export const useStore = create<AppState>((set, get) => ({
       sessionBusy: false,
       sessionError: null,
       authProvider: null,
-      // Per-project: one project's artboard session choices must not leak
-      // into the next one opened.
+      // Per-project: one project's artboard choices must not leak into the
+      // next one opened — every project has a "/" for them to land on.
       frameOrigins: {},
       sessionModes: {},
+      heldRoutes: {},
+      offlineRoutes: {},
       project: null,
       git: null,
       customCommand: null,
@@ -1102,9 +1433,14 @@ export const useStore = create<AppState>((set, get) => ({
       redoStack: [],
       draggingId: null,
       insertKind: null,
+      // A copied snippet is a piece of one project's source; carrying it into
+      // another one would paste markup from a codebase that isn't open.
+      clipboard: null,
       lastSave: null,
       saveError: null,
-    }),
+      notice: null,
+    });
+  },
 
   setDevStatus: (devStatus) => set({ devStatus }),
 
@@ -1156,11 +1492,14 @@ export const useStore = create<AppState>((set, get) => ({
   clearLogs: () => set({ logs: [], errors: [] }),
 
   askAiToFix: () => {
-    const { errors, selected } = get();
-    if (errors.length === 0 || !selected) return;
+    const { errors } = get();
+    if (errors.length === 0) return;
+    // Deliberately not gated on a selection. A build error is the case where
+    // there is least likely to be one — the page didn't compile, so there may
+    // be nothing on the canvas to click. The agent finds the file itself.
     set({ inspectorTab: "chat" });
     void get().sendChat(
-      `The dev server reports this build error. Fix it in this file if the cause is here; if it isn't, say where it is instead of guessing:\n\n${errors
+      `The dev server reports this build error. Find the cause and fix it — read the files named in the error before quoting them:\n\n${errors
         .map((e) => e.content)
         .join("\n\n")}`,
     );
@@ -1175,6 +1514,11 @@ export const useStore = create<AppState>((set, get) => ({
     // Browse mode hands clicks back to the app — an active selection would
     // just be stale UI over a page the user is now navigating.
     if (tool === "browse") get().clearSelection();
+    // Leaving the text tool takes the caret off the canvas with it; a caret
+    // still blinking in a page you are now panning is a lie about the mode.
+    if (tool !== "text" && get().textEditing) {
+      sendToOverlay({ type: "text-edit-end" });
+    }
     sendToOverlay({ type: "set-mode", mode: tool === "browse" ? "browse" : "inspect" });
     // Dragging elements belongs to the select tool: the hand tool pans and
     // browse hands the page back to the app.
@@ -1183,7 +1527,20 @@ export const useStore = create<AppState>((set, get) => ({
       drag: tool === "select",
       insert: false,
     });
-    set({ tool, insertKind: tool === "select" ? get().insertKind : null });
+    set({
+      tool,
+      // Chosen here means chosen on purpose (the T button or shortcut), so
+      // the tool stays put once an edit ends. `requestTextEdit` sets this
+      // false for the double-click path, which borrows the tool for one edit.
+      textToolSticky: tool === "text",
+      insertKind: tool === "select" ? get().insertKind : null,
+    });
+    // In the text tool a selection *is* an edit request, so entering it with
+    // something already selected puts the caret straight in.
+    if (tool === "text") {
+      const id = get().selected?.dedupId;
+      if (id) void get().requestTextEdit(id);
+    }
   },
 
   setZoom: (zoom) => set({ zoom: Math.min(2, Math.max(0.25, zoom)) }),
@@ -1223,6 +1580,7 @@ export const useStore = create<AppState>((set, get) => ({
       frameOrigins: drop(s.frameOrigins),
       sessionModes: drop(s.sessionModes),
       heldRoutes: drop(s.heldRoutes),
+      offlineRoutes: drop(s.offlineRoutes),
       // The scan targets an artboard; closing it leaves no target.
       selectedRoute: s.selectedRoute === path ? null : s.selectedRoute,
       // pageMeta is the root frame's report of the live app.
@@ -1272,7 +1630,7 @@ export const useStore = create<AppState>((set, get) => ({
     const fromSource = async (): Promise<string[] | null> => {
       if (!project) return null;
       try {
-        const res = await detectRoutesFromSource(project.root);
+        const res = await detectRoutesFromSource(project.root, project.framework);
         return res.ok && Array.isArray(res.routes) ? res.routes : null;
       } catch {
         return null;
@@ -1358,6 +1716,17 @@ export const useStore = create<AppState>((set, get) => ({
     // frame's URL and takes effect on the reload that flag causes.
     held[route] = true;
     set({ heldRoutes: held });
+  },
+
+  toggleOffline: (route) => {
+    const offline = { ...get().offlineRoutes };
+    if (offline[route]) delete offline[route];
+    else offline[route] = true;
+    // Both directions reload, and both have to: the cut is installed before
+    // the app boots, so it can neither be added nor taken away from a page
+    // that is already running. React re-points the frame when the flag on its
+    // URL changes — the reload *is* the mechanism, not a side effect of it.
+    set({ offlineRoutes: offline });
   },
 
   setPageHeight: (route, h) =>
@@ -1573,12 +1942,27 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setSelected: (selected) => {
+    // Re-selecting what is already selected must not restart the inspect.
+    // The two clicks of a double-click both select, and throwing away an
+    // in-flight answer on the second one is exactly how the double-click used
+    // to lose its race. (A save clears the selection, so nothing stale
+    // survives here.)
+    const current = get();
+    if (
+      selected &&
+      current.selected?.dedupId === selected.dedupId &&
+      (current.sourceInfo !== null || sourceInfoPending?.id === selected.dedupId)
+    ) {
+      set({ selected });
+      return;
+    }
+    sourceInfoPending = null;
     set({ selected, sourceInfo: null });
     if (!selected) return;
     // A staged insert has no file to ask — its snippet is the source of truth.
     const insert = pendingInsert(get().actions, selected.dedupId);
     if (insert) {
-      set({ sourceInfo: pendingNodeInfo(insert.snippet) });
+      set({ sourceInfo: pendingNodeInfo(insert.snippet, insert.lang) });
       return;
     }
     // Ask the source of truth (the file) what this element is and admits.
@@ -1604,7 +1988,7 @@ export const useStore = create<AppState>((set, get) => ({
       textReason: reason,
       text: null,
     });
-    inspectElement(root, target.file, target.index)
+    const inspecting = inspectElement(root, target.file, target.index)
       .then((r) => {
         if (get().selected?.dedupId !== selected.dedupId) return; // stale
         if (!r.ok) {
@@ -1637,10 +2021,23 @@ export const useStore = create<AppState>((set, get) => ({
         if (get().selected?.dedupId !== selected.dedupId) return;
         set({ sourceInfo: unavailable(String(e)) });
       });
+    // Held so `requestTextEdit` can await the answer instead of giving up on
+    // it — the whole difference between a double-click that edits text and
+    // one that edits text about half the time.
+    sourceInfoPending = { id: selected.dedupId, done: inspecting };
+    // In the text tool a selection *is* an edit request: one click puts the
+    // caret in, the way the tool advertises.
+    if (get().tool === "text") void get().requestTextEdit(selected.dedupId);
   },
 
   clearSelection: () => {
+    // A caret on the canvas is part of the selection, and the overlay's own
+    // `clear` does not touch it — nor does the iframe losing focus, which
+    // only ends drags. Left behind, the element stays contenteditable while
+    // the editor believes nothing is selected.
+    if (get().textEditing !== null) sendToOverlay({ type: "text-edit-end" });
     sendToOverlay({ type: "clear" });
+    sourceInfoPending = null;
     set({ selected: null, sourceInfo: null });
   },
 
@@ -1667,11 +2064,21 @@ export const useStore = create<AppState>((set, get) => ({
   /** Push one action onto the program and re-sync the canvas from it. */
   stage: (action: EditAction, collapse?: (prev: EditAction) => boolean) => {
     const { actions } = get();
+    // The one gate on what may be staged. It lives here because every action
+    // arrives through this function, and a program is only ever invalid as a
+    // *combination* — the action being added is fine on its own, it is the
+    // company it would keep that the write-back would refuse.
+    const conflict = stagingConflict(actions, action);
+    if (conflict) {
+      get().setNotice(conflict);
+      return false;
+    }
     const top = actions[actions.length - 1];
     const merges = top !== undefined && collapse !== undefined && collapse(top);
     const next = merges ? [...actions.slice(0, -1), action] : [...actions, action];
     set({ actions: next, redoStack: [] });
     syncCanvas(next);
+    return true;
   },
 
   applyClassEdit: (next, group) => {
@@ -1729,6 +2136,24 @@ export const useStore = create<AppState>((set, get) => ({
     );
   },
 
+  resizeSelected: (width, height, group) => {
+    const { selected, sourceInfo, actions } = get();
+    // Same gate as every other class edit — and the overlay already refuses to
+    // show grips here, so this is the second line of defence rather than the
+    // first.
+    if (!selected || !sourceInfo?.editable) return;
+
+    const current =
+      stagedValue(actions, "class", selected.dedupId) ?? sourceInfo.className ?? "";
+    let tokens = toTokens(current);
+    // Only the axes the grip actually drags: a side handle must not pin the
+    // dimension it never touched, which would freeze a content-sized element
+    // at whatever height it happened to have.
+    if (width !== null) tokens = setKnob(tokens, KNOBS.width, sizeClass("w", width));
+    if (height !== null) tokens = setKnob(tokens, KNOBS.height, sizeClass("h", height));
+    get().applyClassEdit(fromTokens(tokens), group);
+  },
+
   removeSelected: () => {
     const { selected, sourceInfo, actions } = get();
     if (!selected || !sourceInfo?.canRemove) return;
@@ -1750,11 +2175,18 @@ export const useStore = create<AppState>((set, get) => ({
 
     const target = targetOf(selected.dedupId);
     if (!target) return;
-    get().stage({
-      kind: "remove",
-      target,
-      label: labelOfElement(selected),
-    });
+    if (
+      !get().stage({
+        kind: "remove",
+        target,
+        label: labelOfElement(selected),
+      })
+    ) {
+      // Refused — something staged is anchored to this element. It is still
+      // on the canvas, so the selection stays on it and the notice says what
+      // is in the way.
+      return;
+    }
     // The element is gone from the canvas — a selection pointing at it would
     // show controls for something the user can no longer see.
     set({ selected: null, sourceInfo: null });
@@ -1769,9 +2201,12 @@ export const useStore = create<AppState>((set, get) => ({
     // another — a refactor, not a drag. Refused with a reason rather than
     // half-done (the write-back would refuse it too).
     if (from.file !== to.file) {
-      set({
-        saveError: `Can't move between files yet — that element lives in ${from.file}, the drop target in ${to.file}.`,
-      });
+      // A refusal, not a failed save — `saveError` renders as "Save failed —
+      // retry", which is the wrong thing to say about a drag that never
+      // started. (Copy and paste it, though: that crosses files fine.)
+      get().setNotice(
+        `Can't move between files — that element lives in ${from.file}, the drop target in ${to.file}. Copy and paste it instead.`,
+      );
       return;
     }
     const { selected } = get();
@@ -1790,31 +2225,214 @@ export const useStore = create<AppState>((set, get) => ({
     const entry = PALETTE[kind];
     if (!target || !entry) return;
     const id = `${PENDING_PREFIX}${crypto.randomUUID()}`;
-    get().stage({
+    const staged = get().stage({
       kind: "insert",
       id,
       target,
       position,
       snippet: entry.snippet,
+      lang: "jsx",
       preview: entry.preview,
       label: entry.label,
     });
     // Through the setter, not set(): the overlay has to be told to stop
     // waiting for a placement click, or it swallows the next selection.
     get().setInsertKind(null);
-    // Select what was just placed, so the inspector is already pointed at it
-    // and its text can be typed straight away.
+    // Select what was just placed — but only if it was. Selecting a pending
+    // id that never entered the program would point the inspector at nothing.
+    if (staged) get().selectById(id);
+  },
+
+  copySelected: async () => {
+    await copyToClipboard(get, set, false);
+  },
+
+  /**
+   * Cut: the copy has to succeed before the delete is staged, or the section
+   * is gone and on no clipboard.
+   */
+  cutSelected: async () => {
+    const selected = get().selected;
+    if (!selected) {
+      get().setNotice("Select something on the canvas first.");
+      return;
+    }
+    // Whether it may be deleted comes from the write-back, and that answer can
+    // still be in flight right after a click — awaiting it is the same fix
+    // double-click-to-edit needed. Asked *before* the copy so a cut that will
+    // not delete never says it cut anything.
+    const info = await sourceInfoFor(get, selected.dedupId);
+    if (!info?.canRemove) {
+      get().setNotice(info?.structuralReason ?? "This element can't be cut.");
+      return;
+    }
+    if (!(await copyToClipboard(get, set, true))) return;
+    get().removeSelected();
+  },
+
+  pasteClipboard: async () => {
+    const { clipboard, selected, sourceInfo, actions, project } = get();
+    if (!clipboard) {
+      get().setNotice("Nothing to paste — copy something on the canvas first.");
+      return;
+    }
+    if (!selected) {
+      get().setNotice("Select where to paste — the copy lands next to it.");
+      return;
+    }
+
+    // Where it goes. A sibling *after* the selection is what a paste means
+    // most of the time (it is the duplicate gesture), but not everything has
+    // a sibling to be: a component's root element and <body> would put the
+    // copy somewhere the file cannot express, so those take it as a child.
+    let target: EditTarget | null;
+    let position: DropPosition;
+    const staged = pendingInsert(actions, selected.dedupId);
+    if (staged) {
+      // Pasting again right after a paste: the selection is the element the
+      // last one put down, which has no node in the file to aim at. Reuse the
+      // anchor it used, so repeated pastes pile up as siblings.
+      target = staged.target;
+      position = staged.position;
+    } else {
+      target = targetOf(selected.dedupId);
+      if (!target) return;
+      // The write-back's own report, awaited: right after a click it can still
+      // be in flight, and reading a null would refuse a paste that is fine.
+      const info = sourceInfo ?? (await sourceInfoFor(get, selected.dedupId));
+      const sibling =
+        info !== null && info.parentIndex !== null && info.core === null;
+      position = sibling ? "after" : "inside";
+      if (!sibling && !(info?.canAcceptChildren ?? false)) {
+        get().setNotice(
+          info?.structuralReason ??
+            "There's nowhere to put it here — select the element it should sit next to.",
+        );
+        return;
+      }
+    }
+
+    // One language per file, and no translation exists for an arbitrary
+    // subtree — see SnippetLang. Refused here, where the user can still see
+    // what they aimed at, rather than at save time.
+    const destLang = isHtmlFile(target.file) ? "html" : "jsx";
+    if (clipboard.lang !== destLang) {
+      get().setNotice(
+        destLang === "html"
+          ? "That was copied from a React component — this page is plain HTML."
+          : "That was copied from an HTML page — this file is a React component.",
+      );
+      return;
+    }
+
+    // Names the snippet reads but does not carry: a `<Card title={title} />`
+    // needs both wherever it lands. dedup cannot resolve bindings from here,
+    // so it asks the one question it can answer for certain — does the
+    // destination file mention this name at all? A no is proof; a yes proves
+    // nothing and is left alone. Said out loud rather than refused, because
+    // the paste is staged and undoable and the user can see the result.
+    let missing: string[] = [];
+    if (clipboard.refs.length > 0 && project && target.file !== clipboard.file) {
+      try {
+        const code = await readSource(project.root, target.file);
+        missing = clipboard.refs.filter(
+          (name) => !new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(code),
+        );
+      } catch {
+        // Couldn't read it — say nothing rather than guess.
+      }
+    }
+
+    const id = `${PENDING_PREFIX}${crypto.randomUUID()}`;
+    if (
+      !get().stage({
+        kind: "insert",
+        id,
+        target,
+        position,
+        snippet: clipboard.snippet,
+        lang: clipboard.lang,
+        preview: clipboard.preview,
+        label: clipboard.label,
+      })
+    ) {
+      // Refused — the anchor is on its way out. The clipboard keeps its
+      // contents, so the paste can be repeated somewhere that still exists.
+      return;
+    }
     get().selectById(id);
+    get().setNotice(
+      missing.length > 0
+        ? `Pasted ${clipboard.label} — but ${target.file.split("/").pop()} has no ${missing
+            .slice(0, 3)
+            .join(", ")}, so it won't build until you add ${
+            missing.length === 1 ? "it" : "them"
+          }.`
+        : `Pasted ${clipboard.label}.`,
+    );
+  },
+
+  setNotice: (message) => {
+    if (noticeTimer !== null) clearTimeout(noticeTimer);
+    noticeTimer = null;
+    set({ notice: message });
+    if (message === null) return;
+    noticeTimer = setTimeout(() => {
+      noticeTimer = null;
+      // Only if it is still the same message — a newer one owns the slot.
+      if (useStore.getState().notice === message) useStore.setState({ notice: null });
+    }, 6000);
   },
 
   setDragging: (draggingId) => set({ draggingId }),
 
-  requestTextEdit: (dedupId) => {
-    const { selected, sourceInfo } = get();
-    // The double-click follows a click, so this element is the selection and
-    // its capabilities are already known. If its text isn't editable, the
-    // inspector is already showing the reason — nothing more to say here.
-    if (selected?.dedupId !== dedupId || !sourceInfo?.canEditText) return;
+  /**
+   * The caret landed on, or left, an element on the canvas — reported by the
+   * overlay, which is the only side that knows.
+   *
+   * The tool follows the caret rather than the other way round: whatever put
+   * it there (a double-click, the T tool, selecting while in it), the mode
+   * shown is the mode the canvas is actually in. That also keeps the two
+   * paths from calling each other — `setTool` starts an edit, and if starting
+   * an edit went back through `setTool` they would bounce.
+   */
+  setTextEditing: (textEditing) => {
+    const { textToolSticky, tool } = get();
+    set({ textEditing });
+    if (textEditing !== null) {
+      if (tool !== "text") {
+        // Entered by typing into something, not by choosing the tool — so it
+        // is borrowed for this one edit (see `textToolSticky`). Set directly
+        // rather than through setTool, which would mark it chosen and
+        // re-request the edit that is already underway.
+        sendToOverlay({ type: "set-edit-mode", drag: false, insert: false });
+        set({ tool: "text", textToolSticky: false, insertKind: null });
+      }
+      return;
+    }
+    // Caret gone. A borrowed tool goes back; a chosen one stays, so the next
+    // click edits the next thing.
+    if (tool === "text" && !textToolSticky) get().setTool("select");
+  },
+
+  requestTextEdit: async (dedupId) => {
+    // The double-click's own clicks have already selected this element, but
+    // *whether its text may be edited* comes from the write-back, and that
+    // answer is usually still in flight when `dblclick` fires. Waiting for it
+    // is the whole fix: reading `sourceInfo` and giving up on a null is what
+    // made this gesture work only sometimes.
+    if (get().selected?.dedupId !== dedupId) {
+      // Selection never landed (a Layers row, a stale id) — point the canvas
+      // at it; the selection that follows re-enters here in the text tool.
+      sendToOverlay({ type: "select-id", id: dedupId });
+      return;
+    }
+    const info = await sourceInfoFor(get, dedupId);
+    // Refused: the element is selected, so the Inspector is already showing
+    // `textReason`. Entering a text mode that could not type would be the
+    // dishonest part.
+    if (!info?.canEditText) return;
+    if (get().selected?.dedupId !== dedupId) return; // moved on while waiting
     sendToOverlay({ type: "text-edit-begin", id: dedupId });
   },
 
@@ -1832,9 +2450,31 @@ export const useStore = create<AppState>((set, get) => ({
   revertAction: (index) => {
     const { actions } = get();
     if (index < 0 || index >= actions.length) return;
-    const next = actions.filter((_, i) => i !== index);
+    // Takes any edit made to a discarded insert with it — see withoutAction.
+    // Leaving one behind produced a program that could never be saved and
+    // never be escaped, since the chat also refuses while edits are staged.
+    const next = withoutAction(actions, index);
     set({ actions: next, redoStack: [] });
     syncCanvas(next);
+  },
+
+  discardAllEdits: () => {
+    if (get().actions.length === 0) return;
+    // Nothing here was ever written, so there is nothing to put back — the
+    // staged program only ever existed in memory and on the canvas.
+    set({
+      actions: [],
+      redoStack: [],
+      saveError: null,
+      selected: null,
+      sourceInfo: null,
+    });
+    syncCanvas([]);
+    sendToOverlay({ type: "clear" });
+    // Staged structural edits were previewed by moving real nodes around;
+    // the reload is what puts the page back to what the file actually says.
+    sendToOverlay({ type: "reload" });
+    get().setNotice("Staged edits discarded.");
   },
 
   undo: () => {
@@ -1874,7 +2514,7 @@ export const useStore = create<AppState>((set, get) => ({
         byFile.set(file, [...(byFile.get(file) ?? []), a]);
       }
       for (const [file, group] of byFile) {
-        const { ops, failures } = opsForFile(group);
+        const { ops, failures } = opsForFile(group, file);
         // A staged edit that cannot be expressed is a refusal, not something
         // to drop quietly on the way to disk.
         if (failures.length > 0) throw new Error(failures.join("; "));
@@ -1938,15 +2578,27 @@ export const useStore = create<AppState>((set, get) => ({
 
   setInspectorTab: (inspectorTab) => set({ inspectorTab }),
 
+  /**
+   * One instruction through the chat agent.
+   *
+   * A canvas selection is context, not a precondition. With one, its file goes
+   * in with the element pointed at; with none, the project inventory goes in
+   * and the model finds its own way with read/grep/list — the same loop, the
+   * same protocol, the same review at the end.
+   *
+   * Nothing here writes. The turn ends with a *proposal*: the files the model
+   * would change, as a diff the user accepts or rejects. Only `acceptChatEdit`
+   * reaches the parse-gated write-back and the session branch.
+   */
   sendChat: async (instruction) => {
     const { project, selected, chatBusy } = get();
     const text = instruction.trim();
-    if (!project || !selected || !text || chatBusy) return;
-    const src = targetOf(selected.dedupId);
-    if (!src) return;
+    if (!project || !text || chatBusy) return;
 
     // Append to the active session, materializing a new one on first use.
-    const push = (m: Omit<ChatMessage, "id">) =>
+    // Returns the message's id so a proposal can be resolved onto it later.
+    const push = (m: Omit<ChatMessage, "id">): string => {
+      const messageId = crypto.randomUUID();
       set((s) => {
         let sessions = s.chatSessions;
         let id = s.activeChatId;
@@ -1959,38 +2611,32 @@ export const useStore = create<AppState>((set, get) => ({
         }
         sessions = sessions.map((x) =>
           x.id === id
-            ? { ...x, messages: [...x.messages, { id: crypto.randomUUID(), ...m }] }
+            ? { ...x, messages: [...x.messages, { id: messageId, ...m }] }
             : x,
         );
         if (s.project) saveChatSessions(s.project.root, sessions);
         return { chatSessions: sessions, activeChatId: id };
       });
+      return messageId;
+    };
 
-    // Conversation memory: prior turns of this session (texts only — the
-    // file always goes in fresh), captured before this message lands.
+    // Conversation memory: prior turns of this session (texts only — files
+    // always go in fresh), captured before this message lands.
     const active = get().chatSessions.find((x) => x.id === get().activeChatId);
-    const history = (active?.messages ?? [])
+    const history: ChatTurn[] = (active?.messages ?? [])
       .filter((m) => !m.error)
       .slice(-12)
       .map((m) => ({ role: m.role, text: m.text }));
 
+    const src = selected ? targetOf(selected.dedupId) : null;
     push({
       role: "user",
       text,
-      target: { label: selected.component ?? selected.tag, file: src.file },
+      target:
+        selected && src
+          ? { label: selected.component ?? selected.tag, file: src.file }
+          : undefined,
     });
-
-    // A full-file rewrite renumbers the ordinals this file's staged actions
-    // are addressed by — make the user land or drop them first.
-    const stagedHere = get().actions.some((a) => a.target.file === src.file);
-    if (stagedHere) {
-      push({
-        role: "assistant",
-        error: true,
-        text: `This file has unsaved style edits. Save (⌘S) or discard them first — a chat edit would invalidate their positions.`,
-      });
-      return;
-    }
 
     const kind = get().activeAiBackend();
     const backend =
@@ -2012,68 +2658,305 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
+    // Everything dedup has read for this turn. It is also the *only* thing an
+    // edit may quote: `applyProgram` refuses a block naming a file that isn't
+    // in here, because a SEARCH the model wrote from memory is exactly what
+    // the exact-match rule exists to catch.
+    const sources = new Map<string, string>();
+    const attachments: ChatAttachment[] = [];
+    const toolTrace: string[] = [];
+
+    /** A file dedup will not put in front of the model. Past this size the
+     *  reply would be truncated somewhere in the middle, and a truncated
+     *  source that got written would delete the rest of the file. */
+    const MAX_CONTEXT_BYTES = 120_000;
+
+    const runTool = async (call: ToolCall): Promise<string> => {
+      try {
+        if (call.tool === "list") {
+          const r = await listProjectFiles(project.root);
+          if (!r.ok || !r.files) return r.error ?? "listing failed";
+          return r.files.join("\n");
+        }
+        if (call.tool === "grep") {
+          const r = await grepProject(project.root, call.arg);
+          if (!r.ok || !r.matches) return r.error ?? "grep failed";
+          if (r.matches.length === 0) return "no matches";
+          return (
+            r.matches.map((m) => `${m.file}:${m.line}: ${m.text}`).join("\n") +
+            (r.truncated ? "\n… (more matches not shown)" : "")
+          );
+        }
+        const source = await readSource(project.root, call.arg);
+        if (source.length > MAX_CONTEXT_BYTES) {
+          return `${call.arg} is too large (${Math.round(source.length / 1024)}KB) for dedup to edit through chat. Work in a smaller file.`;
+        }
+        sources.set(call.arg, source);
+        return `\`\`\`${isHtmlFile(call.arg) ? "html" : "tsx"}\n${source}\n\`\`\``;
+      } catch (e) {
+        return `cannot ${call.tool} ${call.arg}: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    };
+
     set({ chatBusy: true });
+    // Say where the work is happening. A turn can take a minute, and the only
+    // sign of it was a spinner in the chat panel — while the element the user
+    // asked about sat on the canvas looking idle. With nothing selected there
+    // is no section to mark, and the panel's own "Working…" is the whole
+    // answer.
+    sendToOverlay({ type: "set-busy", id: selected?.dedupId ?? null });
     try {
-      const source = await readSource(project.root, src.file);
-      // Stale-selection guard: edits since the selection can renumber the
-      // file's elements, and a wrong element makes the model edit the wrong
-      // thing. Re-resolve the id and check it still names the same tag.
-      const live = await inspectElement(project.root, src.file, src.index);
-      if (!live.ok || (live.tag ?? "").toLowerCase() !== selected.tag.toLowerCase()) {
+      let staleSelection = false;
+      if (selected && src) {
+        const source = await readSource(project.root, src.file);
+        if (source.length <= MAX_CONTEXT_BYTES) {
+          sources.set(src.file, source);
+          // Stale-selection guard: edits since the selection can renumber the
+          // file's elements. A stale id doesn't kill the turn any more — it
+          // just stops being a pointer, and the model is told so rather than
+          // being aimed at the wrong element.
+          const live = await inspectElement(project.root, src.file, src.index);
+          const fresh =
+            live.ok &&
+            (live.tag ?? "").toLowerCase() === selected.tag.toLowerCase();
+          staleSelection = !fresh;
+          attachments.push({
+            file: src.file,
+            source,
+            element: fresh
+              ? { selected, line: live.line ?? 0 }
+              : undefined,
+          });
+        }
+      }
+
+      // With nothing selected the model starts from the project's own file
+      // list rather than a blind grep — the cheapest way to make a cold
+      // conversation land on the right file first time.
+      const inventory =
+        attachments.length === 0
+          ? ((await listProjectFiles(project.root)).files ?? null)
+          : null;
+
+      const system = systemPromptFor(
+        attachments[0]?.file ?? null,
+        project.framework === "static",
+        // Only a CLI backend generates files, and only some of them do — a
+        // model told about a directive dedup would refuse for it would reach
+        // for it and then have to explain itself to the user.
+        backend.kind === "cli" &&
+          (CLI_AGENTS.find((a) => a.id === backend.agent)?.generatesAssets ?? false),
+      );
+      let prompt = buildTurnPrompt({
+        instruction: staleSelection
+          ? `${text}\n\n(The canvas selection is out of date — the file changed since the user clicked. Re-read the file above rather than trusting any line number.)`
+          : text,
+        attachments,
+        inventory,
+        framework: project.framework,
+      });
+      let turns = history;
+      let reply: ChatReply | null = null;
+
+      for (let round = 0; ; round++) {
+        const raw = await runChatPrompt(backend, prompt, turns, system);
+        const parsed = parseChatReply(raw);
+        if (parsed.kind !== "tools") {
+          reply = parsed;
+          break;
+        }
+        if (round >= MAX_TOOL_ROUNDS) {
+          push({
+            role: "assistant",
+            error: true,
+            tools: toolTrace,
+            text: `Still looking for context after ${MAX_TOOL_ROUNDS} rounds — nothing was changed. Narrow the instruction, or select the element you mean on the canvas.`,
+          });
+          return;
+        }
+        const results: string[] = [];
+        for (const call of parsed.calls) {
+          toolTrace.push(call.tool === "list" ? "list" : `${call.tool} ${call.arg}`);
+          results.push(
+            formatToolResult(call.tool, call.arg, await runTool(call)),
+          );
+        }
+        turns = [...turns, { role: "user", text: prompt }, { role: "assistant", text: raw }];
+        prompt = results.join("\n\n");
+      }
+
+      const tools = toolTrace.length > 0 ? toolTrace : undefined;
+      if (reply.kind === "answer") {
+        push({ role: "assistant", text: reply.text, tools });
+        return;
+      }
+
+      // Which file an unaddressed block belongs to: the selection's, or the
+      // only one in play. With neither, an unaddressed block is refused.
+      const fallback =
+        attachments[0]?.file ??
+        (sources.size === 1 ? [...sources.keys()][0] : null);
+
+      let program: Map<string, string>;
+      if (reply.kind === "file") {
+        if (!fallback) {
+          push({
+            role: "assistant",
+            error: true,
+            tools,
+            text: "The AI replied with a whole file but didn't say which one — nothing was changed. Try again, or select the element you mean.",
+          });
+          return;
+        }
+        program = new Map([[fallback, reply.content]]);
+      } else {
+        program = applyProgram(sources, reply.blocks, reply.creates, fallback);
+      }
+
+      const files = [...program]
+        .map(([file, after]) => ({
+          file,
+          before: sources.get(file) ?? null,
+          after,
+        }))
+        .filter((f) => f.before !== f.after);
+
+      // Images the agent generated and wants placed in the project. They are
+      // only ever a CLI backend's, and only from an agent that makes them —
+      // the prompt never mentions the directive otherwise, so one appearing
+      // anyway is a model going off script.
+      const assets = reply.kind === "blocks" ? reply.assets : [];
+      if (assets.length > 0 && backend.kind !== "cli") {
         push({
           role: "assistant",
           error: true,
-          text: "The file changed since you selected this element, so the selection is out of date. Re-select it on the canvas and try again.",
+          tools,
+          text: "The AI tried to import a generated file, which this backend doesn't produce — nothing was changed.",
         });
         return;
       }
-      const reply = parseChatReply(
-        await runChatPrompt(
-          backend,
-          buildEditPrompt(
-            { file: src.file, line: live.line ?? 0 },
-            selected,
-            source,
-            text,
-          ),
-          history,
-        ),
-      );
-
-      if (reply.kind === "answer") {
-        push({ role: "assistant", text: reply.text });
-        return;
-      }
-      const next =
-        reply.kind === "blocks"
-          ? applyEditBlocks(source, reply.blocks)
-          : reply.content;
-
-      // Trust gate: the sidecar re-parses the model's output and refuses
-      // anything that doesn't parse; the write never lands on a user branch.
-      const res = await writeSource(project.root, src.file, next);
-      if (!res.ok) throw new Error(res.error ?? `write failed for ${src.file}`);
-      if (!res.changed) {
+      // A destination the same reply also writes as text is two answers to
+      // one question; neither can be the right one.
+      const clashing = assets.find((a) => program.has(a.file));
+      if (clashing) {
         push({
           role: "assistant",
-          text: "No change needed — the file already matches that instruction.",
+          error: true,
+          tools,
+          text: `The AI tried to both write and import ${clashing.file} — nothing was changed.`,
         });
         return;
       }
 
-      const [branch, hash] = await commitSession(
-        project.root,
-        `dedup: ${reply.summary}`,
-        [src.file],
-      );
-      push({ role: "assistant", text: reply.summary, commit: hash });
-      set({ lastSave: { branch, hash } });
+      if (files.length === 0 && assets.length === 0) {
+        push({
+          role: "assistant",
+          tools,
+          text: "No change needed — the project already matches that instruction.",
+        });
+        return;
+      }
+
+      // A file rewrite renumbers the ordinals this file's staged style edits
+      // are addressed by. Checked here rather than before the prompt, because
+      // until the model answers dedup doesn't know which files are in play —
+      // and here rather than at Apply, because the preview writes.
+      const touched = new Set(files.map((f) => f.file));
+      const clash = get().actions.find((a) => touched.has(a.target.file));
+      if (clash) {
+        push({
+          role: "assistant",
+          error: true,
+          tools,
+          text: `${clash.target.file} has unsaved style edits. Save (⌘S) or discard them first — a chat edit would invalidate their positions.`,
+        });
+        return;
+      }
+
+      // One unresolved proposal at a time. The new one was computed against
+      // file contents the old one put on disk, so keeping both would mean
+      // keeping one that is quietly wrong — and the old preview has to come
+      // off the canvas before the new one goes on.
+      const previous = get().pendingEdit;
+      if (previous) {
+        await revertPreview(project.root, previous);
+        patchChatMessage(set, previous.messageId, { outcome: "superseded" });
+      }
+
+      const messageId = push({
+        role: "assistant",
+        text: reply.summary,
+        tools,
+        proposal: {
+          files: [...files.map((f) => f.file), ...assets.map((a) => a.file)],
+          summary: reply.summary,
+        },
+      });
+
+      // Assets first, and this is the ordering that keeps the proposal
+      // all-or-nothing across both kinds of write: an import is a new file, so
+      // it can be taken back cleanly, while a text write that has landed
+      // cannot be undone without the `before` snapshots this function is still
+      // holding. So the fragile, gated half goes first and is unwound if the
+      // rest fails.
+      const imported: string[] = [];
+      const undoImports = async () => {
+        if (imported.length > 0) {
+          await revertSources(
+            project.root,
+            imported.map((file) => [file, null] as [string, string | null]),
+          ).catch(() => {});
+        }
+      };
+      for (const a of assets) {
+        try {
+          const done = await importAgentAsset(
+            project.root,
+            (backend as { agent: CliAgent }).agent,
+            a.source,
+            a.file,
+          );
+          imported.push(done.file);
+        } catch (e) {
+          await undoImports();
+          patchChatMessage(set, messageId, { outcome: "rejected" });
+          push({
+            role: "assistant",
+            error: true,
+            text: `${String(e instanceof Error ? e.message : e)} — nothing was changed.`,
+          });
+          return;
+        }
+      }
+
+      // Show it. A diff says what changed; the canvas says how it looks, and
+      // looking is why dedup renders the app at all. The write is parse-gated
+      // and uncommitted — Apply commits it, Discard puts the files back.
+      const res = files.length > 0
+        ? await writeSources(
+            project.root,
+            files.map((f) => [f.file, f.after] as [string, string]),
+          )
+        : { ok: true };
+      if (!res.ok) {
+        await undoImports();
+        patchChatMessage(set, messageId, { outcome: "rejected" });
+        push({
+          role: "assistant",
+          error: true,
+          text: `${res.error ?? "write failed"} — nothing was changed.`,
+        });
+        return;
+      }
+      set({
+        pendingEdit: { messageId, summary: reply.summary, files, assets, previewing: true },
+      });
       gitStatus(project.root)
         .then((g) => set({ git: g }))
         .catch(() => {});
-      // Reload the canvas rather than trusting HMR (its socket can wedge),
-      // and drop the selection — the edit may have shifted every position in
-      // the file, so the old id can't be trusted for a follow-up.
+      // Reload rather than trusting HMR (its socket can wedge), and drop the
+      // selection — the edit may have shifted every position in the file, so
+      // the old id can't be trusted for a follow-up.
       sendToOverlay({ type: "reload" });
       set({ selected: null, sourceInfo: null });
     } catch (e) {
@@ -2082,6 +2965,118 @@ export const useStore = create<AppState>((set, get) => ({
         error: true,
         text: String(e instanceof Error ? e.message : e),
       });
+    } finally {
+      set({ chatBusy: false });
+      // However the turn ended — answered, refused, or thrown — the canvas
+      // must stop claiming work is under way. In the `finally` for exactly
+      // that reason: an error path that left the squares running would be a
+      // section that looks busy for ever.
+      sendToOverlay({ type: "set-busy", id: null });
+    }
+  },
+
+  /**
+   * Keep the previewed edit. The files are already on disk — that is what the
+   * user has been looking at — so this is only the commit, which is the step
+   * that makes it part of the session's history and undoable from History.
+   */
+  acceptChatEdit: async () => {
+    const { project, pendingEdit, chatBusy } = get();
+    if (!project || !pendingEdit || chatBusy) return;
+
+    const push = (m: Omit<ChatMessage, "id">) =>
+      set((s) => {
+        const sessions = s.chatSessions.map((x) =>
+          x.id === s.activeChatId
+            ? { ...x, messages: [...x.messages, { id: crypto.randomUUID(), ...m }] }
+            : x,
+        );
+        if (s.project) saveChatSessions(s.project.root, sessions);
+        return { chatSessions: sessions };
+      });
+
+    set({ chatBusy: true });
+    try {
+      // Imported images are part of the change and are committed with it —
+      // an accepted proposal whose picture stayed untracked would be a page
+      // referencing a file nobody else has. They are untracked at this point,
+      // which `git::commit_paths` stages by name.
+      const paths = [
+        ...pendingEdit.files.map((f) => f.file),
+        ...pendingEdit.assets.map((a) => a.file),
+      ];
+      // The preview write can have been skipped (it failed); commit the files
+      // first in that case rather than committing a change that isn't there.
+      if (!pendingEdit.previewing) {
+        const res = await writeSources(
+          project.root,
+          pendingEdit.files.map((f) => [f.file, f.after] as [string, string]),
+        );
+        if (!res.ok) throw new Error(res.error ?? "write failed");
+      }
+      const [branch, hash] = await commitSession(
+        project.root,
+        `dedup: ${pendingEdit.summary}`,
+        paths,
+      );
+      patchChatMessage(set, pendingEdit.messageId, {
+        commit: hash,
+        outcome: "accepted",
+      });
+      set({ lastSave: { branch, hash }, pendingEdit: null });
+      gitStatus(project.root)
+        .then((g) => set({ git: g }))
+        .catch(() => {});
+      if (!pendingEdit.previewing) {
+        sendToOverlay({ type: "reload" });
+        set({ selected: null, sourceInfo: null });
+      }
+    } catch (e) {
+      push({
+        role: "assistant",
+        error: true,
+        text: String(e instanceof Error ? e.message : e),
+      });
+    } finally {
+      set({ chatBusy: false });
+    }
+  },
+
+  /** Put the files back exactly as dedup found them and take the preview off
+   *  the canvas. Nothing was committed, so there is nothing to revert in git. */
+  rejectChatEdit: async () => {
+    const { project, pendingEdit, chatBusy } = get();
+    if (!project || !pendingEdit || chatBusy) return;
+    set({ chatBusy: true });
+    try {
+      const error = await revertPreview(project.root, pendingEdit);
+      patchChatMessage(set, pendingEdit.messageId, { outcome: "rejected" });
+      set({ pendingEdit: null });
+      if (error) {
+        set((s) => ({
+          chatSessions: s.chatSessions.map((x) =>
+            x.id === s.activeChatId
+              ? {
+                  ...x,
+                  messages: [
+                    ...x.messages,
+                    {
+                      id: crypto.randomUUID(),
+                      role: "assistant" as const,
+                      error: true,
+                      text: `Could not put every file back: ${error}. Check git status — the session branch has the original.`,
+                    },
+                  ],
+                }
+              : x,
+          ),
+        }));
+      }
+      gitStatus(project.root)
+        .then((g) => set({ git: g }))
+        .catch(() => {});
+      sendToOverlay({ type: "reload" });
+      set({ selected: null, sourceInfo: null });
     } finally {
       set({ chatBusy: false });
     }
@@ -2108,6 +3103,17 @@ export const useStore = create<AppState>((set, get) => ({
     const { project, scanning, devStatus, instrumentation, selectedRoute } =
       get();
     if (!project || scanning) return;
+    // The duplicate engine reads React components; a static site has none.
+    // Refused here as well as hidden in the tab, so a keyboard shortcut or a
+    // stale call can't start a scan that could only ever find nothing.
+    if (project.framework === "static") {
+      set({
+        scanError:
+          "Duplicate detection compares React components — a static HTML site has none to compare.",
+        sidebarTab: "duplicates",
+      });
+      return;
+    }
     // A live, tagged canvas scans one artboard at a time — the user picks
     // which by selecting it. No selection = ask, don't guess.
     const canvasLive = devStatus === "ready" && instrumentation?.active;

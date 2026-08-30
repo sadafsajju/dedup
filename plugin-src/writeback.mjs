@@ -16,8 +16,24 @@
 import { parse } from "@babel/parser";
 import MagicString from "magic-string";
 import fs from "node:fs";
+import path from "node:path";
 import { collectJsx } from "./jsxwalk.mjs";
+import {
+  CONTEXT_FILE_RE,
+  MAX_FILE_BYTES,
+  discoverFiles,
+  relOf,
+} from "./files.mjs";
+import {
+  indentAt,
+  lineEndOf,
+  lineStartOf,
+  ownsLine,
+  reindent,
+  removalRange,
+} from "./srcedit.mjs";
 import { discoverRoutes } from "./routes.mjs";
+import { applyHtml, copyHtml, inspectHtml, validateHtmlContent } from "./htmlback.mjs";
 
 // className must stay a plain single-line string; anything else is refused.
 const SAFE_CLASS_RE = /^[^"'`\\\n\r]*$/;
@@ -228,54 +244,142 @@ function inspect({ file, index }) {
   };
 }
 
-// --- edit program -----------------------------------------------------------
+// --- copy (the read half of cut/copy/paste) ---------------------------------
 
-/** Indentation of the line `pos` sits on. */
-function indentAt(code, pos) {
-  const lineStart = code.lastIndexOf("\n", pos - 1) + 1;
-  const m = code.slice(lineStart, pos).match(/^[ \t]*/);
-  return m ? m[0] : "";
+/**
+ * Names a snippet carries out of its file with it: components it renders and
+ * variables its expressions read. A copied `<Card title={title} />` needs both
+ * `Card` and `title` wherever it lands, and neither travels with the markup.
+ *
+ * Deliberately one-sided. This is used to warn, never to rewrite: the caller
+ * checks whether the destination file mentions each name at all, and a name it
+ * has never heard of is proof the paste would break. Presence proves nothing
+ * (a same-named local is not the same binding) and is treated as fine — the
+ * honest gate is the one that only fires when it is certainly right.
+ */
+const KNOWN_GLOBALS = new Set([
+  "Array", "Boolean", "Date", "Error", "Infinity", "Intl", "JSON", "Math",
+  "NaN", "Number", "Object", "Promise", "React", "RegExp", "String", "Symbol",
+  "console", "document", "globalThis", "navigator", "undefined", "window",
+]);
+
+/** Depth-first walk of a babel subtree. `visit` returning false means it took
+ *  care of that node's children itself. */
+function walkAst(node, visit) {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const child of node) walkAst(child, visit);
+    return;
+  }
+  if (typeof node.type !== "string") return;
+  if (visit(node) === false) return;
+  for (const key of Object.keys(node)) {
+    if (key === "loc" || key === "leadingComments" || key === "trailingComments") {
+      continue;
+    }
+    walkAst(node[key], visit);
+  }
 }
 
-/** Start of the line `pos` sits on (so removals take the whole line). */
-function lineStartOf(code, pos) {
-  return code.lastIndexOf("\n", pos - 1) + 1;
-}
-
-/** End of the line `pos` sits on, including its newline. */
-function lineEndOf(code, pos) {
-  const nl = code.indexOf("\n", pos);
-  return nl === -1 ? code.length : nl + 1;
+function referencedNames(element) {
+  const used = new Set();
+  const bound = new Set();
+  const visit = (n) => {
+    switch (n.type) {
+      // A closing tag repeats the name the opening tag already reported.
+      case "JSXClosingElement":
+      case "JSXClosingFragment":
+        return false;
+      case "JSXOpeningElement": {
+        let name = n.name;
+        while (name && name.type === "JSXMemberExpression") name = name.object;
+        // Lowercase is an HTML tag; capitalised is a component the
+        // destination file has to have imported.
+        if (name?.type === "JSXIdentifier" && /^[A-Z]/.test(name.name)) {
+          used.add(name.name);
+        }
+        walkAst(n.attributes, visit);
+        return false;
+      }
+      // An attribute's *name* is not a reference; its value is.
+      case "JSXAttribute":
+        walkAst(n.value, visit);
+        return false;
+      // `a.b` reads `a`; `b` is a property, not a binding.
+      case "MemberExpression":
+      case "OptionalMemberExpression":
+        walkAst(n.object, visit);
+        if (n.computed) walkAst(n.property, visit);
+        return false;
+      case "ObjectProperty":
+        if (n.computed) walkAst(n.key, visit);
+        walkAst(n.value, visit);
+        return false;
+      case "ArrowFunctionExpression":
+      case "FunctionExpression": {
+        // Names the snippet binds for itself — `items.map((item) => …)` does
+        // not need an `item` at the destination.
+        walkAst(n.params, (p) => {
+          if (p.type === "Identifier") bound.add(p.name);
+        });
+        return;
+      }
+      case "Identifier":
+        if (!KNOWN_GLOBALS.has(n.name)) used.add(n.name);
+        return false;
+      default:
+        return;
+    }
+  };
+  walkAst(element, visit);
+  return [...used].filter((n) => !bound.has(n)).sort();
 }
 
 /**
- * Re-indent a captured block for its new home: strip the block's own base
- * indentation from every line after the first, then apply the target's.
- * Moved markup that lands a level deeper reads as if it were typed there.
+ * The element at `index`, verbatim, as a snippet that can be inserted
+ * somewhere else — the read half of cut/copy/paste.
+ *
+ * Verbatim is the point: the user copies what their file says, not a
+ * re-print of it, so a paste lands the same markup they were looking at. It
+ * is de-indented to zero here because that is the shape `insert` expects (it
+ * re-indents for wherever the snippet is going), and it goes through the same
+ * `validateSnippet` the paste will — a snippet that could never be written
+ * back has no business sitting on a clipboard pretending it could.
  */
-function reindent(text, fromIndent, toIndent) {
-  if (fromIndent === toIndent) return text;
-  return text
-    .split("\n")
-    .map((line, i) => {
-      if (i === 0) return line;
-      const stripped = line.startsWith(fromIndent) ? line.slice(fromIndent.length) : line;
-      return stripped.trim() === "" ? stripped : toIndent + stripped;
-    })
-    .join("\n");
+function copy({ file, index }) {
+  const code = fs.readFileSync(file, "utf8");
+  const nodes = nodesOf(code);
+  const node = nodeAt(nodes, index);
+  if (!node) {
+    return {
+      ok: false,
+      error: `no JSX element #${index} — source may have changed since tagging`,
+    };
+  }
+  const raw = code.slice(node.element.start, node.element.end);
+  const snippet = validateSnippet(reindent(raw, indentAt(code, node.element.start), ""));
+  if (snippet.error) return { ok: false, error: `copy: ${snippet.error}` };
+  return {
+    ok: true,
+    lang: "jsx",
+    snippet: snippet.code,
+    tag: tagNameOf(node.opening, code),
+    component: node.component,
+    refs: referencedNames(node.element),
+    // Every ordinal the copy swallowed, itself included. The editor copies
+    // the *file's* text, and this is what lets it notice that the user has
+    // staged edits inside the thing they just copied — which the file does
+    // not know about, and the copy therefore does not carry.
+    contains: nodes
+      .filter(
+        (n) =>
+          n.element.start >= node.element.start && n.element.end <= node.element.end,
+      )
+      .map((n) => n.index),
+  };
 }
 
-/** Element range including a trailing `{" "}`-free line when it owns its line. */
-function removalRange(code, element) {
-  const start = element.start;
-  const end = element.end;
-  const before = code.slice(lineStartOf(code, start), start);
-  if (before.trim() !== "") return { start, end };
-  const after = code.slice(end, lineEndOf(code, end));
-  if (after.trim() !== "") return { start, end };
-  // The element owns its line(s) — take the whole line so no blank is left.
-  return { start: lineStartOf(code, start), end: lineEndOf(code, end) };
-}
+// --- edit program -----------------------------------------------------------
 
 /**
  * Where a child lands relative to `target`, as an insertion offset and the
@@ -289,17 +393,17 @@ function insertionPoint(code, target, position) {
   const element = target.element;
   const opening = target.opening;
   const outer = indentAt(code, element.start);
-  const ownsLine = code.slice(lineStartOf(code, element.start), element.start).trim() === "";
+  const owns = ownsLine(code, element.start);
 
   if (position === "before") {
-    return ownsLine
+    return owns
       ? { at: lineStartOf(code, element.start), indent: outer, wrap: (b) => outer + b + "\n" }
       : { at: element.start, indent: outer, wrap: (b) => b + " " };
   }
 
   if (position === "after") {
     const trailing = code.slice(element.end, lineEndOf(code, element.end));
-    return ownsLine && trailing.trim() === ""
+    return owns && trailing.trim() === ""
       ? {
           at: lineEndOf(code, element.end),
           indent: outer,
@@ -355,6 +459,24 @@ function apply({ file, ops }) {
 
   const list = Array.isArray(ops) ? ops : [];
   const moves = list.filter((o) => o.op === "move");
+
+  // What this program deletes, resolved up front so an insert can be refused
+  // whichever order the two ops arrive in. Cut-then-paste puts both in one
+  // program, and appending into a chunk that is on its way out drops the
+  // content silently — the one failure a paste must never have.
+  const removedIndexes = new Set();
+  const removedRanges = [];
+  for (const op of list) {
+    if (op.op !== "remove") continue;
+    const node = nodeAt(nodes, op.index);
+    if (!node) continue;
+    removedIndexes.add(node.index);
+    removedRanges.push(removalRange(code, node.element.start, node.element.end));
+  }
+  // Inclusive of both ends: an insertion point sitting exactly on a removed
+  // chunk's boundary belongs to that chunk as far as magic-string is concerned.
+  const inRemovedRange = (pos) =>
+    removedRanges.some((r) => pos >= r.start && pos <= r.end);
 
   // Ranges whose content is relocated wholesale. Content ops inside them are
   // applied to the captured text instead of the outer string.
@@ -445,7 +567,7 @@ function apply({ file, ops }) {
           failures.push(`remove #${op.index}: ${caps.structuralReason}`);
           break;
         }
-        const range = removalRange(code, node.element);
+        const range = removalRange(code, node.element.start, node.element.end);
         if (inMovedRange(range.start)) {
           failures.push(`remove #${op.index}: element is inside an element being moved`);
           break;
@@ -462,9 +584,17 @@ function apply({ file, ops }) {
           failures.push(`insert: ${snippet.error}`);
           break;
         }
+        if (removedIndexes.has(target.index)) {
+          failures.push("insert: the element it is placed against is being deleted");
+          break;
+        }
         const point = insertionPoint(code, target, op.position);
         if (point && op.position === "inside" && !capabilities(target, code).canAcceptChildren) {
           failures.push(`insert: <${tagNameOf(target.opening, code)}> cannot take children`);
+          break;
+        }
+        if (point?.at != null && inRemovedRange(point.at)) {
+          failures.push("insert: destination is inside an element being deleted");
           break;
         }
         // Snippet lines carry no base indentation of their own.
@@ -506,7 +636,7 @@ function apply({ file, ops }) {
       failures.push(`move: <${tagNameOf(target.opening, code)}> cannot take children`);
       continue;
     }
-    const range = removalRange(code, node.element);
+    const range = removalRange(code, node.element.start, node.element.end);
     const point = insertionPoint(code, target, r.op.position);
     if (!point) {
       failures.push(`move: <${tagNameOf(target.opening, code)}> has no place to put a child`);
@@ -616,10 +746,7 @@ function validateSnippet(snippet) {
 // Full-file replacement (AI chat edits). The content is model output, so the
 // gate is strict: parse WITHOUT error recovery — any syntax error aborts the
 // write. The old content is returned so the caller can diff/undo.
-function writeFile({ file, content }) {
-  if (typeof content !== "string" || content.trim() === "") {
-    return { ok: false, error: "refusing to write empty content" };
-  }
+function validateJsxContent(content) {
   try {
     parse(content, {
       sourceType: "module",
@@ -628,15 +755,211 @@ function writeFile({ file, content }) {
   } catch (e) {
     return { ok: false, error: `new content does not parse, aborted: ${e.message}` };
   }
-  const previous = fs.readFileSync(file, "utf8");
-  if (previous === content) {
-    return { ok: true, changed: false };
-  }
-  fs.writeFileSync(file, content);
-  return { ok: true, changed: true };
+  return { ok: true };
 }
 
 // --- entry ------------------------------------------------------------------
+
+/**
+ * Which write-back a file gets. The extension is the whole decision: `.html`
+ * is markup the static server stamps and this sidecar edits through
+ * htmlback.mjs; everything JSX-shaped goes through the walk above. Anything
+ * else is refused by name rather than parsed hopefully.
+ */
+function languageOf(file) {
+  const ext = String(file).toLowerCase().match(/\.[a-z0-9]+$/)?.[0] ?? "";
+  if (ext === ".html" || ext === ".htm") return "html";
+  if ([".jsx", ".tsx", ".js", ".ts", ".mjs", ".cjs", ".mts", ".cts"].includes(ext)) {
+    return "jsx";
+  }
+  if (ext === ".css") return "css";
+  return null;
+}
+
+/**
+ * Stylesheet replacement (AI chat edits on a static site's CSS).
+ *
+ * dedup bundles no CSS parser, so this is deliberately *not* called a parse
+ * gate: it is a balance check — braces must close and no block comment may be
+ * left open. That catches a truncated model reply, which is the failure this
+ * is guarding against, and it says exactly what it checks rather than implying
+ * a guarantee it cannot make.
+ */
+function validateCssContent(content) {
+  const stripped = content.replace(/\/\*[\s\S]*?\*\//g, "");
+  if (stripped.includes("/*")) {
+    return { ok: false, error: "new stylesheet has an unclosed comment, aborted" };
+  }
+  let depth = 0;
+  for (const ch of stripped) {
+    if (ch === "{") depth++;
+    else if (ch === "}" && --depth < 0) break;
+  }
+  if (depth !== 0) {
+    return { ok: false, error: "new stylesheet has unbalanced braces, aborted" };
+  }
+  return { ok: true };
+}
+
+/**
+ * The one gate every full-content write passes, whatever produced it. The
+ * extension picks the check; an extension with no check is refused by name
+ * rather than written hopefully.
+ */
+function validateContent(file, content) {
+  if (typeof content !== "string" || content.trim() === "") {
+    return { ok: false, error: "refusing to write empty content" };
+  }
+  const lang = languageOf(file);
+  if (lang === "html") return validateHtmlContent(content);
+  if (lang === "css") return validateCssContent(content);
+  if (lang === "jsx") return validateJsxContent(content);
+  return {
+    ok: false,
+    error: `dedup cannot write ${path.basename(file)} — unsupported file type`,
+  };
+}
+
+/** Write validated content. Returns whether the file actually changed; a new
+ *  file (the agent extracting a component) counts as a change. */
+function commitContent(file, content) {
+  let previous = null;
+  try {
+    previous = fs.readFileSync(file, "utf8");
+  } catch {
+    previous = null; // a file that does not exist yet
+  }
+  if (previous === content) return false;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, content);
+  return true;
+}
+
+function writeFile({ file, content }) {
+  const check = validateContent(file, content);
+  if (!check.ok) return check;
+  return { ok: true, changed: commitContent(file, content) };
+}
+
+/**
+ * Multi-file replacement — the chat agent's write path.
+ *
+ * Every file is validated before ANY file is written. That is the same
+ * all-or-nothing guarantee the single-file write-back makes within one file,
+ * extended across a set: a program that would leave the project half-edited
+ * (a new component written, its call site not) writes nothing at all. It is
+ * the reason the agent may touch more than one file in the first place.
+ */
+function writeFiles({ files }) {
+  if (!Array.isArray(files) || files.length === 0) {
+    return { ok: false, error: "no files to write" };
+  }
+  for (const f of files) {
+    const check = validateContent(f.file, f.content);
+    if (!check.ok) {
+      return { ok: false, error: `${f.rel ?? path.basename(f.file)}: ${check.error}` };
+    }
+  }
+  const changed = [];
+  for (const f of files) {
+    if (commitContent(f.file, f.content)) {
+      changed.push(f.rel ?? path.basename(f.file));
+    }
+  }
+  return { ok: true, changed };
+}
+
+/**
+ * Put files back exactly as dedup found them — how a previewed chat edit is
+ * discarded. `content: null` means the file did not exist before, so it is
+ * removed.
+ *
+ * Deliberately *not* gated on validateContent, and this is the one write path
+ * where that is right. The gate exists to catch model output; this is bytes
+ * dedup itself read off these exact files a moment ago. Validating them would
+ * refuse to restore a file that was already broken — which is precisely the
+ * case where the user asked the agent for help, previewed the fix, and wants
+ * their original state back.
+ */
+function revertFiles({ files }) {
+  if (!Array.isArray(files) || files.length === 0) {
+    return { ok: false, error: "no files to revert" };
+  }
+  const restored = [];
+  for (const f of files) {
+    try {
+      if (f.content === null || f.content === undefined) {
+        fs.rmSync(f.file, { force: true });
+      } else {
+        fs.writeFileSync(f.file, f.content);
+      }
+      restored.push(f.rel ?? path.basename(f.file));
+    } catch (e) {
+      return {
+        ok: false,
+        error: `could not restore ${f.rel ?? path.basename(f.file)}: ${e?.message ?? e}`,
+        restored,
+      };
+    }
+  }
+  return { ok: true, restored };
+}
+
+// --- chat-agent context tools ----------------------------------------------
+//
+// The agent is never handed tools or write access to the user's project (that
+// would be a second, unaudited path to their source). It asks dedup for what
+// it wants to see and dedup answers — these two commands are the whole of
+// what it can ask for, and both are read-only.
+
+/** `public/` is skipped by the shared traversal because it holds build
+ *  output; a static site keeps its actual pages there. */
+const CONTEXT_ALLOW_DIRS = new Set(["public"]);
+
+function listFiles({ root, limit }) {
+  const files = discoverFiles(root, CONTEXT_FILE_RE, CONTEXT_ALLOW_DIRS)
+    .map((f) => relOf(root, f))
+    .filter((f) => !f.includes("node_modules/"));
+  const max = Number.isInteger(limit) && limit > 0 ? limit : 1200;
+  return { ok: true, files: files.slice(0, max), total: files.length };
+}
+
+/**
+ * Grep, as a regex when the pattern is one and as a literal when it isn't —
+ * a model asking for `useState(` should get matches, not a syntax error.
+ */
+function grepFiles({ root, pattern, limit }) {
+  if (typeof pattern !== "string" || pattern.trim() === "") {
+    return { ok: false, error: "grep needs a pattern" };
+  }
+  let re;
+  try {
+    re = new RegExp(pattern, "i");
+  } catch {
+    re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  }
+  const max = Number.isInteger(limit) && limit > 0 ? limit : 80;
+  const matches = [];
+  for (const abs of discoverFiles(root, CONTEXT_FILE_RE, CONTEXT_ALLOW_DIRS)) {
+    if (matches.length >= max) break;
+    let code;
+    try {
+      if (fs.statSync(abs).size > MAX_FILE_BYTES) continue;
+      code = fs.readFileSync(abs, "utf8");
+    } catch {
+      continue;
+    }
+    if (!re.test(code)) continue;
+    const rel = relOf(root, abs);
+    const lines = code.split("\n");
+    for (let i = 0; i < lines.length && matches.length < max; i++) {
+      if (re.test(lines[i])) {
+        matches.push({ file: rel, line: i + 1, text: lines[i].trim().slice(0, 200) });
+      }
+    }
+  }
+  return { ok: true, matches, truncated: matches.length >= max };
+}
 
 let input = "";
 process.stdin.setEncoding("utf8");
@@ -645,14 +968,32 @@ process.stdin.on("end", () => {
   let result;
   try {
     const req = JSON.parse(input);
-    if (req.cmd === "inspect") result = inspect(req);
+    const lang = req.file ? languageOf(req.file) : null;
+    if (req.cmd === "inspect") {
+      result = lang === "html" ? inspectHtml(req) : inspect(req);
+    }
+    // The read half of cut/copy/paste: an element's own source, as a snippet
+    // the insert op will take back.
+    else if (req.cmd === "copy") {
+      result = lang === "html" ? copyHtml(req) : copy(req);
+    }
     // Route discovery from outside the dev server. Vite projects get this
     // over HTTP from the tagger's middleware; Next has no middleware to add
     // one to, so this is the only way its file-based routes are ever found.
-    else if (req.cmd === "routes") result = { ok: true, routes: discoverRoutes(req.root) };
-    else if (req.cmd === "apply") result = apply(req);
-    else if (req.cmd === "writeFile") result = writeFile(req);
-    else result = { ok: false, error: `unknown cmd: ${req.cmd}` };
+    else if (req.cmd === "routes") result = { ok: true, routes: discoverRoutes(req.root, req.framework) };
+    else if (req.cmd === "apply") {
+      result = lang === "html" ? applyHtml(req) : apply(req);
+    } else if (req.cmd === "writeFile") {
+      result = writeFile(req);
+    } else if (req.cmd === "writeFiles") {
+      result = writeFiles(req);
+    } else if (req.cmd === "revertFiles") {
+      result = revertFiles(req);
+    } else if (req.cmd === "listFiles") {
+      result = listFiles(req);
+    } else if (req.cmd === "grep") {
+      result = grepFiles(req);
+    } else result = { ok: false, error: `unknown cmd: ${req.cmd}` };
   } catch (e) {
     result = { ok: false, error: String(e?.message ?? e) };
   }

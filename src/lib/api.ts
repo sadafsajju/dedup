@@ -12,7 +12,6 @@ import type {
   GitStatus,
   InstrumentationInfo,
   LogEvent,
-  PackageManager,
   ProjectInfo,
   ReadyEvent,
   RecentProject,
@@ -29,6 +28,7 @@ import type {
   VisualDiff,
   NextStatus,
   CliAgent,
+  StarterKind,
 } from "./types";
 
 export const detectProject = (root: string) =>
@@ -37,20 +37,28 @@ export const detectProject = (root: string) =>
 export const gitStatus = (root: string) =>
   invoke<GitStatus>("git_status", { root });
 
-export const startDevServer = (
-  root: string,
-  packageManager: PackageManager,
-  framework: Framework,
-  devScript: string | null,
-  customCommand?: string,
-) =>
+/** Start the project's dev server. Takes the whole detection result because
+ *  what to launch is a property of the project, not five loose arguments —
+ *  and a static site needs `staticDir`, which only detection knows. */
+export const startDevServer = (project: ProjectInfo, customCommand?: string) =>
   invoke<void>("start_dev_server", {
-    root,
-    packageManager,
-    framework,
-    devScript,
+    root: project.root,
+    packageManager: project.packageManager,
+    framework: project.framework,
+    devScript: project.devScript,
+    staticDir: project.staticDir,
     customCommand: customCommand ?? null,
   });
+
+/** Write a starter into an empty folder and make it a git repo. Returns the
+ *  freshly detected project. Progress streams as `scaffold://log`. */
+export const scaffoldProject = (root: string, kind: StarterKind) =>
+  invoke<ProjectInfo>("scaffold_project", { root, kind });
+
+export const onScaffoldLog = (
+  cb: (line: string) => void,
+): Promise<UnlistenFn> =>
+  listen<{ line: string }>("scaffold://log", (e) => cb(e.payload.line));
 
 export const stopDevServer = () => invoke<void>("stop_dev_server");
 
@@ -86,6 +94,21 @@ export interface InspectResult {
 export const inspectElement = (root: string, file: string, index: number) =>
   invoke<InspectResult>("inspect_element", { root, file, index });
 
+/** One element's own source, as a snippet a paste can write elsewhere, plus
+ *  the names it reads but does not carry with it (components, variables). */
+export const copyElement = (root: string, file: string, index: number) =>
+  invoke<{
+    ok: boolean;
+    error?: string;
+    snippet?: string;
+    lang?: "jsx" | "html";
+    tag?: string;
+    component?: string | null;
+    refs?: string[];
+    /** Ordinals inside the copied subtree, itself included. */
+    contains?: number[];
+  }>("copy_element", { root, file, index });
+
 /** Apply one file's staged edit program — all ops land, or none do. */
 export const applyEdits = (root: string, file: string, ops: EditOp[]) =>
   invoke<{ ok: boolean; changed?: boolean; error?: string }>("apply_edits", {
@@ -107,6 +130,50 @@ export const writeSource = (root: string, file: string, content: string) =>
     file,
     content,
   });
+
+/**
+ * Replace several source files as one all-or-nothing write — the chat agent's
+ * write path. Every file's new content is validated before any of them is
+ * written, so a multi-file edit cannot leave the project half-changed. Files
+ * that don't exist yet are created (and only here: this is the one path on
+ * which dedup writes a file the user didn't already have).
+ */
+export const writeSources = (root: string, files: [string, string][]) =>
+  invoke<{ ok: boolean; changed?: string[]; error?: string }>("write_sources", {
+    root,
+    files,
+  });
+
+/**
+ * Put files back exactly as dedup found them — discarding a previewed chat
+ * edit. A null content means the file didn't exist before and is removed.
+ * Deliberately not content-gated: this restores bytes dedup read off these
+ * files, and a file that was already broken must still be restorable.
+ */
+export const revertSources = (
+  root: string,
+  files: [string, string | null][],
+) =>
+  invoke<{ ok: boolean; restored?: string[]; error?: string }>(
+    "revert_sources",
+    { root, files },
+  );
+
+/** Every file the chat agent may look at, project-relative. */
+export const listProjectFiles = (root: string) =>
+  invoke<{ ok: boolean; files?: string[]; total?: number; error?: string }>(
+    "list_project_files",
+    { root },
+  );
+
+/** Line matches for `pattern` across those same files. */
+export const grepProject = (root: string, pattern: string) =>
+  invoke<{
+    ok: boolean;
+    matches?: { file: string; line: number; text: string }[];
+    truncated?: boolean;
+    error?: string;
+  }>("grep_project", { root, pattern });
 
 // --- Duplicate scan (FR-5.x) -----------------------------------------------
 
@@ -130,6 +197,23 @@ export const agentPrompt = (
   prompt: string,
   model?: string | null,
 ) => invoke<string>("agent_prompt", { agent, prompt, model: model ?? null });
+
+/** Copy a file the agent generated into the project — an image, the one
+ *  output it cannot put in its reply. Every gate is in `asset.rs`: the source
+ *  must be inside that agent's own output directory, the bytes must sniff as
+ *  an image, and the destination must be a new path inside the project. */
+export const importAgentAsset = (
+  root: string,
+  agent: CliAgent,
+  source: string,
+  dest: string,
+) =>
+  invoke<{ file: string; bytes: number; kind: string }>("import_agent_asset", {
+    root,
+    agent,
+    source,
+    dest,
+  });
 
 /** Cached AI category assignments (file#name → {hash, category}). */
 export const loadSessionSeed = (root: string) =>
@@ -246,9 +330,10 @@ export const onInstrumentation = (
 
 /** Page routes read from the project's files — works with no dev server, and
  *  is the only route source a Next.js project has (no middleware to add). */
-export const detectRoutesFromSource = (root: string) =>
+export const detectRoutesFromSource = (root: string, framework: Framework) =>
   invoke<{ ok: boolean; routes?: string[]; error?: string }>("detect_routes", {
     root,
+    framework,
   });
 
 /** What dedup can do for a Next.js project: wired, offered (with the exact

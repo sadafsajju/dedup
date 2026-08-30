@@ -8,9 +8,9 @@
 //! its visuals become editable.
 //!
 //! The seed is honest by construction:
-//! - it lives in `node_modules/.dedup/` (the sanctioned injection point — the
-//!   user's source and config are never touched), like the tagger and
-//!   overlay assets;
+//! - it lives in dedup's support directory for the project (the sanctioned
+//!   injection point — the user's source and config are never touched), like
+//!   the tagger and overlay assets;
 //! - the tagger serves it only into framed canvas pages, so the user's own
 //!   browsing of the dev server is untouched (see the framed gate in
 //!   `dedup-session.js`);
@@ -26,8 +26,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Persisted per project at `node_modules/.dedup/session.json` — the tagger
-/// reads the same file at serve time (see `dedup-session.js` middleware).
+/// Persisted per project at `<support_dir>/session.json` — the tagger reads
+/// the same file at serve time (see the `dedup-session.js` middleware), and the
+/// static server is handed its path on the command line. `support_dir` is
+/// `node_modules/.dedup` for a node project and the app cache directory for a
+/// static site, which has no node_modules to hide anything in.
 #[derive(Serialize, Deserialize, Default)]
 pub struct SessionSeed {
     pub enabled: bool,
@@ -37,7 +40,7 @@ pub struct SessionSeed {
 }
 
 fn seed_path(root: &str) -> PathBuf {
-    Path::new(root).join("node_modules/.dedup/session.json")
+    crate::sidecar::support_dir(root).join("session.json")
 }
 
 pub fn load(root: &str) -> Option<SessionSeed> {

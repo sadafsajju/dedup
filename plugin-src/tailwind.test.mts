@@ -2,16 +2,17 @@
 // Run: pnpm test:tw  (node --experimental-strip-types)
 import assert from "node:assert/strict";
 import {
-  toTokens,
-  fromTokens,
-  readKnob,
-  setKnob,
-  readSpacing,
-  writeSpacing,
   KNOBS,
-  stepSpacing,
   cssColor,
+  fromTokens,
   mergeClasses,
+  readKnob,
+  readSpacing,
+  setKnob,
+  sizeClass,
+  stepSpacing,
+  toTokens,
+  writeSpacing,
 } from "../src/lib/tailwind.ts";
 
 let passed = 0;
@@ -157,6 +158,58 @@ test("mergeClasses leaves variants and unknown classes alone", () => {
   assert.equal(mergeClasses("p-2 hover:p-4"), "p-2 hover:p-4");
   assert.equal(mergeClasses("my-own-class p-2"), "my-own-class p-2");
   assert.equal(mergeClasses(""), "");
+});
+
+// --- resize gesture → classes ------------------------------------------------
+//
+// A canvas resize is a class edit, so the only question that matters is
+// whether the class it produces is exactly the size that was dragged. It never
+// snaps to the spacing scale: `w-64` is 256px only while `--spacing` is its
+// default, and a project that redefines it would get a silently different size
+// than the one under the pointer.
+
+test("a dragged size becomes an exact arbitrary value", () => {
+  assert.equal(sizeClass("w", 437), "w-[437px]");
+  assert.equal(sizeClass("h", 180), "h-[180px]");
+  assert.equal(
+    sizeClass("w", 256),
+    "w-[256px]",
+    "a scale-sized drag must not snap to w-64 — the scale moves with --spacing",
+  );
+  assert.equal(sizeClass("w", 12.6), "w-[13px]", "sub-pixel drags round");
+  assert.equal(sizeClass("w", -5), "w-[0px]", "never a negative size");
+});
+
+test("resizing replaces the existing width, whatever form it had", () => {
+  for (const before of ["w-full", "w-64", "w-[100px]", "w-1/2"]) {
+    const after = fromTokens(
+      setKnob(toTokens(`${before} p-4 flex`), KNOBS.width, sizeClass("w", 437)),
+    );
+    assert.equal(after.includes(before), false, `${before} should be replaced`);
+    assert.match(after, /w-\[437px\]/);
+    assert.match(after, /p-4/, "unrelated classes must survive");
+    assert.match(after, /flex/);
+  }
+});
+
+test("a side grip sets one axis and leaves the other alone", () => {
+  // The overlay sends null for the axis it did not drag; pinning a
+  // content-sized height because the user dragged sideways would be a bug the
+  // user could not see until the content changed.
+  const tokens = setKnob(toTokens("p-4"), KNOBS.width, sizeClass("w", 300));
+  const out = fromTokens(tokens);
+  assert.match(out, /w-\[300px\]/);
+  assert.equal(/\bh-/.test(out), false, "height must not appear");
+});
+
+test("a corner grip sets both axes", () => {
+  let tokens = toTokens("rounded p-4");
+  tokens = setKnob(tokens, KNOBS.width, sizeClass("w", 300));
+  tokens = setKnob(tokens, KNOBS.height, sizeClass("h", 180));
+  const out = fromTokens(tokens);
+  assert.match(out, /w-\[300px\]/);
+  assert.match(out, /h-\[180px\]/);
+  assert.match(out, /rounded/);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

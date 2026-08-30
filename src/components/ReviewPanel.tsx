@@ -114,6 +114,7 @@ export function ReviewPanel({ onClose }: { onClose: () => void }) {
   const actions = useStore((s) => s.actions);
   const saveAll = useStore((s) => s.saveAll);
   const saving = useStore((s) => s.saving);
+  const discardAllEdits = useStore((s) => s.discardAllEdits);
   // A class scrubbed back to where it started is staged but not a change.
   const dirty = actions
     .map((action, index) => ({ action, index }))
@@ -128,6 +129,16 @@ export function ReviewPanel({ onClose }: { onClose: () => void }) {
           Staged changes
         </span>
         <span className="flex-1" />
+        {dirty.length > 0 && (
+          <button
+            onClick={discardAllEdits}
+            disabled={saving}
+            title="Throw every staged edit away. Nothing here has been written, so there is nothing to put back."
+            className="mr-1 rounded px-1.5 py-0.5 text-2xs text-ink-faint hover:text-danger disabled:opacity-40"
+          >
+            Discard all
+          </button>
+        )}
         <button
           onClick={onClose}
           className="text-ink-faint hover:text-ink p-0.5 rounded"

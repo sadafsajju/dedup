@@ -24,10 +24,38 @@
  */
 export const HOLD_FLAG = "__dedup_hold";
 
-/** A route's frame URL, carrying the hold flag when that artboard is frozen. */
-export function frameUrl(route: string, origin: string, held: boolean): string {
+/**
+ * Query flag asking a frame to render as if the machine had no internet: the
+ * app's own requests fail, the dev server's keep working. Like the hold it has
+ * to reach the page before the app boots — a fetch on mount must already fail
+ * — so it travels the same way, on the frame's URL, and the same separately
+ * bundled boot script reads it. `pnpm test:origins` asserts the two agree.
+ */
+export const OFFLINE_FLAG = "__dedup_offline";
+
+/** Every flag dedup puts on a frame's URL wears this prefix. The overlay
+ *  keeps params matching it across any navigation it drives, by prefix rather
+ *  than by name — it is a third separately bundled world, and one more list to
+ *  keep in sync is one more way to drop a flag with nothing to see. */
+export const FLAG_PREFIX = "__dedup";
+
+/** What an artboard is being asked to do to its frame, beyond loading it. */
+export interface FrameFlags {
+  /** Freeze on the first screen (splash/interstitial editing). */
+  held?: boolean;
+  /** Cut the app's network so its no-internet state renders. */
+  offline?: boolean;
+}
+
+/** A route's frame URL, carrying whichever flags that artboard has set. */
+export function frameUrl(
+  route: string,
+  origin: string,
+  flags: FrameFlags = {},
+): string {
   const url = new URL(route, origin);
-  if (held) url.searchParams.set(HOLD_FLAG, "1");
+  if (flags.held) url.searchParams.set(HOLD_FLAG, "1");
+  if (flags.offline) url.searchParams.set(OFFLINE_FLAG, "1");
   return url.toString();
 }
 

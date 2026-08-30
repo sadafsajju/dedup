@@ -7,8 +7,9 @@ known limitations accepted knowingly.
 
 **Current state: Phases 0–5 complete.**
 (Plus a 2026-08-22 inspector/chrome UI pass, a 2026-08-23 structural-editing
-+ element-identity rework, and a 2026-08-28 floating-canvas redesign — see the
-interludes below.)
++ element-identity rework, a 2026-08-28 floating-canvas redesign, and a
+2026-08-29 pass widening what dedup can open — static HTML sites, and empty
+folders that become a project — see the interludes below.)
 
 ---
 
@@ -1131,12 +1132,766 @@ Three things follow from that, and each is a real change rather than styling:
 
 ---
 
+## Two more kinds of folder — static sites and empty ones (2026-08-29)
+
+dedup could open a Vite or Next project and nothing else. It now opens two more
+things, and they turned out to be one change rather than two: what dedup can
+*create* in an empty folder is exactly the set of things it can *open*.
+
+**PRD deviation, deliberate.** §1.5 lists "creating new projects / scaffolding"
+as an MVP non-goal, on the reasoning that dedup is not a v0/Lovable competitor.
+That reasoning still holds and this does not cross it: there is no generation
+here, no prompt-to-app. There are two fixed starter templates, offered only
+when the folder is empty, so that "open a folder" has a sensible answer for a
+folder with nothing in it. The non-goal it protects — dedup does not compete on
+building apps from prompts — is untouched.
+
+### Static sites (`Framework::Static`)
+
+A folder of `.html` files has no build step to inject a tagger into. It also
+needs none: the file *is* the markup, so the element↔source mapping is 1:1
+rather than compiled — genuinely simpler than the JSX path, not a degraded
+version of it.
+
+**dedup is the dev server.** `plugin-src/serve.mjs` serves the folder and runs
+every HTML response through the stamper on the way out. It announces its URL in
+Vite's format on purpose: `devserver.rs` parses that line, so process-group
+teardown, log streaming and ready-URL detection all apply with no second code
+path. Live reload is an SSE endpoint plus `fs.watch` — the static equivalent of
+HMR, which for a page with no module graph is just a reload.
+
+**One walk, two languages.** `htmlwalk.mjs` is to HTML what `jsxwalk.mjs` is to
+JSX: the single definition of which elements dedup knows about, in what order,
+and what may be done to each. The stamper (`htmltag.mjs`) and the write-back
+(`htmlback.mjs`) both import it, for the same reason the JSX pair does — an
+element's id is its ordinal in that walk, so two walks would be two
+incompatible identity schemes for one write-back. `writeback.mjs` dispatches
+between the two by file extension and nothing else.
+
+**The gate is structural, because parsing proves nothing here.** This is the
+one genuinely new safety problem. A JSX write-back can re-parse its output and
+be told definitively that it broke the file. HTML5 is *required* to recover
+from anything, so `<div class="a><p>x</p></div>` is not an error — it is a
+`<div>` with a very long class attribute that ate the paragraph. So:
+
+- a content-only program must leave the output's tag sequence (depth + tag, in
+  walk order) **identical**;
+- a structural program must produce **exactly** the element count its ops imply;
+- either way the output may introduce **no HTML5 parse error the input did not
+  already have**;
+- and a snippet whose element is never closed is refused at the boundary — it
+  is a legal fragment that would swallow every sibling after it, and nothing
+  downstream would notice.
+
+Each of those is a test in `pnpm test:html`, written before the rule it guards.
+
+**Where dedup's files go.** `node_modules/.dedup` was chosen because it is
+git-invisible by construction. A static site has no node_modules, and creating
+one to hide files in would drop an untracked folder into the user's repo. So
+`sidecar::support_dir` is now the single answer to "where do this project's
+dedup files live": `node_modules/.dedup` with a package.json, the app cache
+directory keyed by project path without one. Nothing lands in a static site's
+folder at all.
+
+**Honest about what's off.** The Duplicates tab reads React components, so it
+is read-only with that reason on a static site rather than a Scan button that
+could only ever find nothing — and `runScan` refuses it too, so a shortcut
+can't start one. The typecheck and build gates report `skipped`, which is
+already a first-class verdict. The compatibility card drops the TypeScript and
+package-manager badges: those aren't things a hand-written site is missing,
+they're things it doesn't have.
+
+### Empty folders
+
+`project::detect` answers `is_empty` before any heuristic runs. "Unsupported —
+no package.json" is a true statement about an empty folder and a useless one;
+the launch screen shows a starter picker instead of a verdict.
+
+Two starters, matching the two things dedup opens: **React app** (Vite +
+TypeScript + Tailwind v4, installs dependencies) and **HTML page** (index.html
++ style.css + the Tailwind CDN, no install, works offline). Both include
+Tailwind deliberately — the Style panel writes Tailwind classes, and a starter
+without it would let the panel write classes that render nothing.
+
+`scaffold.rs` refuses any folder that isn't empty, writes the files, runs
+`git init`, and commits the starter as the repo's **initial commit** — so every
+dedup edit afterwards has a clean baseline to diff against. Install runs after
+the commit, so the first commit is the starter and not whatever a lockfile
+resolved to. An install failure keeps the files and says what to run.
+
+### Deviations / limitations accepted
+
+- The static write-back edits `.html`; `.css` gets a brace-balance check on
+  whole-file AI writes, explicitly **not** called a parse gate (dedup bundles
+  no CSS parser, and the check is honest about being a truncation guard).
+- Isolated component previews, the duplicate scan and the merge stay
+  React-only. There is no component to preview in a static site.
+- A static site's pages are found at the root or in one of `public/`, `site/`,
+  `www/`, `docs/`, `src/`. The server serves that folder (`--root`) while ids
+  stay relative to the project root (`--base`), so one project has one path
+  vocabulary.
+- The starter picker and the static editor session are wired and typechecked
+  but were not clicked through by hand; every layer beneath them is covered by
+  the tests below, including the seam between them.
+
+**Tests:** `pnpm test:html` (25) — the HTML walk, stamper, write-back, every
+refusal above, the static server's path-traversal refusal, and the id
+round-trip between the two separately-bundled halves. Rust (80 total, +10):
+empty/static detection, the subfolder case, Tailwind read off the page, a Vite
+project's index.html *not* being mistaken for a static site, both starters
+producing a project `detect` recognises, and one end-to-end test that takes an
+empty folder to a served, stamped page with the user's file untouched.
+
+## Fix — double-click to edit text, and a text tool to show it (2026-08-29)
+
+Double-clicking text on the canvas was supposed to put the caret in it. It did,
+intermittently, which read as broken.
+
+**The race.** A double-click's two clicks each select, and `setSelected` fires
+an `inspect` through the node sidecar to learn whether the element's text may
+be edited. `requestTextEdit` read `sourceInfo` and returned silently on a null
+— and the sidecar spawn usually had not returned by the time `dblclick` fired.
+Worse, the *second* click reset `sourceInfo` to null and started a second
+lookup, so the gesture actively raced itself.
+
+Two changes: `setSelected` no longer restarts an inspect for the element that
+is already selected, and the in-flight lookup is held in `sourceInfoPending` so
+`requestTextEdit` can **await** the answer instead of giving up on it. When the
+answer is "no", the element is still selected and the Inspector is already
+showing `textReason` — the reason is on screen, and entering a text mode that
+could not type would be the dishonest part.
+
+**The missing mode.** Nothing in the UI ever said a caret was on the canvas.
+There is now a `text` tool (T) beside Select/Hand/Browse:
+
+- Double-clicking text enters it for that one edit and hands it back when the
+  caret leaves; choosing it with T or the button is sticky, so the next click
+  edits the next thing (`textToolSticky`).
+- In the tool, a **single** click puts the caret in — a selection *is* an edit
+  request there.
+- While a caret is actually in the page the button widens to read "Typing", so
+  the user can tell an armed tool from a live one and knows why their
+  keystrokes are going into the artboard.
+
+The mode follows the caret rather than intent: only the overlay knows when an
+edit ends (Escape, Enter, a click elsewhere, a re-render), so it now posts
+`text-editing {id|null}` and the store's `setTextEditing` owns the tool. The
+overlay also gained a `text-edit-end` command, because leaving the tool has to
+take the caret with it — one still blinking in a page you are now panning is a
+lie about the mode.
+
+Two smaller things fell out: a repeat `text-edit-begin` on the element already
+being typed into is now a no-op (it used to end and restart the edit,
+reselecting all its text and losing the caret position), and the insert
+palette's text button became a paragraph glyph — two identical `T`s a few
+pixels apart read as one control.
+
+**Not done:** the canvas cursor doesn't change to an I-beam in the text tool.
+That needs the overlay to be told the tool, which is a third field on
+`set-edit-mode` and three call sites, for a cosmetic cue the highlighted
+toolbar and the "Typing" label already carry.
+
+**Tests:** `pnpm test:overlay` (17, +3) — the overlay reports a caret landing
+and leaving, a repeat begin does not restart the edit, the editor can take the
+caret back, and the tool shortcuts (now including T) are forwarded from inside
+the canvas but never while typing, so "the" can no longer switch tools and
+delete the selection.
+
+---
+
+## Chat becomes an agent (2026-08-30)
+
+The chat tab could only do one thing: edit the file behind the element you had
+selected. No selection, no chat — the composer was disabled and the placeholder
+said "Select an element first". That is not what anyone coming from Cursor
+expects, and it is wrong on its own terms too: the moment you most need to ask
+a question is when the build is broken and there is nothing on the canvas to
+click.
+
+**A selection is context, not a gate.** The composer is always live once a
+backend is connected. With something selected, its file goes in with the
+element named and its line pointed at, and a chip above the composer says so —
+dismissing the chip clears the selection, because the selection *is* the
+attachment and a second piece of state pretending otherwise would drift. With
+nothing selected, the project's file inventory goes in instead, and the model
+finds its own way.
+
+**Tools it doesn't have.** Finding its own way means reading files, and the
+non-negotiable rule is that a coding agent dedup borrows is never given tools
+or write access — a second path to the user's source would be an unaudited one.
+So the tools are a *protocol*, not a capability: the model replies with `TOOL:
+read <path>`, `TOOL: grep <pattern>` or `TOOL: list`, dedup runs the read-only
+sidecar and hands the results back as the next turn, up to `MAX_TOOL_ROUNDS`
+(6). Everything the model can see, dedup fetched on purpose and can show the
+user — the trace of what it looked at is printed above each answer.
+
+**Multi-file, all or nothing.** Edit blocks now carry the file they belong to
+(`<<<<<<< SEARCH src/Card.tsx`), and `<<<<<<< CREATE … >>>>>>> END` adds a whole
+new file, so "extract this into its own component" — which the empty-state copy
+had been promising since Phase 4 — is finally a thing chat can do. The write
+path is `writeFiles`: every file's new content is validated *before any file is
+written*, the same guarantee the class write-back makes within one file and the
+merge codemod makes across a set. A refactor that half-lands is not a state the
+project can reach.
+
+Two refusals fell out of it and both have tests. A block naming a file the
+model never read is refused rather than applied — a SEARCH written from memory
+is exactly what the exact-match rule exists to catch. And a file over 120KB is
+not sent at all: a reply that got truncated mid-file, written back, would
+delete the rest of the module.
+
+**A proposal you can look at.** The old flow applied the model's edit and
+committed it in one breath; the first sight of the change was a canvas reload
+of something already in your history. The first pass at fixing that showed a
+diff and wrote nothing until Apply — which was safer and still wrong, because a
+diff tells you what changed and not how it looks, and looking is the reason
+dedup renders the app at all.
+
+So a reply becomes a *proposal that is on the canvas*: written out through the
+parse-gated `writeSources`, uncommitted, with its diff in the chat. **Keep**
+commits it to the session branch; **Discard** calls `revertSources` and puts
+every file back byte-for-byte — original content restored, created files
+removed. The safety line moved from "written vs not" to "committed vs not",
+which is the same bargain Cursor makes and the only one under which a preview
+can exist at all.
+
+Three things fell out of that and each is load-bearing. The revert path is the
+one write that is deliberately **not** content-gated: it restores bytes dedup
+read off those exact files, and validating them would refuse to put back a file
+that was already broken — precisely the case where the user asked the agent for
+help, previewed the fix, and wants their tree back. Leaving the project reverts
+a live preview, because closing is not a decision to keep it. And the top bar
+carries an **AI preview — keep or discard** badge, because a user who switched
+to the Design tab would otherwise have uncommitted AI edits on disk with
+nothing on screen saying so.
+
+Only one proposal is unresolved at a time: a second was computed against the
+contents the first put on disk, so keeping both would mean keeping one that is
+quietly wrong. Superseding reverts the older preview and marks it `superseded`
+in the transcript rather than dropping it silently.
+
+The proposal's file *contents* live in transient store state, not in the
+persisted transcript. A chat log is saved per project; it has no business
+holding snapshots of the user's source.
+
+Two guards moved rather than disappeared. The stale-selection check no longer
+kills the turn — the element pointer is dropped and the model is told the
+selection is out of date, which is strictly better than aiming it at the wrong
+element. And the "this file has unsaved style edits" refusal moved from
+send-time to just before the preview write: until the model answers dedup does
+not know which files are in play, and the preview is the moment it starts
+mattering.
+
+Also un-gated: the console drawer's **Ask AI** button, which required a
+selection to send a build error to a chat that then had to fix it in that one
+file. It now asks the agent to find the cause.
+
+Still not Cursor: replies do not stream (the CLI bridge waits for the whole
+child process, so there is no Stop button either), and there is no ⌘K inline
+edit in the code panel. Both are additive on top of this shape.
+
+## Fix — committing a file that didn't exist (2026-08-30)
+
+"Can we add a new page?" produced a good answer, a correct preview, and then
+`git commit failed: error: pathspec 'docs.html' did not match any file(s)
+known to git` on Keep.
+
+`git commit -- <path>` takes a **pathspec**, and a pathspec matches only files
+git already knows about. That form was chosen deliberately — it commits the
+worktree state of exactly those paths and leaves the user's own staged work for
+other files alone (FR-4.5) — but it silently cannot express "and this file is
+new". The failure lands at the worst possible moment: after the file is on
+disk, when the user has already looked at it and said yes.
+
+`commit_paths` now stages the untracked paths in the set first, and only those.
+A tracked path keeps the bare pathspec form, so the guarantee that made the
+original choice right is untouched. A path that is neither tracked nor listed
+as untracked is covered by the user's `.gitignore`; that is refused with the
+reason spelled out, because force-adding it would be dedup overriding a
+decision the user wrote down, and git's own error names the path without ever
+saying why.
+
+This was latent in the merge too, not just chat — merging into a new file goes
+through the same commit. Two tests: a commit mixing an edited file, a new file
+and a new file in a new directory, with an unrelated staged file still only
+staged afterwards; and an ignored new file refused with both the path and
+`.gitignore` in the message.
+
+## Cut, copy and paste a section (2026-08-31)
+
+The canvas could add an element from the palette, delete one, and drag one to a
+new parent. It could not take a section and put another one like it somewhere
+else — the gesture everybody reaches for first, and the one a duplicate-finder
+has the least excuse for missing.
+
+**A copy is two renderings of one element, exactly like a palette entry.** The
+palette writes both by hand — the JSX that goes into source and the HTML that
+goes on the canvas — because deriving one from the other would mean shipping a
+JSX renderer into the overlay. A copy has the same two halves and gets them
+from the two places that actually know: the *source* from the write-back's new
+`copy` command, because the file is the truth about what a paste will write,
+and the *picture* from the overlay's `copy-element`, because only the page
+knows what that source rendered as.
+
+Which means the copy is what the **file** says, not what the screen shows. A
+staged-but-unsaved edit inside the copied section is not in it. Rather than
+refuse the copy or silently take the stale version, `copy` reports every
+ordinal it swallowed — from the same parse that produced the snippet, so it
+is exact where the DOM could not be (an element staged for deletion is already
+off the screen and still in the file) — and the editor counts the staged
+actions that land inside and says so: *"Copied Card · section as it is saved —
+2 unsaved edits inside it aren't included."*
+
+**A snippet now carries its language.** Everything the palette stages is JSX,
+respelled once at the boundary for a page that speaks HTML; that only works
+because palette markup is a single element `toHtmlSnippet` can rewrite. An
+arbitrary copied subtree has no such translation, so `EditAction`'s insert
+carries a `SnippetLang` and a mismatch is refused — at paste time, where the
+user can still see what they aimed at, and again in `opsForFile` as the
+backstop. Copying between two files of the same kind, which is the case worth
+having, is verbatim.
+
+**Where a paste lands.** As a sibling *after* the selection, which is what the
+gesture means most of the time. Not everything can have a sibling, though: a
+component's root element and `<body>` would put the copy somewhere the file
+cannot express (adjacent JSX with no parent), so those take it as a child
+instead, and something that can be neither is refused with the reason. Pasting
+again straight after a paste aims at the anchor the last one used, so repeats
+pile up as siblings rather than refusing against an element that has no node in
+the file yet.
+
+**Cut and paste arrive as one program.** A cut stages a remove and a paste
+stages an insert, and both land in the same save. Appending content onto a
+chunk that the same program removes drops it silently — magic-string is right
+to, and it is the one failure a paste must never have — so both write-backs now
+resolve what a program deletes *up front* and refuse an insert whose anchor is
+being deleted or whose insertion point falls inside something that is. A paste
+somewhere else in the same program is a real move and still lands. The order
+the two ops arrive in does not matter, which is why the ranges are resolved
+before the loop rather than during it.
+
+**Names a snippet cannot carry.** `<Card title={title} />` needs both `Card`
+and `title` wherever it lands, and neither travels with the markup. `copy`
+reports them (components it renders, variables its expressions read, minus the
+names it binds itself and the obvious globals) and a paste into a *different*
+file asks the one question it can answer for certain: does the destination
+mention this name at all? A no is proof the paste will not build and is said
+out loud; a yes proves nothing — a same-named local is not the same binding —
+and is left alone. Said, not refused: the paste is staged and undoable, and a
+gate that cannot be sure has no business blocking.
+
+That message needed somewhere to go. `saveError` renders as **Save failed —
+retry**, which is not what "copied" or "nothing to paste" means, so the top bar
+gained a plain `notice` slot that clears itself — its own slot, not part of the
+save-state chain, because a paste both says something and leaves an edit
+staged. The cross-file move refusal, which had been borrowing `saveError`,
+moved there too.
+
+**A pasted section is read-only until it is saved.** The rewriter that folds
+class and text edits into a not-yet-written insert parses one element with
+quoted attributes; a whole subtree is not that. So `pendingNodeInfo` reports a
+pasted section as read-only with a reason rather than accepting edits the save
+would refuse — one ⌘S gives it real nodes and everything works on it.
+
+Keyboard-first (⌘C/⌘X/⌘V, forwarded from inside the canvas like every other
+shortcut, and only when nothing else has a claim on the gesture — a text
+selection, a field, or a caret in an element on the canvas all mean the user is
+copying text) with buttons in the inspector beside Delete, because a gesture
+with no visible affordance is one most people never find.
+
+Limitations kept on purpose: it is dedup's own clipboard, not the system one —
+what is being carried is a piece of source with a rendering attached, and
+neither half survives a round trip through plain text. It clears when the
+project does, since a snippet from a closed codebase has no business landing in
+the next one.
+
+**Tests:** `pnpm test:plugin` (41, +3) — copy handing back verbatim,
+de-indented source that insert takes straight back, the ordinals it swallowed,
+the names it reports (and the ones it correctly doesn't: a name the snippet
+binds itself, an attribute name); and a paste refused in all three positions
+when its anchor is being deleted, writing nothing, while a paste elsewhere in
+the same program lands. `pnpm test:html` (28, +3) — the same three for markup,
+plus `<body>` refusing to be copied. `pnpm test:overlay` (26, +2) — the
+subtree's markup reported with every `data-dedup-` stamp stripped (left in, the
+copy would answer to the same id as its original and every lookup in the
+overlay would hit whichever the DOM returned first), a frame without the
+element staying quiet, and two inserts at one anchor previewing in the order
+the save writes them. `pnpm test:actions` (8, +1) — the language matrix, both
+directions. `cargo test` (87, +1) — copy from one file, paste into another,
+re-indented for where it landed, and nothing outside the project copyable.
+
+## Show the app with no internet (2026-08-31)
+
+Every app has a screen for "no connection" and almost nobody ever gets to look
+at one: you cannot style an error state you cannot reach. That is the same
+problem the hold solves for splash screens and the mock session solves for
+protected pages, so it is solved the same way — a per-artboard toggle whose
+flag rides in on the frame's URL, read by the boot script before the app boots.
+`?__dedup_offline=1`, next to `?__dedup_hold=1`.
+
+**It cuts the app's network, not the frame's.** The naive version — kill
+`fetch` — also kills hot reload, and an artboard that stops updating the moment
+you switch it offline is useless for the thing you switched it offline to do.
+So the cut has an allowlist of same-origin prefixes that belong to the dev
+server and to dedup rather than to the app (`/__dedup/`, `/@vite/`, `/@id/`,
+`/@fs/`, `/node_modules/`, `/_next/static/`, `/_next/webpack-hmr`, …), plus
+Vite's HMR socket, which announces itself by its `vite-hmr` protocol.
+Everything else — every cross-origin request, and every same-origin route the
+app itself defines — fails.
+
+**Nothing is mocked, and that is the whole point.** `session.rs` already says
+dedup "never mocks the network"; this does not break that rule, it is the rule
+applied. dedup changes the *conditions* and lets the app answer: a blocked
+`fetch` rejects with WebKit's own `TypeError: Load failed` (the canvas is a
+WKWebView, so that is the message the app would really be handed), a blocked
+XHR reaches readyState 4 with status 0 and fires `error` then `loadend`, a
+socket constructs and then dies with close code 1006, `sendBeacon` returns
+false, and `navigator.onLine` reads false from the first line the app runs. No
+response is invented anywhere. What renders is the app's real offline
+behaviour, which is the only version worth styling.
+
+The XHR case is where the fidelity is load-bearing rather than decorative: a
+library that waits for readyState 4 and never sees it does not show an error
+state, it shows a spinner forever — so `readyState` is shadowed with an own
+property and the event sequence is the real one. The alternative considered and
+rejected was pointing blocked requests at a dead local port to get authentic
+failures for free; it works, but it fills the user's console with requests to
+`127.0.0.1:1` that their app never made, and a design tool that lies in the
+console is not worth the saved code.
+
+**Flags now travel.** They live in the query string, so anything that sends a
+frame to a bare path drops them — and `reload {path}` (how a session change
+brings a bounced frame back to its pinned route) did exactly that. An offline
+artboard would have quietly come back online with the editor's label still
+saying "offline", which is the worst kind of bug this app can have. The overlay
+now carries any `__dedup`-prefixed param across a navigation it drives, matched
+by prefix rather than by name: it is a third separately bundled world after
+`boot.mjs` and `lib/origins.ts`, and one more list to keep in sync is one more
+way to lose a flag with nothing to see. `frameUrl` took a positional `held`
+boolean and now takes `FrameFlags`, so the next one is a field rather than a
+fourth argument.
+
+Said out loud on the artboard itself, in the label beside "held": an artboard
+whose every request is failing looks exactly like an app that is broken, and
+the badge is the difference between the two.
+
+Drive-by, in the same spirit: `heldRoutes` was not cleared when the project
+changed, so a held "/" leaked into the next project's "/" artboard. It is
+cleared alongside the new `offlineRoutes`, next to the comment that already
+promised it.
+
+Limitation kept on purpose: the cut blocks requests the app *makes*, not
+subresources the browser fetches for it, so a remote `<img>` or webfont still
+loads. Blocking those needs a CSP injected ahead of the page's own content —
+a bigger, riskier mechanism aimed at a smaller part of the problem, and the
+data fetching is what the error states are actually about.
+
+**Tests:** `pnpm test:plugin` (49, +8) — armed only by the flag and only inside
+the canvas (the user's own browsing of their dev server is never cut); a clean
+install on a page missing any given request API, since a throw in `<head>`
+takes the app down; the app's requests failing while six kinds of tooling
+request still go out; the XHR event sequence and readyState; a socket dying
+with 1006 while the `vite-hmr` one is left alone; the `offline` event fired
+only once the page can have a listener; and offline composing with the hold —
+the regression that matters, since the hold ends the boot script with a
+`return` and anything after it would silently stop installing.
+`pnpm test:overlay` (27, +1) — a driven navigation keeping the frame's dedup
+flags and dropping the app's own query. `pnpm test:origins` (8) — the editor
+and the boot script agreeing on every flag, both flags wearing the prefix the
+overlay matches on, and `frameUrl` carrying either or both.
+
+## The agent can bring an image it generated (2026-08-31)
+
+Reported from a real session: Codex was asked for an image, generated one, and
+then had to say so rather than use it —
+
+> The image was generated, but I can't safely wire it into `index.html`:
+> dedup's protocol has no way to import the generated binary asset.
+
+It was right, and the file was really there: a 1.5 MB PNG under
+`~/.codex/generated_images/`. The chat protocol carries text — SEARCH/REPLACE
+and whole CREATE files — and `validateContent` refuses any extension it has no
+parser for, so a PNG could not be expressed at any point in the path.
+
+**A fourth marker, and it is a request rather than an instruction.**
+
+    <<<<<<< ASSET public/hero.png
+    /Users/…/.codex/generated_images/…/exec-….png
+    >>>>>>> END
+
+The block holds one path and nothing else, because it is a *reference* to a
+file dedup will go and look at, not content to salvage — two paths in there is
+a model that has misunderstood, and picking one would be dedup guessing.
+
+**This is the first time something the model said names a path outside the
+project, so it is the first place that has to assume the model is wrong.** The
+failure to design against is not a clumsy agent, it is `~/.ssh/id_rsa` →
+`public/hero.png` → committed → pushed. `asset.rs` therefore refuses on four
+counts before it copies anything: the source must resolve **through symlinks**
+(canonicalize both sides — a link planted inside the allowed directory is the
+same attack wearing an allowed path) into that agent's own output directory and
+nowhere else; it must be under 16 MB; its **magic bytes** must say PNG, JPEG,
+GIF or WebP, never its extension, which is the part the model chose; and the
+destination extension has to agree with those bytes, on a new path inside the
+root. Each has a test, the symlink one included.
+
+Where that directory is belongs to the agent, so it is `Agent::asset_dir` — one
+more match arm, the pattern the file already uses for binaries, flags and
+fallbacks. Claude Code returns `None`: it generates nothing to import, and the
+prompt is only given the ASSET directive when the backend's `generatesAssets`
+is true. Inviting a model to use a directive that could only fail is worse than
+not having it — it will reach for it and then have to explain itself to the
+user, which is exactly the message that started this.
+
+**Imports go first, and that ordering is the all-or-nothing rule.** An import
+is a new file, so it can be taken back cleanly; a text write that has landed
+cannot be, without the `before` snapshots `sendChat` is still holding. So the
+gated half runs first and is unwound if the rest fails. After that an asset is
+an ordinary part of the proposal: previewed on the canvas uncommitted like
+everything else, committed with the text on Apply (untracked, which
+`git::commit_paths` already stages by name), and removed on Discard —
+`revertSources` with a null content, which is the same path a created file
+takes. Two collisions are refused outright rather than resolved: a reply that
+both writes and imports the same path is two answers to one question, and an
+ASSET block from a backend that generates nothing is a model off script.
+
+Deliberately *not* built: a general file-import capability. The model may name
+a file it just generated, in the one directory it generates into. Everything
+else on the machine stays exactly as unreachable as it was.
+
+**Fix, same day.** The first real attempt failed with *"that image is a PNG,
+so it cannot be saved as .png> — name it .png"*, which is a confusing way to
+be told the model made a typo. The prompt writes its placeholders as
+`<project-relative path>`, the model copied the brackets, and
+`<public/hero.png>` has the extension `png>`. Paths in markers now go through
+`undecoratePath`, which takes off angle brackets, quotes and backticks —
+unambiguous rather than a guess, since a real path wears none of them, and the
+same undressing `parseTools` has always done for TOOL arguments.
+
+Reported a second time, in a shape the first fix missed: only *balanced*
+wrappers were stripped, and a model that opens a bracket does not reliably
+close one, so `public/hero.png>` complained exactly as `<public/hero.png>` had.
+Angle brackets now come off unpaired — safe in a way it would not be for
+quotes, since `<` and `>` are illegal in a Windows path and effectively never
+seen in a real one anywhere else, while an apostrophe in a filename is
+ordinary. The refusal also names the destination it was handed rather than the
+extension alone: "cannot be saved as .png> — name it .png" is two nearly
+identical strings with the difference invisible. The prompt
+also now says outright that the brackets mark where a value goes and are not
+part of it. A bare marker still means "the file in play" rather than a file
+called `<>`.
+
+**Tests:** `cargo test` (90, +3) — the source confinement (an ordinary path
+refused, and a symlink out of the allowed directory refused too), the byte
+sniff and the name having to agree with it, a successful import arriving
+byte-for-byte, no overwrite, no escape from the root, and an agent that
+generates nothing saying so. `pnpm test:chat` (21, +4) — an ASSET block parsed
+alongside the markup that uses it, one on its own still being an edit, four
+malformed shapes throwing rather than importing a guess, and a path wearing the
+prompt's own placeholder brackets (or quotes, or both) still being a path.
+
+## Two small things in the chat composer (2026-08-31)
+
+**Copy a prompt you already sent.** Hovering a sent message shows a copy icon
+in the gutter beside it; it turns into a tick for a moment when the write
+lands, and only then — a clipboard write makes no sound and changes nothing on
+screen, so a button that looks identical afterwards reads as one that did
+nothing. It stays visible on keyboard focus as well, since hover-only would put
+it out of reach. `copyText` tries `navigator.clipboard` and falls back to the
+old textarea + `execCommand` route, returning false rather than throwing so the
+tick never appears for a copy that did not happen. Both live in `ui.tsx`, so
+the same button can go on assistant replies whenever that is wanted.
+
+**↑/↓ through prompts already sent**, shell-style, scoped to the conversation
+on screen. The rules are in `lib/promptHistory.ts` rather than the panel
+because they are a state machine whose edges are invisible in a screenshot, and
+one of them matters: the composer is a textarea, so ↑ inside a multi-line draft
+belongs to the caret and taking it would make the box impossible to edit.
+History moves only from the edges. Two other edges earned their tests — ↑ at
+the oldest entry is swallowed rather than passed on (a caret jumping to the top
+reads as a recall that silently failed), and a half-written draft is stashed on
+the first ↑ and handed back by the last ↓, including one edited out of a
+recalled prompt. Losing typed text to a keystroke is the whole reason the shape
+has a stash in it. Consecutive duplicate prompts collapse; ones returned to
+after others keep their place.
+
+**Tests:** `pnpm test:prompts` (6, new) — the history list (newest first,
+replies and blanks skipped, consecutive repeats collapsed but distant ones
+kept), the walk in both directions, the stop at the oldest, the draft
+surviving a round trip, and every case where the keys belong to the caret
+instead.
+
+## Fix — a staged program that could not be saved or escaped (2026-08-31)
+
+Reported: the chat refused with *"index.html has unsaved style edits. Save
+(⌘S) or discard them first"*, and saving answered *"Save failed — retry"*.
+Neither door opened. Retry could not work, and the reason it could not was in a
+tooltip.
+
+**The trap.** An edit addressed to a `pending:` insert has nowhere to land once
+that insert is gone, so `opsForFile` refuses it — correctly, and permanently:
+every later save throws on the same orphan. Deleting an inserted element on the
+canvas always took its edits with it. The review panel's per-row *Discard this
+edit* did not: it dropped exactly one action, so discarding the insert row
+stranded the class or text edit made to that element. And the chat refuses to
+run while any staged action targets the file, so the app's own advice —
+"discard them first" — was the thing that could produce the deadlock.
+
+Three parts to the fix, and only the first is the bug:
+
+- `withoutAction` puts the rule in one place: discarding an insert discards
+  what was addressed to it, the same rule `removeSelected` already applied.
+- `discardAllEdits` is the way out of a program that is *already* stuck.
+  Nothing staged has ever been written, so there is nothing to put back — but
+  every other exit from a staged program went through a save, which is exactly
+  what was failing. It sits in the review panel as **Discard all** and beside
+  the failure in the top bar.
+- The top bar shows the reason instead of hiding it. "Save failed — retry" made
+  a save that could never succeed indistinguishable from one worth retrying,
+  and offered only the button that could not help. It now reads the error out,
+  with Retry and Discard edits next to it.
+
+**A second bug, found on the way**, from the paste feature: a staged insert
+used to be JSX always, so folding a restyle into one wrote `className`. A
+pasted snippet carries the spelling of the file it came from, and `className`
+in an HTML page is an unknown attribute that styles nothing — the restyle
+silently did not happen and the original classes stayed. `classAttrFor` now
+answers that question everywhere a staged snippet's classes are read or
+rewritten: the fold in `opsForFile`, the inspector's view of a pending element
+(which had been reporting *no* classes for HTML markup that plainly had some),
+and the clipboard's own fold.
+
+**Tests:** `pnpm test:actions` (10, +2) — a pasted HTML element restyled in
+`class` and not `className`, with the palette's JSX inserts still respelled on
+the way in; and discarding an insert taking its edits with it, with the orphan
+first shown to be fatal so the guard is demonstrably load-bearing.
+
+## Fix — a staged program that could not be saved (2026-08-31)
+
+Reported as three symptoms with one cause: `save failed: insert: the element it
+is placed against is being deleted`, a Save button stuck on "Save failed —
+retry", and the chat refusing with "index.html has unsaved style edits".
+
+The write-back refusal was correct and new — it arrived with cut/copy/paste,
+because appending content into a chunk the same program removes drops it
+silently. What was wrong is that the editor let the program be *built*. Paste a
+copy beside a section, then delete that section, and the staged program holds
+an insert anchored to an element the same program removes: refused at save, for
+ever, with the chat also refusing while any edit targets that file. Exactly the
+failure the "a staged program must never be able to strand itself" rule exists
+to prevent — the rule was written down and then not applied to the actions
+cut/copy/paste added.
+
+**The check moved to where actions arrive.** `stage` is the single choke point
+every staged action goes through, so `stagingConflict` runs there and `stage`
+now returns false when it refuses. A program is only ever invalid as a
+*combination* — the action being added is fine on its own, it is the company it
+would keep — so no individual call site could have owned this. The callers that
+chain off a stage (selecting a pasted element, clearing the selection after a
+delete) check the return instead of assuming.
+
+The rule is one sentence: an element on its way out cannot also be a party to
+another structural edit. That covers the reported case and two more that were
+already reachable, one of them worse — a *move* onto an element the same
+program deletes never even produced an error, because the write-back appends
+into a removed chunk and content appended to a removed chunk is dropped in
+silence.
+
+Refusing rather than repairing, and refusing the *second* action rather than
+unpicking the first: re-anchoring the paste to the deleted element's parent
+would move it somewhere the user did not put it, and dropping it would lose
+what they pasted. So the delete is refused with what is in the way named —
+"Card · section is staged to go next to this element — save (⌘S) first, then
+delete it" — which is also the honest answer, since two saves is all the
+sequence ever needed.
+
+**Tests:** `pnpm test:actions` (12, +2) — deleting the anchor of a staged
+paste, pasting against something already staged for deletion, both directions
+for a move's source and destination, and the message naming both the obstacle
+and the key; plus the negative half, that an ordinary delete-here-paste-there
+program is untouched and a value edit never conflicts (it is also the action
+staged hundreds of times during a drag, so the check has to fall straight
+through).
+
+## Click empty canvas to deselect (2026-08-31)
+
+The canvas had no way to select nothing with the mouse — Escape cleared the
+selection, clicking the background did not, which is the one thing every canvas
+tool does.
+
+Both ends of the click have to land on the background: a pan that happens to
+finish over empty canvas is a drag, not a click, and there is a 4px allowance
+for a hand that moves while pressing. "Background" is the container or the
+pannable surface itself and nothing else, so artboard labels and every floating
+control keep their own clicks — they bubble through this handler and are
+ignored by target. Clicks *inside* an artboard never arrive here at all: they
+happen in another document and reach the editor as overlay messages.
+
+It clears the artboard selection too, since that is drawn as a selection (the
+accent ring, the scan's target) and reads as one.
+
+One thing it dragged out: `clearSelection` did not end a text edit in flight.
+The overlay's `clear` does not touch the caret, and the iframe losing focus
+only ends drags — so an element could stay contenteditable while the editor
+believed nothing was selected. It now ends the edit, which fixes the same hole
+behind Escape and the Layers panel.
+
+Not changed: clicking blank space *inside* an app still selects the nearest
+tagged ancestor rather than deselecting. `<body>` and a component's root are
+real elements an inspector should be able to point at, and treating some tagged
+elements as unselectable would be a different decision from this one.
+
+**Tests:** none — this is editor chrome, which has no browser in the test path
+(the gap is already listed below). Typecheck and build only.
+
+## A readable element name, and a canvas that says where the AI is working (2026-08-31)
+
+**The name badge got bigger** — 11px to 13px, with the padding and the parking
+offset to match. It is drawn in screen pixels rather than page ones, which is
+what makes the size worth setting at all: zoomed out to fit a page on screen is
+exactly when a name is hardest to read, and it is also when the badge is the
+only thing telling you what you are pointing at. Worth knowing and unchanged:
+it follows the *hover*, not the selection, so it disappears when the pointer
+leaves.
+
+**And the canvas now says where a chat turn is working.** A turn can take a
+minute, and the only sign of it was a spinner in a side panel the user may have
+scrolled away from, while the element they asked about sat there looking idle.
+Squares now light up across that element in a diagonal wave — deliberately not
+a progress bar, because there is no progress to report, only that something is
+running. Drawn *over* the element rather than replacing it: the user is still
+entitled to look at the thing they asked about.
+
+Three details earned their place. The grid is rebuilt only when its cell count
+changes, because repaint runs on every scroll and re-creating it each time
+would restart every animation and leave the wave stuttering in place. It is
+cleared in `sendChat`'s `finally`, so a turn that throws does not leave a
+section looking busy for ever. And `prefers-reduced-motion` gets a still wash
+instead of a pulse — the message is "work is happening here", which does not
+need the movement.
+
+With nothing selected there is no section to mark and the panel's own
+"Working…" is the whole answer, which is the honest outcome rather than a
+missing feature: the agent genuinely is not working on one place.
+
+**Tests:** `pnpm test:overlay` (28, +1) — the layer mounted with the rest of
+the chrome and invisible until asked for, squares laid over the element with
+neighbours a beat apart, an id this frame does not hold drawing nothing rather
+than erroring (every artboard hears the same broadcast), and the grid stopping
+when the turn ends. The badge's size is style, and untested as such.
+
 ## Verification inventory
 
-- `cargo test` (src-tauri): 69 — URL/ANSI parsing, project detection,
+- `cargo test` (src-tauri): 90 — URL/ANSI parsing, project detection,
   instrumentation, tunnel (real TLS upstream, IPv6-only), sidecar (real node
   spawn E2E incl. the full-file parse gate and an edit program that is
-  all-or-nothing), git branch/commit isolation, Next stale-lock parsing, scan
+  all-or-nothing; the chat agent's multi-file write landing whole or not at
+  all, with the valid file in a refused set left untouched and a new file
+  created only on success; discarding a preview restoring the tree exactly,
+  including content that never parsed; new-file paths resolving only inside
+  the project; and the agent's list/grep skipping the user's node_modules),
+  git branch/commit isolation (incl. committing a file that did not exist
+  before, and an ignored new file refused with its reason), Next stale-lock parsing, scan
   persist/restore round-trip, Claude Code result-envelope parsing, thumbnail
   key stability, toolchain PATH resolution (enriched PATH is dead-entry-free,
   `which` resolves node; the node-spawning suites also pass under a simulated
@@ -1145,7 +1900,7 @@ Three things follow from that, and each is a real change rather than styling:
   ignored), and auth-SDK detection incl. whether a seed can reach that SDK's
   session (Firebase not seedable, Supabase seedable, NextAuth not read as
   plain Next, no SDK → falls back to the file scan).
-- `pnpm test:plugin`: 38 — tagger transform (ordinal ids stable across
+- `pnpm test:plugin`: 49 — tagger transform (ordinal ids stable across
   reformatting, dynamic/core marking, fragments, generics, sourcemaps,
   virtual-export + unsafe-name rejection); write-back program E2E via child
   process (inspect incl. capabilities, class/text/insert/remove/move, moves
@@ -1155,15 +1910,26 @@ Three things follow from that, and each is a real change rather than styling:
   the injected boot script, exercised by *running* it against a stand-in page:
   no/disabled/empty seed serves valid no-op JS, an active seed is gated to
   framed pages (asserted both ways), a throwing seed warns instead of breaking
-  the page's boot, and the hold arms only when flagged, queues long timers
+  the page's boot, the hold arms only when flagged, queues long timers
   while letting short ones through, freezes navigation, keeps a cleared timer
-  cleared, and hands timers and history back intact on release.
-- `pnpm test:actions`: 6 — staged program → write-back ops: palette snippets
+  cleared, and hands timers and history back intact on release; and the
+  offline cut arms only when flagged and only inside the canvas, installs
+  without throwing on a page missing any request API, fails the app's requests
+  (with the real failure shapes) while the dev server's still go out, kills a
+  socket but not Vite's HMR one, and composes with the hold rather than being
+  silently skipped by its early return.
+- `pnpm test:actions`: 12 — staged program → write-back ops: palette snippets
   round-trip through the rewriters, values that would break out of the markup
   refused, text/classes typed into a staged insert folded into its snippet
-  (newest wins), edits on real elements kept as their own ops in order, and an
-  unfoldable or orphaned edit reported rather than silently dropped.
-- `pnpm test:overlay`: 14 — the built overlay evaluated in a stub DOM: it loads
+  (newest wins), edits on real elements kept as their own ops in order, an
+  unfoldable or orphaned edit reported rather than silently dropped, and a
+  copied section written in the language it was copied from — verbatim into a
+  file of the same kind, refused in both crossing directions. Plus a pasted
+  element restyled in its own spelling rather than JSX's, and discarding an
+  insert taking with it the edits that were addressed to it (an orphan is a
+  permanent save failure, so that rule is what keeps a staged program
+  escapable).
+- `pnpm test:overlay`: 28 — the built overlay evaluated in a stub DOM: it loads
   and announces itself (the guard against a throw killing every listener after
   it), click → selection payload with markers and ancestry, click on an
   untagged child resolving to its tagged ancestor, browse mode passing clicks
@@ -1178,7 +1944,12 @@ Three things follow from that, and each is a real change rather than styling:
   newly enabled mock session reaches a frame bounced to /login), and page
   console forwarding (an SDK error reaches the editor with objects
   serialized, the page's own console still fires, a cyclic argument doesn't
-  throw).
+  throw), a copied subtree's markup reported with every `data-dedup-` stamp
+  stripped (a frame that doesn't hold the element stays quiet), two inserts
+  at one anchor previewing in the order the save will write them, and the
+  AI-working grid (mounted but invisible until asked for, squares over the
+  element with neighbours a beat apart, silent for an id the frame doesn't
+  hold, and cleared when the turn ends).
 - `pnpm test:scan`: 10 — scan bundle E2E via child process: near-dup clustering
   + unrelated separation, canvas-scope filtering (project-wide call sites),
   knob-value equivalence, trivial-component exclusion, node_modules/garbage
@@ -1205,9 +1976,25 @@ Three things follow from that, and each is a real change rather than styling:
   rest of the file, comment markers inside strings and vice versa, keywords vs
   identifiers that merely start with one, JSX tag names, and a `<` that isn't
   a tag.
-- `pnpm test:chat`: 8 — chat edit-block parse/apply: single/multi block,
-  deletion, non-match + ambiguous + malformed all throw (no half-applies),
-  full-file fallback, prose passthrough.
+- `pnpm test:prompts`: 6 — the chat composer's ↑/↓ prompt history: the list it
+  walks (newest first, consecutive repeats collapsed but distant ones kept),
+  both directions, the swallowed ↑ at the oldest entry, an interrupted draft
+  handed back intact, and every case where the arrow keys belong to the caret
+  rather than to the history.
+- `pnpm test:chat`: 21 — the chat agent's reply protocol. Edit-block
+  parse/apply (single/multi block, deletion, non-match + ambiguous + malformed
+  all throw — no half-applies, full-file fallback, prose passthrough); the
+  agent half (tool lines read as a context request not an edit, `list` with no
+  argument and a bare `read` ignored, an edit reply winning over stray tool
+  lines, file-addressed blocks assembled into a multi-file program, an
+  unaddressed block falling back to the file in play); and four refusals —
+  editing a file the model never read, overwriting an existing file with
+  CREATE, a CREATE with no path or no terminator, and a fenced snippet with no
+  SUMMARY staying an *answer* rather than becoming a whole-file rewrite that
+  would blank the module. Plus the ASSET block an agent uses to hand over an
+  image it generated: parsed alongside the markup that references it, valid on
+  its own, and four malformed shapes throwing rather than importing a guess
+  (the copy's own gates are in `cargo test`).
 - `pnpm test:merge`: 18 — the merge codemod against the built bundle: a plan
   reporting sources/props/call sites; a same-named component from a library
   *not* counted as a call site (the trap a name-based codemod falls into); call

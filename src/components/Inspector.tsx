@@ -5,11 +5,14 @@ import { NextSetup } from "./NextSetup";
 import {
   ChatBubbleIcon,
   ChevronRightIcon,
+  ClipboardIcon,
   CodeIcon,
   Component1Icon,
   ComponentInstanceIcon,
+  CopyIcon,
   ExclamationTriangleIcon,
   MixerHorizontalIcon,
+  ScissorsIcon,
   TrashIcon,
 } from "@radix-ui/react-icons";
 import { StylePanel } from "./StylePanel";
@@ -31,6 +34,10 @@ function ElementActions() {
   const effectiveText = useStore((s) => s.effectiveText);
   const applyTextEdit = useStore((s) => s.applyTextEdit);
   const removeSelected = useStore((s) => s.removeSelected);
+  const copySelected = useStore((s) => s.copySelected);
+  const cutSelected = useStore((s) => s.cutSelected);
+  const pasteClipboard = useStore((s) => s.pasteClipboard);
+  const clipboard = useStore((s) => s.clipboard);
   if (!sourceInfo) return null;
 
   const text = actions.length >= 0 ? effectiveText() : null;
@@ -50,6 +57,34 @@ function ElementActions() {
           line={sourceInfo.line}
         />
       )}
+
+      {/* Cut/copy/paste, keyboard-first but not keyboard-only — a gesture with
+          no visible affordance is a gesture most people never find. */}
+      <div className="mt-2 flex items-center gap-1">
+        <ActionButton
+          label="Copy"
+          shortcut="⌘C"
+          icon={CopyIcon}
+          onClick={() => void copySelected()}
+        />
+        <ActionButton
+          label="Cut"
+          shortcut="⌘X"
+          icon={ScissorsIcon}
+          onClick={() => void cutSelected()}
+          disabled={!sourceInfo.canRemove}
+          reason={sourceInfo.structuralReason}
+        />
+        <ActionButton
+          label="Paste"
+          shortcut="⌘V"
+          icon={ClipboardIcon}
+          onClick={() => void pasteClipboard()}
+          disabled={clipboard === null}
+          reason="Nothing copied yet"
+          title={clipboard ? `Paste ${clipboard.label} here` : undefined}
+        />
+      </div>
 
       <div className="mt-2 flex items-center gap-2">
         <button
@@ -72,6 +107,37 @@ function ElementActions() {
         </span>
       </div>
     </Section>
+  );
+}
+
+/** One of the small element actions, disabled with the reason it is. */
+function ActionButton({
+  label,
+  shortcut,
+  icon: Icon,
+  onClick,
+  disabled = false,
+  reason,
+  title,
+}: {
+  label: string;
+  shortcut: string;
+  icon: IconType;
+  onClick: () => void;
+  disabled?: boolean;
+  reason?: string | null;
+  title?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={disabled ? (reason ?? `${label} (${shortcut})`) : (title ?? `${label} (${shortcut})`)}
+      className="flex items-center gap-1 rounded border border-line px-1.5 py-1 text-2xs text-ink-dim hover:text-ink hover:border-ink-faint disabled:opacity-40 disabled:hover:text-ink-dim disabled:hover:border-line"
+    >
+      <Icon width={11} height={11} />
+      {label}
+    </button>
   );
 }
 

@@ -11,13 +11,17 @@ import {
   ImageIcon,
   MinusIcon,
   PlusIcon,
+  TextAlignLeftIcon,
   TextIcon,
 } from "@radix-ui/react-icons";
 import type { IconType } from "./ui";
 
 const PALETTE_ICONS: Record<string, IconType> = {
   div: BoxIcon,
-  text: TextIcon,
+  // A paragraph block, not a bare T: the T is the text *tool* (edit what is
+  // already there), and this is the palette (place something new). Two
+  // identical glyphs a few pixels apart would make them read as one control.
+  text: TextAlignLeftIcon,
   button: ButtonIcon,
   image: ImageIcon,
 };
@@ -36,6 +40,12 @@ const TOOLS = [
     hint: "Hand — drag to pan the canvas (H, or hold Space)",
   },
   {
+    id: "text" as const,
+    icon: TextIcon,
+    label: "Text",
+    hint: "Text — click text on the canvas to type into it (T). Double-clicking any text does the same.",
+  },
+  {
     id: "browse" as const,
     icon: GlobeIcon,
     label: "Browse",
@@ -47,6 +57,7 @@ export function Toolbar() {
   const consoleOpen = useStore((s) => s.consoleOpen);
   const tool = useStore((s) => s.tool);
   const setTool = useStore((s) => s.setTool);
+  const textEditing = useStore((s) => s.textEditing);
   const zoom = useStore((s) => s.zoom);
   const setZoom = useStore((s) => s.setZoom);
   const insertKind = useStore((s) => s.insertKind);
@@ -63,18 +74,26 @@ export function Toolbar() {
       {TOOLS.map((t) => {
         const Icon = t.icon;
         const active = tool === t.id;
+        // A caret actually blinking in the page is a stronger state than an
+        // armed tool, and the user needs to be able to tell them apart: this
+        // is why their typing is going into the artboard and not into a
+        // shortcut.
+        const typing = t.id === "text" && textEditing !== null;
         return (
           <button
             key={t.id}
             onClick={() => setTool(t.id)}
-            title={t.hint}
-            className={`flex h-8 w-8 items-center justify-center rounded-lg ${
+            title={typing ? "Typing on the canvas — Enter commits, Esc reverts" : t.hint}
+            className={`flex h-8 items-center justify-center gap-1 rounded-lg ${
+              typing ? "w-auto px-2" : "w-8"
+            } ${
               active
                 ? "bg-accent text-white"
                 : "text-ink-dim hover:text-ink hover:bg-surface-2"
             }`}
           >
             <Icon width={15} height={15} />
+            {typing && <span className="text-2xs font-medium">Typing</span>}
           </button>
         );
       })}

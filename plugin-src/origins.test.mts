@@ -7,10 +7,20 @@
 // the precedence wrong means an artboard silently showing the wrong thing, so
 // the rules are pinned here.
 import assert from "node:assert/strict";
-import { HOLD_FLAG, frameUrl, resolveOrigin } from "../src/lib/origins.ts";
+import {
+  FLAG_PREFIX,
+  HOLD_FLAG,
+  OFFLINE_FLAG,
+  frameUrl,
+  resolveOrigin,
+} from "../src/lib/origins.ts";
 import type { OriginInputs } from "../src/lib/origins.ts";
-// @ts-expect-error — the built plugin bundle ships no type declarations.
-import { HOLD_FLAG as TAGGER_HOLD_FLAG } from "../src-tauri/assets/dedup-tagger.mjs";
+import {
+  // @ts-expect-error — the built plugin bundle ships no type declarations.
+  HOLD_FLAG as TAGGER_HOLD_FLAG,
+  // @ts-expect-error — same.
+  OFFLINE_FLAG as TAGGER_OFFLINE_FLAG,
+} from "../src-tauri/assets/dedup-tagger.mjs";
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -86,24 +96,39 @@ test("before the dev server is up there is no origin to give", () => {
   assert.equal(resolveOrigin("/", s), null);
 });
 
-test("the editor and the tagger agree on the hold flag", () => {
-  // The flag travels on the frame's URL because it must reach the page before
-  // the app boots. The editor writes it and the injected boot script reads
-  // it, from two separately bundled worlds — if they ever disagree, holding
-  // silently stops working, with nothing to see anywhere.
+test("the editor and the boot script agree on every frame flag", () => {
+  // These travel on the frame's URL because they must reach the page before
+  // the app boots. The editor writes them and the injected boot script reads
+  // them, from two separately bundled worlds — if they ever disagree, holding
+  // or the offline cut silently stops working, with nothing to see anywhere.
   assert.equal(HOLD_FLAG, TAGGER_HOLD_FLAG);
+  assert.equal(OFFLINE_FLAG, TAGGER_OFFLINE_FLAG);
+  // And the overlay, a third such world, keeps them across a navigation it
+  // drives by matching this prefix rather than by knowing their names.
+  for (const flag of [HOLD_FLAG, OFFLINE_FLAG]) {
+    assert.ok(flag.startsWith(FLAG_PREFIX), `${flag} is not a dedup frame flag`);
+  }
 });
 
-test("the hold flag rides on the frame URL, and only when asked", () => {
-  assert.equal(frameUrl("/splash", "http://localhost:5173", false), "http://localhost:5173/splash");
+test("frame flags ride on the frame URL, and only when asked", () => {
+  const at = "http://localhost:5173";
+  assert.equal(frameUrl("/splash", at), `${at}/splash`);
+  assert.equal(frameUrl("/splash", at, {}), `${at}/splash`);
+  assert.equal(frameUrl("/splash", at, { held: true }), `${at}/splash?${HOLD_FLAG}=1`);
   assert.equal(
-    frameUrl("/splash", "http://localhost:5173", true),
-    `http://localhost:5173/splash?${HOLD_FLAG}=1`,
+    frameUrl("/offline", at, { offline: true }),
+    `${at}/offline?${OFFLINE_FLAG}=1`,
+  );
+  // An artboard can be both: a splash screen frozen with no network is
+  // exactly the screen that is hardest to reach any other way.
+  assert.equal(
+    frameUrl("/splash", at, { held: true, offline: true }),
+    `${at}/splash?${HOLD_FLAG}=1&${OFFLINE_FLAG}=1`,
   );
   // A route carrying its own query keeps it.
   assert.equal(
-    frameUrl("/p?tab=two", "http://localhost:5173", true),
-    `http://localhost:5173/p?tab=two&${HOLD_FLAG}=1`,
+    frameUrl("/p?tab=two", at, { held: true }),
+    `${at}/p?tab=two&${HOLD_FLAG}=1`,
   );
 });
 

@@ -1,6 +1,6 @@
 // Types mirroring the Rust serde structs (camelCase over the IPC boundary).
 
-import { withAttr, withText } from "./palette";
+import { classAttrFor, toHtmlSnippet, withAttr, withText } from "./palette";
 
 /** A coding-agent CLI dedup can borrow for a prompt. Mirrors `ai::Agent`. */
 export type CliAgent = "claude-code" | "codex";
@@ -25,6 +25,10 @@ export const CLI_AGENTS: {
   detail: string;
   /** Command to run if it isn't installed or isn't signed in. */
   command: string;
+  /** This CLI can generate files (images) dedup knows how to import. Mirrors
+   * `Agent::asset_dir` — a backend without one is never told the ASSET
+   * directive exists, since it could only fail. */
+  generatesAssets: boolean;
   /** Model choices offered; "" means the CLI's own default. */
   models: { value: string; label: string }[];
 }[] = [
@@ -33,6 +37,7 @@ export const CLI_AGENTS: {
     label: "Claude Code",
     detail: "subscription",
     command: "claude",
+    generatesAssets: false,
     models: [
       { value: "", label: "CLI default" },
       { value: "haiku", label: "Haiku" },
@@ -45,13 +50,27 @@ export const CLI_AGENTS: {
     label: "Codex",
     detail: "subscription",
     command: "codex",
+    generatesAssets: true,
     models: [{ value: "", label: "CLI default" }],
   },
 ];
 
 export type PackageManager = "pnpm" | "yarn" | "bun" | "npm" | "unknown";
-export type Framework = "vite" | "next" | "unknown";
+/** How dedup runs a project. `static` is a plain HTML site: no build step, no
+ *  package manager — dedup serves the folder itself and stamps the markup on
+ *  the way out. */
+export type Framework = "vite" | "next" | "static" | "unknown";
 export type SupportLevel = "full" | "partial" | "unsupported";
+
+/** The starters dedup can write into an empty folder. */
+export type StarterKind = "react" | "html";
+
+/**
+ * Active canvas tool (FR-6.1). `text` is a mode rather than a creator: it puts
+ * the caret in existing text on the canvas. Inserting a *new* text element is
+ * the palette's job, which is a different gesture (arm, then place).
+ */
+export type Tool = "select" | "hand" | "browse" | "text";
 
 export interface ProjectInfo {
   root: string;
@@ -61,6 +80,11 @@ export interface ProjectInfo {
   hasTailwind: boolean;
   hasTypescript: boolean;
   hasGit: boolean;
+  /** Nothing here to open — the launch screen offers a starter instead. */
+  isEmpty: boolean;
+  /** For a static site whose pages sit in a subfolder (`site/`, `www/`), the
+   *  folder dedup serves. Element ids stay relative to the project root. */
+  staticDir: string | null;
   devScript: string | null;
   support: SupportLevel;
   summary: string;
@@ -244,6 +268,41 @@ export type ValueAction =
       component: string | null;
     };
 
+/**
+ * Which spelling a staged snippet is written in.
+ *
+ * Everything the palette stages is JSX, and `opsForFile` respells it once, at
+ * the boundary, for a file that speaks HTML. A *copied* snippet is different:
+ * it is a verbatim slice of a real file, so it arrives already in that file's
+ * language and there is no translation for an arbitrary subtree — hence the
+ * tag, and hence the refusal when the two don't match.
+ */
+export type SnippetLang = "jsx" | "html";
+
+/**
+ * What a copy or a cut put on dedup's clipboard.
+ *
+ * Two renderings of one element, exactly like a palette entry: the source that
+ * will be written (from the write-back, because the file is the truth about
+ * what a paste writes) and the picture the canvas shows before the save (from
+ * the overlay, because only the page knows what that source rendered as).
+ */
+export interface Clipboard {
+  /** The copied element's own source, de-indented — written on paste. */
+  snippet: string;
+  lang: SnippetLang;
+  /** Rendered HTML, for the staged preview on the canvas. */
+  preview: string;
+  /** "Card · div" — how the paste reads in the review panel. */
+  label: string;
+  /** The file it came out of, so a paste elsewhere can say so. */
+  file: string;
+  /** Components and variables the snippet reads but doesn't carry with it. */
+  refs: string[];
+  /** True when the copy was a cut — the source element is staged for removal. */
+  cut: boolean;
+}
+
 export type StructuralAction =
   | { kind: "remove"; target: EditTarget; label: string }
   | {
@@ -256,8 +315,12 @@ export type StructuralAction =
       /** The reference node the new element is placed against. */
       target: EditTarget;
       position: DropPosition;
-      /** JSX written to source. */
+      /** Markup written to source, in `lang`'s spelling. */
       snippet: string;
+      /** The language `snippet` is written in. Palette entries are always
+       * JSX (respelled for an HTML page on the way out); a pasted snippet
+       * carries the language of the file it was copied from. */
+      lang: SnippetLang;
       /** HTML rendered into the canvas for the live preview. */
       preview: string;
       label: string;
@@ -276,6 +339,83 @@ export type EditAction = ValueAction | StructuralAction;
 export const isValueAction = (a: EditAction): a is ValueAction =>
   a.kind === "class" || a.kind === "text";
 
+/**
+ * Drop one staged action — and anything that only made sense because of it.
+ *
+ * A class or text edit on a not-yet-saved element is addressed to the insert
+ * that created it, and has nowhere to land without it: `opsForFile` refuses
+ * such an orphan, correctly, and that refusal is permanent. Discarding one row
+ * of the review panel could therefore leave a program that can never be saved
+ * *and* never be got out of, since the chat refuses to run while any edit
+ * targets the file. Deleting an inserted element already took its edits with
+ * it; discarding it from the review list has to do the same.
+ */
+export function withoutAction(actions: EditAction[], index: number): EditAction[] {
+  const target = actions[index];
+  if (!target) return actions;
+  const orphaned =
+    target.kind === "insert"
+      ? (id: string) => id === target.id
+      : () => false;
+  return actions.filter(
+    (a, i) =>
+      i !== index && !(isValueAction(a) && orphaned(a.target.dedupId)),
+  );
+}
+
+/**
+ * Why `next` cannot join the staged program, or null when it can.
+ *
+ * A staged program must never be able to strand itself. Every combination the
+ * editor allows has to be one the write-back will accept — otherwise the user
+ * reaches a save that always fails, a chat that refuses while any edit targets
+ * the file, and no way forward or back except discarding work.
+ *
+ * The rule is one sentence: an element on its way out cannot also be a party
+ * to another structural edit. Delete a section and the copy you staged beside
+ * it has nothing to sit next to; the write-back sees an insertion point inside
+ * a chunk it is removing and either refuses or, worse, silently drops the
+ * content. Said here, at the moment the second action is made, it is a
+ * sentence about what the user just did rather than an error about a program
+ * they can no longer see.
+ */
+export function stagingConflict(
+  actions: EditAction[],
+  next: EditAction,
+): string | null {
+  if (isValueAction(next)) return null;
+
+  /** The element ids `a` needs to still exist for it to mean anything. */
+  const refs = (a: EditAction): string[] => {
+    if (a.kind === "insert") return [a.target.dedupId];
+    if (a.kind === "move") return [a.target.dedupId, a.to.dedupId];
+    return [];
+  };
+
+  if (next.kind === "remove") {
+    const blocked = actions.find(
+      (a): a is StructuralAction =>
+        !isValueAction(a) && refs(a).includes(next.target.dedupId),
+    );
+    if (!blocked) return null;
+    const what =
+      blocked.kind === "insert"
+        ? `${blocked.label} is staged to go next to this element`
+        : `${blocked.label} is staged to move here`;
+    return `${what} — save (⌘S) first, then delete it.`;
+  }
+
+  const gone = new Set(
+    actions
+      .filter((a) => a.kind === "remove")
+      .map((a) => a.target.dedupId),
+  );
+  const orphan = refs(next).find((id) => gone.has(id));
+  return orphan
+    ? "that element is staged for deletion, so there is nothing left to place this against — discard the deletion first, or save it and start from what's on screen."
+    : null;
+}
+
 /** The write-back op wire format (one entry of a file's edit program). */
 export type EditOp = Record<string, unknown>;
 
@@ -291,15 +431,22 @@ export type EditOp = Record<string, unknown>;
  * failed validation), so the caller can refuse the save rather than write a
  * program that silently drops an edit.
  */
-export function opsForFile(actions: EditAction[]): {
+export function opsForFile(
+  actions: EditAction[],
+  file?: string,
+): {
   ops: EditOp[];
   failures: string[];
 } {
+  // A plain HTML page spells the same element differently. The snippet is
+  // translated once, at the boundary, rather than staging two versions of it.
+  const html = file !== undefined && /\.html?$/i.test(file);
   const failures: string[] = [];
-  // Pending id → the snippet as edits accumulate.
-  const pending = new Map<string, string>();
+  // Pending id → the snippet as edits accumulate, in the spelling that
+  // snippet is written in (a pasted one carries its source file's).
+  const pending = new Map<string, { snippet: string; lang: SnippetLang }>();
   for (const a of actions) {
-    if (a.kind === "insert") pending.set(a.id, a.snippet);
+    if (a.kind === "insert") pending.set(a.id, { snippet: a.snippet, lang: a.lang });
   }
   for (const a of actions) {
     if (!isValueAction(a) || !isPendingId(a.target.dedupId)) continue;
@@ -310,8 +457,8 @@ export function opsForFile(actions: EditAction[]): {
     }
     const next =
       a.kind === "class"
-        ? withAttr(current, "className", a.after)
-        : withText(current, a.after);
+        ? withAttr(current.snippet, classAttrFor(current.lang), a.after)
+        : withText(current.snippet, a.after);
     if (next === null) {
       failures.push(
         a.kind === "class"
@@ -320,7 +467,7 @@ export function opsForFile(actions: EditAction[]): {
       );
       continue;
     }
-    pending.set(a.target.dedupId, next);
+    pending.set(a.target.dedupId, { ...current, snippet: next });
   }
 
   const ops: EditOp[] = [];
@@ -339,14 +486,32 @@ export function opsForFile(actions: EditAction[]): {
       case "remove":
         ops.push({ op: "remove", index: a.target.index });
         break;
-      case "insert":
+      case "insert": {
+        const staged = pending.get(a.id)?.snippet ?? a.snippet;
+        // A snippet already in the destination's language is written as it
+        // stands — that is what makes pasting a whole section possible, since
+        // no translation exists for an arbitrary subtree. A JSX one bound for
+        // an HTML page is respelled, which only the palette's simple markup
+        // survives; anything else is refused rather than guessed at.
+        let snippet: string | null = staged;
+        if (html && a.lang !== "html") snippet = toHtmlSnippet(staged);
+        else if (!html && a.lang === "html") snippet = null;
+        if (snippet === null) {
+          failures.push(
+            html
+              ? "that element can't be written into an HTML page"
+              : "that element was copied from an HTML page and can't be written into a component",
+          );
+          break;
+        }
         ops.push({
           op: "insert",
           target: a.target.index,
           position: a.position,
-          snippet: pending.get(a.id) ?? a.snippet,
+          snippet,
         });
         break;
+      }
       case "move":
         ops.push({
           op: "move",
@@ -396,16 +561,58 @@ export interface ChatSession {
   messages: ChatMessage[];
 }
 
-/** One inspector-chat message (AI edits). */
+/** One chat message. */
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
-  /** The element the instruction targeted (on user messages). */
+  /** The element the instruction targeted (on user messages). Absent when
+   *  nothing was selected — chat works either way. */
   target?: { label: string; file: string };
-  /** Short commit hash when this reply applied an edit. */
+  /** Short commit hash when this reply's edit was accepted and committed. */
   commit?: string;
   error?: boolean;
+  /** The context lookups dedup ran for this turn, shown as a trace the way an
+   *  agent's tool calls are — the user should be able to see what the model
+   *  was allowed to look at. */
+  tools?: string[];
+  /** An edit the model proposed: the files it touches and what it says it
+   *  did. The file *contents* live in `pendingEdit` (transient) — a
+   *  transcript is persisted per project and has no business holding
+   *  snapshots of the user's source. */
+  proposal?: { files: string[]; summary: string };
+  /** How the proposal ended, once it has. */
+  outcome?: "accepted" | "rejected" | "superseded";
+}
+
+/** An edit the chat agent proposed and the user has not resolved yet.
+ *
+ * Nothing here has been written. This is the whole point of the shape: the
+ * model's output becomes a diff the user accepts or rejects, and only an
+ * accept reaches the parse-gated write-back and the session branch. */
+export interface PendingEdit {
+  /** The assistant message this proposal belongs to. */
+  messageId: string;
+  summary: string;
+  files: {
+    file: string;
+    /** null for a file the edit creates. */
+    before: string | null;
+    after: string;
+  }[];
+  /** Binaries the agent generated and dedup copied in — images, which have
+   * no `after` string to carry. They are new files by construction, so
+   * discarding the proposal removes them the same way it removes a created
+   * one. */
+  assets: { file: string; source: string }[];
+  /** Whether `after` is currently on disk so the canvas renders it.
+   *
+   * A diff says what changed; it does not say how it looks, and looking is the
+   * whole reason dedup renders the app at all. So a proposal is written out
+   * uncommitted and the running dev server shows it — the same bargain Cursor
+   * makes. `before` above is what puts it back, exactly, if the user discards.
+   * False when the preview write itself failed. */
+  previewing: boolean;
 }
 
 /**

@@ -7,6 +7,12 @@
 //! Returns None (no instrumentation, plain spawn) for anything we can't
 //! confidently rewrite — non-Vite projects, dev scripts that aren't a plain
 //! `vite …` invocation, or a missing vite binary.
+//!
+//! Two more launch paths live further down, one per kind of project dedup can
+//! open that isn't Vite: `next_webpack_launch` (Next has no `--config` flag,
+//! so tagging rides on one line in the user's own next.config) and
+//! `static_setup` (a plain HTML site has no build to hook, so dedup serves it
+//! and stamps the response instead).
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +21,7 @@ const OVERLAY_SRC: &str = include_str!("../assets/dedup-overlay.js");
 const NEXT_WRAPPER: &str = include_str!("../assets/dedup-next.mjs");
 const NEXT_LOADER: &str = include_str!("../assets/dedup-next-loader.cjs");
 const NEXT_TYPES: &str = include_str!("../assets/dedup-next.d.mts");
+const SERVE_BUNDLE: &str = include_str!("../assets/dedup-serve.mjs");
 
 pub struct Instrumentation {
     /// Absolute path to the executable to spawn (node_modules/.bin/vite).
@@ -171,6 +178,93 @@ mod tests {
     }
 }
 
+
+// --- Static sites -------------------------------------------------------------
+//
+// A plain HTML site has no build step to hook, so there is nothing to
+// instrument — but it also needs no instrumentation. dedup serves the folder
+// itself and runs every HTML response through the shared stamper on the way
+// out, which is the same tagging guarantee the Vite path gives (ids exist only
+// in what the browser receives, never in the user's file) reached by a
+// shorter road.
+//
+// The server runs as the project's dev server child process, so process-group
+// teardown, log streaming and ready-URL parsing all apply unchanged.
+
+/// Prepare the static server for `root` and return how to launch it.
+///
+/// `static_dir` is the folder the pages live in when they aren't at the root
+/// (`site/`, `www/`); ids stay relative to `root` either way.
+pub fn static_setup(root: &str, static_dir: Option<&str>) -> Result<Instrumentation, String> {
+    let node = crate::sidecar::find_node()?;
+    let dir = crate::sidecar::support_dir(root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create support dir: {e}"))?;
+
+    let server = dir.join("dedup-serve.mjs");
+    std::fs::write(&server, SERVE_BUNDLE).map_err(|e| format!("write static server: {e}"))?;
+    let overlay = dir.join("dedup-overlay.js");
+    std::fs::write(&overlay, OVERLAY_SRC).map_err(|e| format!("write overlay: {e}"))?;
+
+    let serve_root = match static_dir {
+        Some(d) if !d.is_empty() => Path::new(root).join(d),
+        _ => PathBuf::from(root),
+    };
+
+    Ok(Instrumentation {
+        program: node,
+        args: vec![
+            server.to_string_lossy().to_string(),
+            "--root".into(),
+            serve_root.to_string_lossy().to_string(),
+            "--base".into(),
+            root.to_string(),
+            "--overlay".into(),
+            overlay.to_string_lossy().to_string(),
+            "--session".into(),
+            dir.join("session.json").to_string_lossy().to_string(),
+        ],
+    })
+}
+
+#[cfg(test)]
+mod static_tests {
+    use super::*;
+
+    #[test]
+    fn static_setup_serves_the_pages_and_keeps_ids_project_relative() {
+        let dir = std::env::temp_dir().join(format!("dedup-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("site")).unwrap();
+        std::fs::write(dir.join("site/index.html"), "<h1>x</h1>").unwrap();
+        let root = dir.to_str().unwrap();
+
+        let launch = static_setup(root, Some("site")).unwrap();
+        let args = launch.args.join(" ");
+        assert!(args.contains("--root"), "{args}");
+        assert!(args.contains(&format!("{root}/site")), "serves the pages folder: {args}");
+        assert!(
+            args.contains(&format!("--base {root}")),
+            "but ids stay relative to the project root: {args}"
+        );
+
+        // Nothing may land in the user's folder: a static site has no
+        // node_modules to hide in, so dedup's files live outside it.
+        assert!(
+            !dir.join("node_modules").exists(),
+            "dedup must not create node_modules in a static site"
+        );
+        let support = crate::sidecar::support_dir(root);
+        assert!(support.join("dedup-serve.mjs").exists());
+        assert!(support.join("dedup-overlay.js").exists());
+        assert!(
+            !support.starts_with(&dir),
+            "support files for a static site live outside the project"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&support).ok();
+    }
+}
 
 // --- Next.js (Phase 5) --------------------------------------------------------
 //

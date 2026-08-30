@@ -10,12 +10,14 @@
 // Tags live only in the served JS, never in the user's source files.
 
 import { tagCode } from "./tagcode.mjs";
+import { buildBootScript } from "./boot.mjs";
 import { discoverRoutes } from "./routes.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export { tagCode };
+export { buildBootScript, HOLD_FLAG, OFFLINE_FLAG } from "./boot.mjs";
 export { discoverRoutes } from "./routes.mjs";
 
 const JSX_FILE_RE = /\.[jt]sx$/;
@@ -25,132 +27,6 @@ const ROUTES_ROUTE = "/__dedup/routes";
 const SESSION_ROUTE = "/__dedup/session.js";
 const HARNESS_ID = "virtual:dedup-harness";
 
-/** Query flag on a frame's URL asking it to freeze on its first screen. */
-export const HOLD_FLAG = "__dedup_hold";
-
-/**
- * The script served into the top of every canvas page's <head>, carrying the
- * two things that must run *before the app boots*: the mock-session seed
- * (zero-login editing) and the hold (freezing a transient screen).
- *
- * Both are gated on being framed, so the user's own browsing of their dev
- * server is never affected, and both are wrapped so a failure warns instead
- * of killing the page in <head>. `seed` is the persisted `session.json`
- * (`{enabled, script}`) or null; with no seed and no hold flag this is still
- * a valid, inert script.
- */
-export function buildBootScript(seed) {
-  const body = seed && seed.enabled && seed.script && seed.script.trim()
-    ? `  try {
-${seed.script}
-  } catch (e) {
-    console.warn("dedup: mock-session seed failed", e);
-  }`
-    : "  /* no active mock session */";
-  return `// dedup boot script — injected only into the editor canvas.
-(function () {
-  "use strict";
-  // Framed gate: never touch the app when it's opened directly in a browser.
-  if (window.top === window.self) return;
-${body}
-
-  // --- hold ---------------------------------------------------------------
-  // Splash screens, interstitials and "redirecting…" states are gone before
-  // anyone can look at them, so they can never be inspected or edited. When
-  // this frame is flagged, freeze it on its first screen.
-  //
-  // Long timers are how those screens advance, so queue them. Short ones must
-  // still run: React's scheduler falls back to setTimeout, and stalling that
-  // hangs the page instead of pausing it. 400ms cleanly separates the two —
-  // no framework schedules rendering that far out, and no splash is that
-  // brief. Timer-driven navigation is covered twice over, since history is
-  // frozen as well. Releasing restores everything and flushes what was held,
-  // so the app continues rather than having lost the work.
-  if (location.search.indexOf("${HOLD_FLAG}=1") === -1) return;
-  try {
-    var MIN_HELD_DELAY = 400;
-    var queued = [];
-    var seq = 0;
-    var nSetTimeout = window.setTimeout.bind(window);
-    var nSetInterval = window.setInterval.bind(window);
-    var nClearTimeout = window.clearTimeout.bind(window);
-    var nClearInterval = window.clearInterval.bind(window);
-
-    var hold = function (fn, args, resume) {
-      var id = "dedup-held-" + ++seq;
-      queued.push({
-        id: id,
-        run: function () {
-          if (resume) resume();
-          fn.apply(null, args);
-        },
-      });
-      return id;
-    };
-    window.setTimeout = function (fn, delay) {
-      if (typeof fn === "function" && (+delay || 0) >= MIN_HELD_DELAY) {
-        return hold(fn, [].slice.call(arguments, 2), null);
-      }
-      return nSetTimeout.apply(null, arguments);
-    };
-    window.setInterval = function (fn, delay) {
-      var d = +delay || 0;
-      if (typeof fn === "function" && d >= MIN_HELD_DELAY) {
-        // On release the interval resumes ticking, not just fires once.
-        return hold(fn, [].slice.call(arguments, 2), function () {
-          nSetInterval(fn, d);
-        });
-      }
-      return nSetInterval.apply(null, arguments);
-    };
-    var drop = function (id) {
-      for (var i = 0; i < queued.length; i++) {
-        if (queued[i].id === id) {
-          queued.splice(i, 1);
-          return true;
-        }
-      }
-      return false;
-    };
-    // The app may cancel a held timer before it ever runs — honour that.
-    window.clearTimeout = function (id) {
-      if (!drop(id)) nClearTimeout(id);
-    };
-    window.clearInterval = function (id) {
-      if (!drop(id)) nClearInterval(id);
-    };
-
-    var pushState = history.pushState;
-    var replaceState = history.replaceState;
-    history.pushState = function () {};
-    history.replaceState = function () {};
-
-    window.__dedupHeld = true;
-    window.__dedupRelease = function () {
-      if (!window.__dedupHeld) return;
-      window.__dedupHeld = false;
-      window.setTimeout = nSetTimeout;
-      window.setInterval = nSetInterval;
-      window.clearTimeout = nClearTimeout;
-      window.clearInterval = nClearInterval;
-      history.pushState = pushState;
-      history.replaceState = replaceState;
-      var pending = queued.slice();
-      queued.length = 0;
-      for (var i = 0; i < pending.length; i++) {
-        try {
-          pending[i].run();
-        } catch (e) {
-          console.warn("dedup: a held timer failed on release", e);
-        }
-      }
-    };
-  } catch (e) {
-    console.warn("dedup: hold failed to install", e);
-  }
-})();
-`;
-}
 
 /** Candidate global stylesheets so harness-rendered components get the
  * project's Tailwind theme. Best-effort — missing files are skipped. */
@@ -189,11 +65,12 @@ export default function dedupTagger(options = {}) {
 
     transformIndexHtml() {
       return [
-        // Mock-session seed (zero-login editing): a classic, synchronous
-        // script at the very top of <head>, so its storage writes land before
-        // the app's module entry runs and reads them. Empty/no-op unless the
-        // user has an active seed (served per request); self-gated to framed
-        // canvas pages regardless.
+        // The boot script (see boot.mjs): a classic, synchronous script at
+        // the very top of <head>, because everything it carries has to be in
+        // place before the app's module entry runs — the seed's storage
+        // writes before the app reads them, the offline cut before the app's
+        // first request. Inert unless a seed is active or a frame flag asks
+        // for something; self-gated to framed canvas pages regardless.
         {
           tag: "script",
           attrs: { src: SESSION_ROUTE },

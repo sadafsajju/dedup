@@ -25,15 +25,27 @@ export const SKIP_DIRS = new Set([
 export const COMPONENT_FILE_RE = /\.[jt]sx$/;
 /** Any module that can *import* a component — call sites live here too. */
 export const SOURCE_FILE_RE = /\.[jt]sx?$/;
+/** What the chat agent may list and read: source, markup, styles, and the
+ *  small config files it needs to answer "how is this project set up". */
+export const CONTEXT_FILE_RE =
+  /\.(?:[jt]sx?|mjs|cjs|mts|cts|css|s[ac]ss|html?|json|md)$/i;
 export const MAX_FILE_BYTES = 512 * 1024; // generated/vendored monsters aren't components
 export const MAX_FILES = 5000;
 
 /**
  * Every source file under `root`, sorted. `pattern` picks which kinds:
  * COMPONENT_FILE_RE for "files that can declare JSX components" (the scan),
- * SOURCE_FILE_RE for "files that can reference one" (the codemod).
+ * SOURCE_FILE_RE for "files that can reference one" (the codemod),
+ * CONTEXT_FILE_RE for "files the chat agent may read" (a wider net — the
+ * agent answers questions about markup and stylesheets too).
+ *
+ * `allow` un-skips directories that are normally skipped. Only the chat agent
+ * passes it, and only for `public/`: a static site keeps its actual pages
+ * there, so the default skip list would leave the agent blind to the very
+ * files it is being asked about. The scan and the codemod pass nothing and
+ * therefore still walk exactly the same tree as each other.
  */
-export function discoverFiles(root, pattern = COMPONENT_FILE_RE) {
+export function discoverFiles(root, pattern = COMPONENT_FILE_RE, allow = null) {
   const files = [];
   const stack = [root];
   while (stack.length > 0 && files.length < MAX_FILES) {
@@ -48,7 +60,7 @@ export function discoverFiles(root, pattern = COMPONENT_FILE_RE) {
       if (entry.name.startsWith(".")) continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) stack.push(full);
+        if (!SKIP_DIRS.has(entry.name) || allow?.has(entry.name)) stack.push(full);
       } else if (entry.isFile() && pattern.test(entry.name)) {
         files.push(full);
       }
