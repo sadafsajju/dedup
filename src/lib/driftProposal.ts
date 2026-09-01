@@ -45,6 +45,11 @@ export interface ExtractionProposal {
   /** Complete file content for the new component. */
   source: string;
   notes: string;
+  /** How many copies it was designed from. Carried so the UI can say when a
+   *  proposal describes a subset — a component designed from three of seven
+   *  copies is not wrong, but it is not the answer to the question the list
+   *  appeared to be asking. */
+  fromCount?: number;
 }
 
 const SYSTEM_PROMPT = `You are an expert React + Tailwind engineer working inside "dedup". A deterministic scan found the same piece of markup written out several times across a codebase — copies that were never made into a component. You are given every copy and a precise report of what differs between them. Write the single component that replaces them.

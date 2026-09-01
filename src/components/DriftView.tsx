@@ -98,8 +98,14 @@ function OccurrenceCard({
       </div>
       <div
         style={{ width: cardW, height: cardH }}
-        className={`overflow-hidden rounded-lg bg-white ring-1 transition-shadow ${
-          selected ? "ring-accent" : "ring-line group-hover:ring-line-strong"
+        // An excluded copy has to read as excluded across a whole row at a
+        // glance. A ring the user has to look for is how three emerald badges
+        // got combined while four other copies in two other colours sat
+        // quietly deselected beside them.
+        className={`overflow-hidden rounded-lg bg-white ring-1 transition-all ${
+          selected
+            ? "ring-accent"
+            : "opacity-40 grayscale-[0.35] ring-line group-hover:opacity-70"
         }`}
       >
         {src ? (
@@ -150,6 +156,8 @@ export function DriftView() {
   const proposing = useStore((s) => s.driftProposing);
   const proposal = useStore((s) => s.driftProposal);
   const proposalError = useStore((s) => s.driftProposalError);
+  const selectAllDrift = useStore((s) => s.selectAllDrift);
+  const partial = !!candidate && selectedCount < candidate.occurrences.length;
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const zoom = useStore((s) => s.driftZoom);
@@ -227,8 +235,19 @@ export function DriftView() {
                 file{candidate.fileCount === 1 ? "" : "s"}
               </span>
             </div>
-            <div className="mb-5 text-2xs text-ink-faint">
-              {selectedCount} selected · click a copy to include or exclude it.
+            <div className="mb-5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-ink-faint">
+              <span className={partial ? "text-warn" : undefined}>
+                {selectedCount} of {candidate.occurrences.length} selected
+              </span>
+              <button
+                onClick={selectAllDrift}
+                disabled={!partial}
+                className="text-accent hover:underline disabled:text-ink-faint disabled:no-underline"
+              >
+                Select all
+              </button>
+              <span className="text-line-strong">·</span>
+              <span>click a copy to include or exclude it.</span>
               {candidate.existing && (
                 <span className="text-warn">
                   {" "}
@@ -286,6 +305,14 @@ export function DriftView() {
                       {proposal.summary}
                     </div>
                   )}
+                  <div
+                    className={`mt-1 text-2xs ${partial ? "text-warn" : "text-ink-faint"}`}
+                  >
+                    Designed from {proposal.fromCount} of{" "}
+                    {candidate.occurrences.length} copies
+                    {partial && " — the rest were deselected and had no say in it"}
+                    .
+                  </div>
                 </div>
                 <pre className="overflow-x-auto px-4 py-3 font-mono text-[11px] leading-5 text-ink-dim">
                   {proposal.source}

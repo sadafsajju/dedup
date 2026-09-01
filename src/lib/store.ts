@@ -570,6 +570,8 @@ interface AppState {
    *  rendered together in the main view. */
   openDrift: (id: string | null) => void;
   toggleDriftOccurrence: (key: string) => void;
+  /** Put every copy back in the selection. */
+  selectAllDrift: () => void;
   setDriftTransform: (t: { zoom: number; pan: { x: number; y: number } }) => void;
   /** Ask the model for the component that replaces the selected copies. This
    *  never writes: the extraction codemod does not exist, so a proposal is
@@ -3456,7 +3458,9 @@ export const useStore = create<AppState>((set, get) => ({
     set({ driftProposing: true, driftProposalError: null, driftProposal: null });
     try {
       const reply = await runExtractPrompt(backend, candidate, picked);
-      set({ driftProposal: parseExtractReply(reply) });
+      set({
+        driftProposal: { ...parseExtractReply(reply), fromCount: picked.length },
+      });
     } catch (e) {
       set({ driftProposalError: String(e instanceof Error ? e.message : e) });
     } finally {
@@ -3466,6 +3470,17 @@ export const useStore = create<AppState>((set, get) => ({
 
   setDriftTransform: ({ zoom, pan }) =>
     set({ driftZoom: clampZoom(zoom), driftPan: pan }),
+
+  selectAllDrift: () => {
+    const { driftResult, openDriftId } = get();
+    const candidate = driftResult?.candidates.find((c) => c.id === openDriftId);
+    if (!candidate) return;
+    const driftSelection: Record<string, true> = {};
+    for (const o of candidate.occurrences) {
+      driftSelection[`${o.file}:${o.start}`] = true;
+    }
+    set({ driftSelection });
+  },
 
   toggleDriftOccurrence: (key) => {
     const next = { ...get().driftSelection };
