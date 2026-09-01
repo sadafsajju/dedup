@@ -24,8 +24,10 @@ const JSX_FILE_RE = /\.[jt]sx$/;
 const OVERLAY_ROUTE = "/__dedup/overlay.js";
 const HARNESS_ROUTE = "/__dedup/harness";
 const ROUTES_ROUTE = "/__dedup/routes";
+const SNIPPET_ROUTE = "/__dedup/snippet";
 const SESSION_ROUTE = "/__dedup/session.js";
 const HARNESS_ID = "virtual:dedup-harness";
+const SNIPPET_ID = "virtual:dedup-snippet";
 
 
 /** Candidate global stylesheets so harness-rendered components get the
@@ -88,11 +90,13 @@ export default function dedupTagger(options = {}) {
     // renders one component in isolation for the editor's canvas artboards.
     resolveId(id) {
       if (id === HARNESS_ID) return HARNESS_ID;
+      if (id === SNIPPET_ID) return SNIPPET_ID;
       return null;
     },
 
     load(id) {
       if (id === HARNESS_ID) return harnessModule(projectRoot);
+      if (id === SNIPPET_ID) return snippetModule(projectRoot);
       return null;
     },
 
@@ -136,6 +140,21 @@ export default function dedupTagger(options = {}) {
         }
         res.end(buildBootScript(seed));
       });
+      server.middlewares.use(SNIPPET_ROUTE, (req, res) => {
+        // Same pipeline as the harness for the same reason (the react plugin's
+        // preamble), even though this page mounts no components: it still
+        // loads a module Vite has to transform.
+        server
+          .transformIndexHtml(req.originalUrl || SNIPPET_ROUTE, SNIPPET_HTML)
+          .then((html) => {
+            res.setHeader("content-type", "text/html");
+            res.end(html);
+          })
+          .catch((e) => {
+            res.statusCode = 500;
+            res.end(`dedup snippet: ${e}`);
+          });
+      });
       server.middlewares.use(HARNESS_ROUTE, (req, res) => {
         // Through the HTML transform pipeline, not raw: @vitejs/plugin-react
         // injects its react-refresh preamble there, and component modules
@@ -178,6 +197,64 @@ const HARNESS_HTML = `<!doctype html>
   </body>
 </html>
 `;
+
+const SNIPPET_HTML = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; background: #fff; }
+      #root { display: inline-block; min-width: 8px; min-height: 8px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/@id/${SNIPPET_ID}"></script>
+  </body>
+</html>
+`;
+
+/**
+ * Source of the snippet module: drops a fragment of markup into a page that
+ * carries the project's own stylesheets, and reports what size it came out.
+ *
+ * This exists because a *drift occurrence* has no name and no export — it is
+ * `<button className="…">Save</button>` sitting inside a page — so the
+ * component harness below, which imports a module and mounts an export, has
+ * nothing to import. The markup is all there is, and with the project's own
+ * Tailwind build behind it that is enough for the preview to be the real
+ * pixels rather than an approximation.
+ *
+ * It renders inert markup and nothing else: no React, no user modules, no
+ * handlers. The snippet arrives in the query string already stripped of
+ * anything dynamic (see `previewHtml` in plugin-src/extract.mjs).
+ */
+export function snippetModule(root) {
+  const cssImports = CSS_CANDIDATES.filter((f) => fs.existsSync(path.join(root, f)))
+    .map((f) => `import "/${f}";`)
+    .join("\n");
+
+  return `${cssImports}
+const q = new URLSearchParams(location.search);
+const rootEl = document.getElementById("root");
+const id = q.get("id") || "";
+const fixedW = parseInt(q.get("w") || "", 10) || 0;
+if (fixedW > 0) { rootEl.style.display = "block"; rootEl.style.width = fixedW + "px"; }
+rootEl.innerHTML = q.get("html") || "";
+// Stylesheets land asynchronously, so measure after a paint or the report is
+// the unstyled size — which for Tailwind markup is wildly wrong.
+requestAnimationFrame(() => requestAnimationFrame(() => {
+  const r = rootEl.getBoundingClientRect();
+  parent.postMessage({
+    __dedup: true,
+    type: "snippet-size",
+    id,
+    width: Math.ceil(r.width),
+    height: Math.ceil(r.height),
+  }, "*");
+}));
+`;
+}
 
 /**
  * Source of the harness module, generated per project so it can import the

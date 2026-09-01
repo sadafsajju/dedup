@@ -719,6 +719,10 @@ export interface DriftOccurrence {
   /** The component this copy was found inside, when it was inside one. */
   component: string | null;
   source: string;
+  /** Static markup for the preview harness — a picture of the occurrence, not
+   *  a translation of it: handlers and computed values are dropped rather than
+   *  approximated. Built by `previewHtml` in plugin-src/extract.mjs. */
+  html: string;
 }
 
 /** A class knob whose value differs between copies. `layout` is the load-

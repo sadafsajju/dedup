@@ -12,6 +12,7 @@
     "test:actions": "node plugin-src/run-ts.mjs plugin-src/actions.test.mts",
     "test:scan": "node plugin-src/scan.test.mjs",
     "test:extract": "node plugin-src/extract.test.mjs",
+    "test:drift": "node plugin-src/run-ts.mjs plugin-src/driftproposal.test.mts",
     "test:tw": "node plugin-src/run-ts.mjs plugin-src/tailwind.test.mts",
     "test:chat": "node plugin-src/run-ts.mjs plugin-src/chatedits.test.mts",
     "preview": "vite preview",

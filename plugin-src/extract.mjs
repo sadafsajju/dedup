@@ -70,6 +70,57 @@ const MAX_CANDIDATES = 100;
 
 // --- subtree model -----------------------------------------------------------
 
+// --- preview markup ---------------------------------------------------------
+//
+// A drift occurrence has no name and no export, so it cannot be rendered the
+// way the component harness renders a component (import the module, mount the
+// export). What it does have is markup — so the preview is built here, from
+// the tree that was just parsed, and handed to a harness that only has to drop
+// it into a page carrying the project's own stylesheet. Same Tailwind, same
+// pixels, no module to import.
+//
+// It is a *picture*, not a translation: event handlers and computed values are
+// dropped rather than approximated, because a preview that invented an `href`
+// or a `disabled` state would be lying about the thing the user is judging.
+
+const VOID_TAGS = new Set([
+  "area", "base", "br", "col", "embed", "hr", "img", "input",
+  "link", "meta", "source", "track", "wbr",
+]);
+
+/** Attributes worth keeping: static strings that change how it looks. An
+ *  expression value (`onClick={…}`, `disabled={busy}`) is dropped — its
+ *  runtime value is exactly what a static preview cannot know. */
+const SKIP_ATTRS = /^(?:key|ref|on[A-Z]|dangerouslySetInnerHTML$)/;
+
+const escapeHtml = (t) =>
+  t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const escapeAttr = (t) => escapeHtml(t).replace(/"/g, "&quot;");
+
+/** Display text for an expression child. A string literal inside it is the
+ *  label the user actually sees (`{saving ? "Saving…" : "Save"}` → `Saving…`),
+ *  so prefer that; otherwise show the expression, which reads as the
+ *  placeholder it is. */
+function expressionText(expr) {
+  const literal = expr.match(/["'`]([^"'`\n]{1,60})["'`]/);
+  return literal ? literal[1] : expr.trim();
+}
+
+function openTag(node) {
+  const attrs = [];
+  if (node.classes.length > 0) {
+    attrs.push(` class="${escapeAttr(node.classes.join(" "))}"`);
+  }
+  for (const a of node.attrs) {
+    if (SKIP_ATTRS.test(a.name)) continue;
+    if (!a.text) continue;
+    const m = a.text.match(/^"([^"]*)"$|^'([^']*)'$/);
+    if (!m) continue; // an expression — unknowable statically
+    attrs.push(` ${a.name}="${escapeAttr(m[1] ?? m[2] ?? "")}"`);
+  }
+  return attrs.join("");
+}
+
 /**
  * Build the comparable form of one JSX element and everything under it.
  *
@@ -113,26 +164,42 @@ function buildNode(el, code) {
 
   const children = [];
   const texts = [];
+  // Preview markup is assembled here rather than from `children` + `texts`,
+  // which are separate arrays and so have lost the order the two appeared in.
+  // `<button><Icon/>Save</button>` and `<button>Save<Icon/></button>` are
+  // different pictures.
+  const inner = [];
   for (const c of el.children ?? []) {
     if (c.type === "JSXElement") {
       const child = buildNode(c, code);
-      if (child) children.push(child);
+      if (child) {
+        children.push(child);
+        inner.push(child.html);
+      }
     } else if (c.type === "JSXText") {
       const t = c.value.trim();
-      if (t) texts.push(t);
+      if (t) {
+        texts.push(t);
+        inner.push(escapeHtml(t));
+      }
     } else if (c.type === "JSXExpressionContainer") {
       if (c.expression?.type === "JSXEmptyExpression") continue; // a comment
       const expr = code.slice(c.expression.start, c.expression.end);
       texts.push(`{${expr.length > 200 ? `${expr.slice(0, 200)}…` : expr}}`);
       // JSX inside the expression still shapes the subtree, so `{items.map(i =>
       // <li/>)}` contributes an `li` exactly as the scan's walk does.
+      const nested = [];
       walk(c.expression, (n) => {
         if (n.type === "JSXElement") {
           const child = buildNode(n, code);
-          if (child) children.push(child);
+          if (child) {
+            children.push(child);
+            nested.push(child.html);
+          }
           return false;
         }
       });
+      inner.push(nested.length > 0 ? nested.join("") : escapeHtml(expressionText(expr)));
     }
   }
 
@@ -147,6 +214,17 @@ function buildNode(el, code) {
     line: el.loc?.start.line ?? 0,
     col: el.loc?.start.column ?? 0,
   };
+  // A component child (`<InboxIcon className="h-7 w-7"/>`) has no HTML form,
+  // so it renders as an empty box carrying its own classes — which is enough
+  // for its sizing to hold the layout together.
+  const tagName = /^[a-z]/.test(node.tag) ? node.tag : null;
+  const attrHtml = openTag(node);
+  node.html = tagName
+    ? VOID_TAGS.has(tagName)
+      ? `<${tagName}${attrHtml}>`
+      : `<${tagName}${attrHtml}>${inner.join("")}</${tagName}>`
+    : `<span${attrHtml}>${inner.join("")}</span>`;
+
   node.shape = `${node.tag}(${children.map((c) => c.shape).join(",")})`;
   node.elements = 1 + children.reduce((n, c) => n + c.elements, 0);
   node.weight =
@@ -501,6 +579,9 @@ export function extract(root, options = {}, emitProgress = () => {}) {
         end: o.node.end,
         component: o.component,
         source: o.source,
+        /** Static markup for the preview harness — see the note above
+         *  VOID_TAGS. Not a translation of the JSX, a picture of it. */
+        html: o.node.html,
       })),
       varies: {
         classes: variance.classes,

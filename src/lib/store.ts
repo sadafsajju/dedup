@@ -42,6 +42,11 @@ import {
 } from "./mergeFlow";
 import { parseMergeReply, runMergePrompt } from "./mergeProposal";
 import {
+  parseExtractReply,
+  runExtractPrompt,
+  type ExtractionProposal,
+} from "./driftProposal";
+import {
   combinedConfidence,
   runVisualPass,
   type VisualScore,
@@ -246,7 +251,7 @@ interface AppState {
    * seed can reach its session at all. null until probed. */
   authProvider: AuthProvider | null;
   /** Top-level editor view: the live canvas or the component gallery. */
-  editorTab: "canvas" | "components";
+  editorTab: "canvas" | "components" | "drift";
 
   /**
    * The source file open in the split code panel, or null.
@@ -331,8 +336,17 @@ interface AppState {
   driftProgress: DriftProgress | null;
   driftResult: DriftResult | null;
   driftError: string | null;
-  /** Candidate expanded in the drift list. */
+  /** Candidate expanded in the drift list, and shown in the drift view. */
   openDriftId: string | null;
+  /** The model's proposed component for the current selection, once asked. */
+  driftProposal: ExtractionProposal | null;
+  driftProposing: boolean;
+  driftProposalError: string | null;
+  /** Occurrences of the open candidate the user wants in the extraction,
+   *  keyed `file:start`. Opening a candidate selects all of them — the common
+   *  case is "these are all the same thing", and deselecting the odd one out
+   *  is less work than picking fifteen. */
+  driftSelection: Record<string, true>;
   /** Visual similarity per cluster (FR-5.2's third signal). Absent = the pass
    * hasn't run; a `score` of null inside one = it ran and the members could
    * not be rendered in isolation, which is reported, not averaged away. */
@@ -437,7 +451,7 @@ interface AppState {
   saveSessionSeed: (enabled: boolean, script: string) => Promise<void>;
   /** Draft a seed from the project's auth source via the active AI backend. */
   generateSessionSeed: () => Promise<void>;
-  setEditorTab: (tab: "canvas" | "components") => void;
+  setEditorTab: (tab: "canvas" | "components" | "drift") => void;
   /** Open a source file in the split code panel, revealing `line`. */
   openCode: (file: string, line?: number) => Promise<void>;
   closeCode: () => void;
@@ -547,7 +561,14 @@ interface AppState {
   /** Load the last persisted drift run for the open project, if any. */
   restoreDrift: () => Promise<void>;
   setDriftProgress: (p: DriftProgress) => void;
+  /** Open a candidate: expands its row, selects every copy, and shows them
+   *  rendered together in the main view. */
   openDrift: (id: string | null) => void;
+  toggleDriftOccurrence: (key: string) => void;
+  /** Ask the model for the component that replaces the selected copies. This
+   *  never writes: the extraction codemod does not exist, so a proposal is
+   *  shown and nothing lands. */
+  proposeExtraction: () => Promise<void>;
   /** Render every cluster member in isolation and compare the pixels — the
    * scan's visual signal (FR-5.2). Runs on demand, from the Components tab. */
   runVisualPass: () => Promise<void>;
@@ -1325,6 +1346,10 @@ export const useStore = create<AppState>((set, get) => ({
   driftResult: null,
   driftError: null,
   openDriftId: null,
+  driftSelection: {},
+  driftProposal: null,
+  driftProposing: false,
+  driftProposalError: null,
   scanError: null,
   liveSizes: {},
   dismissed: {},
@@ -1374,6 +1399,10 @@ export const useStore = create<AppState>((set, get) => ({
       driftResult: null,
       driftError: null,
       openDriftId: null,
+      driftSelection: {},
+      driftProposal: null,
+      driftProposing: false,
+      driftProposalError: null,
       scanError: null,
       liveSizes: loadLiveSizes(project.root),
       dismissed: loadDismissed(project.root),
@@ -1456,6 +1485,10 @@ export const useStore = create<AppState>((set, get) => ({
       driftResult: null,
       driftError: null,
       openDriftId: null,
+      driftSelection: {},
+      driftProposal: null,
+      driftProposing: false,
+      driftProposalError: null,
       scanError: null,
       liveSizes: {},
       dismissed: {},
@@ -3356,7 +3389,73 @@ export const useStore = create<AppState>((set, get) => ({
 
   setDriftProgress: (driftProgress) => set({ driftProgress }),
 
-  openDrift: (openDriftId) => set({ openDriftId }),
+  openDrift: (openDriftId) => {
+    const candidate = get().driftResult?.candidates.find(
+      (c) => c.id === openDriftId,
+    );
+    const driftSelection: Record<string, true> = {};
+    for (const o of candidate?.occurrences ?? []) {
+      driftSelection[`${o.file}:${o.start}`] = true;
+    }
+    set({
+      openDriftId,
+      driftSelection,
+      driftProposal: null,
+      driftProposalError: null,
+      // Opening a candidate is the request to *see* the copies — that is the
+      // whole point of the tab, and a list of file:line is what every other
+      // tool already gives you.
+      ...(openDriftId ? { editorTab: "drift" as const } : {}),
+    });
+  },
+
+  proposeExtraction: async () => {
+    const { driftResult, openDriftId, driftSelection, driftProposing } = get();
+    if (driftProposing) return;
+    const candidate = driftResult?.candidates.find((c) => c.id === openDriftId);
+    if (!candidate) return;
+    const picked = candidate.occurrences.filter(
+      (o) => driftSelection[`${o.file}:${o.start}`],
+    );
+    if (picked.length < 2) {
+      set({ driftProposalError: "Select at least two copies to combine." });
+      return;
+    }
+    const kind = get().activeAiBackend();
+    const backend =
+      kind && kind !== "api"
+        ? {
+            kind: "cli" as const,
+            agent: kind,
+            run: (p: string) => agentPrompt(kind, p, get().agents[kind].model),
+          }
+        : kind === "api"
+          ? { kind: "api" as const, apiKey: get().anthropicKey }
+          : null;
+    if (!backend) {
+      set({
+        driftProposalError:
+          "No AI backend connected — choose one in the AI switch (top bar).",
+      });
+      return;
+    }
+    set({ driftProposing: true, driftProposalError: null, driftProposal: null });
+    try {
+      const reply = await runExtractPrompt(backend, candidate, picked);
+      set({ driftProposal: parseExtractReply(reply) });
+    } catch (e) {
+      set({ driftProposalError: String(e instanceof Error ? e.message : e) });
+    } finally {
+      set({ driftProposing: false });
+    }
+  },
+
+  toggleDriftOccurrence: (key) => {
+    const next = { ...get().driftSelection };
+    if (next[key]) delete next[key];
+    else next[key] = true;
+    set({ driftSelection: next });
+  },
 
   openCluster: (openClusterId) => set({ openClusterId }),
 

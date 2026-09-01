@@ -17,6 +17,7 @@ import { TopBar } from "./TopBar";
 import { Sidebar } from "./Sidebar";
 import { Canvas } from "./Canvas";
 import { ComponentsView } from "./ComponentsView";
+import { DriftView } from "./DriftView";
 import { Inspector } from "./Inspector";
 import { ConsoleDrawer } from "./ConsoleDrawer";
 import { SessionModal } from "./SessionModal";
@@ -216,6 +217,7 @@ export function Editor() {
             switching tabs never reloads the app or harness iframes. */}
         <Canvas />
         <ComponentsView />
+        <DriftView />
       </div>
       <TopBar />
       <Sidebar />

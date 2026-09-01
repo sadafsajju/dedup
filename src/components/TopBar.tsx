@@ -54,6 +54,11 @@ export function TopBar() {
   const categorizing = useStore((s) => s.categorizing);
   const runScan = useStore((s) => s.runScan);
   const editorTab = useStore((s) => s.editorTab);
+  const driftCount = useStore(
+    (s) =>
+      s.driftResult?.candidates.find((c) => c.id === s.openDriftId)
+        ?.occurrences.length ?? 0,
+  );
   const setEditorTab = useStore((s) => s.setEditorTab);
   const selectedRoute = useStore((s) => s.selectedRoute);
   const instrumentation = useStore((s) => s.instrumentation);
@@ -131,6 +136,7 @@ export function TopBar() {
           [
             ["canvas", "Canvas"],
             ["components", "Components"],
+            ["drift", "Drift"],
           ] as const
         ).map(([id, label]) => (
           <button
@@ -146,6 +152,11 @@ export function TopBar() {
             {id === "components" && galleryCount > 0 && (
               <span className="ml-1 text-ink-faint tabular-nums">
                 {galleryCount}
+              </span>
+            )}
+            {id === "drift" && driftCount > 0 && (
+              <span className="ml-1 text-ink-faint tabular-nums">
+                {driftCount}
               </span>
             )}
           </button>
