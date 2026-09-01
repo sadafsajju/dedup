@@ -8,6 +8,8 @@
 import assert from "node:assert/strict";
 import {
   buildExtractPrompt,
+  covaryingGroups,
+  isColourKnob,
   parseExtractReply,
 } from "../src/lib/driftProposal.ts";
 import type { DriftCandidate, DriftOccurrence } from "../src/lib/types.ts";
@@ -99,6 +101,91 @@ test("an existing component is pointed at rather than duplicated", () => {
   );
   assert.match(p, /already one of these copies/);
   assert.match(p, /src\/Button\.tsx/);
+});
+
+// --- semantic colour, and co-variance -----------------------------------------
+//
+// These exist because of a real failure: a badge with three tones — neutral,
+// success, warning — came back from the model as one emerald pill. The two
+// colour knobs moved in perfect lockstep across seven copies and the prompt
+// showed them as two unrelated rows next to an instruction to normalise.
+
+const TONED: DriftCandidate = {
+  ...CANDIDATE,
+  occurrences: [
+    occ("a.tsx", 1, 10),
+    occ("b.tsx", 2, 20),
+    occ("c.tsx", 3, 30),
+    occ("d.tsx", 4, 40),
+  ],
+  varies: {
+    classes: [
+      {
+        node: 0,
+        knob: "bg-color",
+        layout: false,
+        values: ["bg-slate-100", "bg-emerald-50", "bg-emerald-50", "bg-amber-50"],
+      },
+      {
+        node: 0,
+        knob: "text-color",
+        layout: false,
+        values: ["text-slate-600", "text-emerald-700", "text-emerald-700", "text-amber-700"],
+      },
+      { node: 0, knob: "px", layout: false, values: ["px-2", "px-2.5", "px-2", "px-2"] },
+    ],
+    attrs: [],
+    texts: [],
+  },
+};
+
+test("a base colour is semantic; a state colour is just a missing state", () => {
+  assert.equal(isColourKnob("bg-color"), true);
+  assert.equal(isColourKnob("text-color"), true);
+  // Three buttons that forgot a hover is drift, not a variant to preserve.
+  assert.equal(isColourKnob("hover:bg-color"), false);
+  assert.equal(isColourKnob("focus:ring-color"), false);
+  assert.equal(isColourKnob("px"), false);
+});
+
+test("colour knobs are marked SEMANTIC, spacing is not", () => {
+  const p = buildExtractPrompt(TONED, TONED.occurrences);
+  assert.match(p, /SEMANTIC bg-color:/);
+  assert.match(p, /SEMANTIC text-color:/);
+  assert.match(p, /^px: /m, "padding must stay unmarked — it is drift");
+});
+
+test("knobs that vary in lockstep are reported as one prop with its members", () => {
+  const p = buildExtractPrompt(TONED, TONED.occurrences);
+  assert.match(p, /MOVE TOGETHER: bg-color \+ text-color — one prop, not 2\./);
+  assert.match(p, /bg-slate-100 \+ text-slate-600 {2}\(1 copy\)/);
+  assert.match(p, /bg-emerald-50 \+ text-emerald-700 {2}\(2 copies\)/);
+  assert.match(p, /bg-amber-50 \+ text-amber-700 {2}\(1 copy\)/);
+});
+
+test("knobs that merely both vary are not called co-varying", () => {
+  // px changes on a different copy than the colours do — reporting that as
+  // one prop would invent a variant nobody wrote.
+  const groups = covaryingGroups(TONED.varies.classes);
+  assert.equal(groups.length, 1);
+  assert.deepEqual(groups[0].map((g) => g.knob), ["bg-color", "text-color"]);
+});
+
+test("a knob that differs in every copy partitions nothing", () => {
+  // Fifteen distinct labels are not fifteen variants; only a knob that groups
+  // the copies is evidence of a state.
+  const groups = covaryingGroups([
+    { knob: "a", values: ["1", "2", "3", "4"] },
+    { knob: "b", values: ["w", "x", "y", "z"] },
+  ]);
+  assert.equal(groups.length, 0);
+});
+
+test("co-variance is judged on the selection, not the whole candidate", () => {
+  // Copies 1 and 2 are both emerald: across just those two, neither colour
+  // knob varies at all, so there is no variant to propose.
+  const p = buildExtractPrompt(TONED, [TONED.occurrences[1], TONED.occurrences[2]]);
+  assert.ok(!/MOVE TOGETHER/.test(p), "a uniform selection has nothing moving");
 });
 
 // --- the parse ---------------------------------------------------------------

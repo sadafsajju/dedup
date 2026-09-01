@@ -2248,6 +2248,35 @@ detector has already marked them. **Apply is present and disabled with its
 reason**: the extraction codemod does not exist, and offering an edit that
 cannot land safely is the one thing the merge gates have never done.
 
+**Three kinds of varying value, not two** (2026-09-02, from a real failure).
+Asked to combine a badge that had three tones — neutral, success, warning —
+the model returned one emerald pill, silently deleting a distinction the UI was
+carrying. Two causes, both in the prompt:
+
+- The detector knew `bg-color` was a colour and never said so. `knobOf` already
+  names every colour utility `*-color`, so `isColourKnob` reads the detector's
+  own classification rather than inventing a second one, and colour knobs are
+  now marked **SEMANTIC** the way position knobs are marked **LAYOUT**. Only
+  *unprefixed* colours qualify: a `hover:` colour some copies have and others
+  don't is a missing state — ordinary drift — and marking it semantic would
+  invite the model to turn "three of these forgot a hover" into a prop.
+- **Co-variance was invisible.** `bg-color` and `text-color` partitioned the
+  seven copies identically — slate/slate, emerald/emerald, amber/amber — and
+  were shown as two unrelated rows next to an instruction to normalise. Nobody
+  drifts two knobs into perfect agreement three times over; that pattern is a
+  set of named states somebody wrote on purpose, and it is the strongest
+  evidence of meaning the detector has. `covaryingGroups` reports them as one
+  decision with its members and their counts. Two guards keep it honest: a knob
+  with a distinct value in *every* copy partitions nothing (fifteen labels are
+  not fifteen variants), and co-variance is computed over the user's selection,
+  because two knobs can agree across all the copies and disagree across the
+  four that were kept.
+
+So a varying value is now drift (pick one canonical value), LAYOUT (stays at
+the call site), or SEMANTIC (becomes a variant named for what it means, never
+for the colour). The prompt says which, per knob, rather than leaving the model
+to infer it.
+
 **Not yet built:** the extraction codemod (replace each range with `<Name …>`, add the import, reusing
 `renderProps` / `importAnchor` / `takenNames` collision-aliasing from
 `merge.mjs`, all-or-nothing across files).

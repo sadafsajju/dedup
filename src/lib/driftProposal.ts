@@ -22,6 +22,21 @@
 import type { AiBackend } from "./categorize";
 import type { DriftCandidate, DriftOccurrence } from "./types";
 
+/**
+ * A colour that varies is the one visual difference that is usually meant.
+ *
+ * `knobOf` already names every colour utility `*-color` (`bg-red-500` →
+ * `bg-color`), so this reads the detector's own classification rather than
+ * inventing a second one. Variant-prefixed knobs are deliberately excluded:
+ * a `hover:` or `focus:` colour that some copies have and others don't is a
+ * missing state — drift of the most ordinary kind — and calling it semantic
+ * would invite the model to turn "three of these forgot a hover" into a prop.
+ * A state colour that really is meaningful still surfaces, through MOVE
+ * TOGETHER with the base colour it tracks, which is the stronger signal.
+ */
+export const isColourKnob = (knob: string) =>
+  /-color$/.test(knob) && !knob.includes(":");
+
 export interface ExtractionProposal {
   /** Where the canonical component should live, project-relative. */
   file: string;
@@ -34,9 +49,13 @@ export interface ExtractionProposal {
 
 const SYSTEM_PROMPT = `You are an expert React + Tailwind engineer working inside "dedup". A deterministic scan found the same piece of markup written out several times across a codebase — copies that were never made into a component. You are given every copy and a precise report of what differs between them. Write the single component that replaces them.
 
-Design rules:
-- The copies have DRIFTED. Where a visual value differs (padding, radius, text size, opacity), that is almost always an accident, not an intention: pick ONE canonical value and say which in NOTES. Only introduce a \`variant\` prop when the difference is clearly meaningful — a different colour that maps to a real state (success/warning/danger) is a variant; three paddings are not three sizes.
-- Knobs marked LAYOUT are the exception and must NOT move into the component. They are where a copy was placed, not what it is. Accept a \`className\` prop, append it last, and let the call site keep them.
+A varying value is one of exactly three things, and the report tells you which:
+
+1. DRIFT (unmarked) — padding, radius, text size, weight, opacity. Almost always an accident, not an intention. Pick ONE canonical value and say which in NOTES. Three paddings are not three sizes; they are one component and two mistakes.
+2. LAYOUT (marked LAYOUT) — where a copy was *placed*, not what it is. These must NOT move into the component: accept a \`className\` prop, append it last, and let each call site keep its own.
+3. SEMANTIC (marked SEMANTIC) — colour. A colour that changes with meaning is a real distinction, and collapsing it destroys information the UI was carrying. Give these a \`variant\`/\`tone\` union prop with a class map, one member per distinct combination, named for what it MEANS (success, warning, neutral) and never for the colour itself.
+
+If the report says several knobs MOVE TOGETHER, that is one decision, not several: they are one variant prop whose members are the listed combinations. Never split co-varying knobs into separate props.
 - Everything listed as varying text or a varying attribute becomes a prop. Prefer \`children\` for the visible label.
 - Match the project's conventions — the copies' own formatting, quoting and TypeScript usage are your guide.
 - Output the COMPLETE file content, including imports. It must be valid on its own.
@@ -50,6 +69,46 @@ SUMMARY: <one imperative line describing the API you chose>
 \`\`\`
 NOTES:
 - <which canonical values you picked and what you dropped; write "none" if there is nothing>`;
+
+/** Which occurrences share a value, as a group index per occurrence. Two
+ *  knobs with the same signature partition the copies identically. */
+function partition(values: (string | null)[]): string {
+  const seen = new Map<string, number>();
+  return values
+    .map((v) => {
+      const k = v ?? "\u0000";
+      if (!seen.has(k)) seen.set(k, seen.size);
+      return seen.get(k)!;
+    })
+    .join(",");
+}
+
+/**
+ * Knobs that vary *in lockstep* — `bg-color` slate/emerald/amber alongside
+ * `text-color` slate/emerald/amber.
+ *
+ * This is the single strongest evidence that a difference is meaningful rather
+ * than accidental. Nobody drifts two knobs into perfect agreement three times
+ * over; that pattern is a set of named states somebody wrote on purpose. Left
+ * as independent rows the model reads them as two more things to normalise,
+ * and quietly deletes the distinction the UI was carrying — which is exactly
+ * what it did to a badge whose three tones became one.
+ */
+export function covaryingGroups<T extends { knob: string; values: (string | null)[] }>(
+  knobs: T[],
+): T[][] {
+  const bySignature = new Map<string, T[]>();
+  for (const k of knobs) {
+    // A knob with a single distinct value isn't varying, and one that differs
+    // in every copy partitions nothing — neither is evidence of a state.
+    const sig = partition(k.values);
+    const distinct = new Set(sig.split(",")).size;
+    if (distinct < 2 || distinct === k.values.length) continue;
+    if (!bySignature.has(sig)) bySignature.set(sig, []);
+    bySignature.get(sig)!.push(k);
+  }
+  return [...bySignature.values()].filter((g) => g.length > 1);
+}
 
 export function buildExtractPrompt(
   candidate: DriftCandidate,
@@ -73,17 +132,40 @@ export function buildExtractPrompt(
     candidate.occurrences.map((o, i) => [`${o.file}:${o.start}`, i]),
   );
   const picked = occurrences.map((o) => shownIndex.get(`${o.file}:${o.start}`)!);
+  const pick = (values: (string | null)[]) => picked.map((i) => values[i] ?? null);
   const at = (values: (string | null)[]) =>
-    picked.map((i) => values[i] ?? "(absent)").join(", ");
+    pick(values)
+      .map((v) => v ?? "(absent)")
+      .join(", ");
 
   if (candidate.varies.classes.length > 0) {
     parts.push("--- what differs between them (computed, not guessed) ---");
     for (const v of candidate.varies.classes) {
-      parts.push(
-        `${v.layout ? "LAYOUT " : ""}${v.knob}: ${at(v.values)}`,
-      );
+      const kind = v.layout ? "LAYOUT " : isColourKnob(v.knob) ? "SEMANTIC " : "";
+      parts.push(`${kind}${v.knob}: ${at(v.values)}`);
     }
     parts.push("");
+
+    // Restricted to the selection first: two knobs can agree across all
+    // fifteen copies and disagree across the four the user actually kept.
+    const picked = candidate.varies.classes.map((v) => ({
+      knob: v.knob,
+      layout: v.layout,
+      values: pick(v.values),
+    }));
+    for (const group of covaryingGroups(picked.filter((v) => !v.layout))) {
+      const names = group.map((g) => g.knob).join(" + ");
+      parts.push(`MOVE TOGETHER: ${names} — one prop, not ${group.length}.`);
+      const combos = new Map<string, number>();
+      for (let i = 0; i < occurrences.length; i++) {
+        const combo = group.map((g) => g.values[i] ?? "(absent)").join(" + ");
+        combos.set(combo, (combos.get(combo) ?? 0) + 1);
+      }
+      for (const [combo, n] of combos) {
+        parts.push(`  ${combo}  (${n} cop${n === 1 ? "y" : "ies"})`);
+      }
+      parts.push("");
+    }
   }
   if (candidate.varies.attrs.length > 0) {
     parts.push("--- attributes that differ (these become props) ---");
