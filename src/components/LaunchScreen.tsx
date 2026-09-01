@@ -13,6 +13,7 @@ import { useStore } from "../lib/store";
 import type { Framework, GitStatus, ProjectInfo, RecentProject } from "../lib/types";
 import { CompatCard } from "./CompatCard";
 import { forgetOpen, prefFor, reasonToShowCard, rememberOpen } from "../lib/openPrefs";
+import { forgetCanvas } from "../lib/canvasMemory";
 import { StarterPicker } from "./StarterPicker";
 import { CubeIcon, Cross2Icon, GearIcon } from "@radix-ui/react-icons";
 
@@ -198,8 +199,9 @@ export function LaunchScreen() {
     e.stopPropagation();
     e.preventDefault();
     // Nothing about a forgotten project should outlive it — re-adding it
-    // later is a first open again, card included.
+    // later is a first open again, card included and canvas empty.
     forgetOpen(path);
+    forgetCanvas(path);
     await loadRecents(await removeRecentProject(path));
   }
 

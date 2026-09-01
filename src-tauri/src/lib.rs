@@ -11,6 +11,7 @@ mod project;
 mod proxy;
 mod recents;
 mod scaffold;
+mod extract;
 mod scan;
 mod session;
 mod sidecar;
@@ -355,6 +356,27 @@ fn load_scan_result(root: String) -> Option<serde_json::Value> {
     scan::load_saved(&root)
 }
 
+/// Inline-drift scan (FR-5.10): repeated JSX subtrees — markup that was never
+/// a component at all. Same shape as `scan_project`: `files` scopes it to the
+/// current canvas page, progress arrives as `drift://progress`, and the return
+/// value is the full result.
+#[tauri::command]
+async fn extract_project(
+    app: AppHandle,
+    root: String,
+    files: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || extract::run(&app, &root, files))
+        .await
+        .map_err(|e| format!("drift task failed: {e}"))?
+}
+
+/// Last persisted drift run for the project (None when never run).
+#[tauri::command]
+fn load_extract_result(root: String) -> Option<serde_json::Value> {
+    extract::load_saved(&root)
+}
+
 /// Which coding-agent CLIs are installed. Preferred AI backends — they use a
 /// subscription the user already has; an API key is the fallback.
 #[tauri::command]
@@ -651,6 +673,8 @@ pub fn run() {
             grep_project,
             scan_project,
             load_scan_result,
+            extract_project,
+            load_extract_result,
             load_categories,
             save_categories,
             load_session_seed,

@@ -11,6 +11,7 @@
     "test:overlay": "node plugin-src/overlay.test.mjs",
     "test:actions": "node plugin-src/run-ts.mjs plugin-src/actions.test.mts",
     "test:scan": "node plugin-src/scan.test.mjs",
+    "test:extract": "node plugin-src/extract.test.mjs",
     "test:tw": "node plugin-src/run-ts.mjs plugin-src/tailwind.test.mts",
     "test:chat": "node plugin-src/run-ts.mjs plugin-src/chatedits.test.mts",
     "preview": "vite preview",
@@ -22,6 +23,7 @@
     "test:highlight": "node plugin-src/run-ts.mjs plugin-src/highlight.test.mts",
     "test:html": "node plugin-src/html.test.mjs",
     "test:openprefs": "node plugin-src/run-ts.mjs plugin-src/openprefs.test.mts",
+    "test:canvas": "node plugin-src/run-ts.mjs plugin-src/canvasmemory.test.mts",
     "test:prompts": "node plugin-src/run-ts.mjs plugin-src/prompthistory.test.mts"
   },
   "dependencies": {

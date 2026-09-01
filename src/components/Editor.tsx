@@ -6,6 +6,7 @@ import {
   onDevServerReady,
   onDevServerStatus,
   onInstrumentation,
+  onDriftProgress,
   onScanProgress,
   startDevServer,
   stopDevServer,
@@ -61,6 +62,9 @@ export function Editor() {
         onScanProgress((p) => useStore.getState().setScanProgress(p)),
       );
       await track(
+        onDriftProgress((p) => useStore.getState().setDriftProgress(p)),
+      );
+      await track(
         onInstrumentation((i) => useStore.getState().setInstrumentation(i)),
       );
       await track(
@@ -90,6 +94,7 @@ export function Editor() {
       // A previous session's scan renders immediately instead of demanding
       // a rescan every time the project is reopened.
       void useStore.getState().restoreScan();
+      void useStore.getState().restoreDrift();
       // Probe every agent so the AI switch can say which are installed.
       for (const agent of CLI_AGENTS) {
         void useStore.getState().detectAgent(agent.id);

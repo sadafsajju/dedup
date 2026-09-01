@@ -17,6 +17,8 @@ import {
   grepProject,
   saveCategories,
   scanProject,
+  extractProject,
+  loadExtractResult,
   applyEdits,
   writeSource,
   loadSessionSeed as apiLoadSessionSeed,
@@ -46,6 +48,12 @@ import {
 } from "./visualPass";
 import { generateSeed } from "./session";
 import { resolveOrigin } from "./origins";
+import {
+  loadCanvas,
+  saveCanvas,
+  MAX_ARTBOARDS,
+  type SavedCanvas,
+} from "./canvasMemory";
 import {
   buildTurnPrompt,
   formatToolResult,
@@ -84,6 +92,7 @@ import {
   withoutAction,
   PENDING_PREFIX,
   SCAN_SCHEMA,
+  DRIFT_SCHEMA,
   targetOf,
   VIEWPORTS,
 } from "./types";
@@ -132,6 +141,8 @@ import type {
   SessionSeed,
   SnippetLang,
   SidebarTab,
+  DriftProgress,
+  DriftResult,
   Tool,
   DropPosition,
   EditAction,
@@ -314,6 +325,14 @@ interface AppState {
   dismissed: Record<string, true>;
   /** Cluster open in the review view. */
   openClusterId: string | null;
+
+  // Inline drift (FR-5.10) — repeated markup that was never a component.
+  driftRunning: boolean;
+  driftProgress: DriftProgress | null;
+  driftResult: DriftResult | null;
+  driftError: string | null;
+  /** Candidate expanded in the drift list. */
+  openDriftId: string | null;
   /** Visual similarity per cluster (FR-5.2's third signal). Absent = the pass
    * hasn't run; a `score` of null inside one = it ran and the members could
    * not be rendered in isolation, which is reported, not averaged away. */
@@ -523,6 +542,12 @@ interface AppState {
   dismissCluster: (id: string) => void;
   /** Drop one member out of a cluster (FR-5.3); dissolves at < 2 members. */
   removeMember: (clusterId: string, memberIndex: number) => void;
+  /** Find repeated JSX subtrees and land on the Drift tab (FR-5.10). */
+  runDrift: () => Promise<void>;
+  /** Load the last persisted drift run for the open project, if any. */
+  restoreDrift: () => Promise<void>;
+  setDriftProgress: (p: DriftProgress) => void;
+  openDrift: (id: string | null) => void;
   /** Render every cluster member in isolation and compare the pixels — the
    * scan's visual signal (FR-5.2). Runs on demand, from the Components tab. */
   runVisualPass: () => Promise<void>;
@@ -830,6 +855,30 @@ function saveDismissed(root: string, dismissed: Record<string, true>) {
   } catch {
     // Persistence is best-effort; the session still works without it.
   }
+}
+
+/**
+ * The canvas waiting for a dev server that can mount it, from entering a
+ * project until its first ready URL. Module scope, deliberately not store
+ * state — nothing renders it, and it is consumed exactly once.
+ */
+let pendingCanvas: SavedCanvas | null = null;
+
+/** Remember the pages row for this project.
+ *
+ * Called from each gesture that changes it rather than from a subscription on
+ * the store, because the one change that must *not* be remembered is the
+ * pages row a dev-server restart clears: that is dedup deferring a reload of
+ * the user's app, not the user closing anything. */
+function rememberCanvas(s: AppState) {
+  if (!s.project) return;
+  saveCanvas(s.project.root, {
+    routes: s.routes,
+    selectedRoute: s.selectedRoute,
+    sessionModes: s.sessionModes,
+    heldRoutes: Object.keys(s.heldRoutes),
+    offlineRoutes: Object.keys(s.offlineRoutes),
+  });
 }
 
 const chatsKey = (root: string) => `dedup:chats:${root}`;
@@ -1271,6 +1320,11 @@ export const useStore = create<AppState>((set, get) => ({
   scanning: false,
   scanProgress: null,
   scanResult: null,
+  driftRunning: false,
+  driftProgress: null,
+  driftResult: null,
+  driftError: null,
+  openDriftId: null,
   scanError: null,
   liveSizes: {},
   dismissed: {},
@@ -1300,6 +1354,9 @@ export const useStore = create<AppState>((set, get) => ({
   enterEditor: (project, git, customCommand = null) => {
     // Past chats come back with the project; land on the most recent one.
     const chatSessions = loadChatSessions(project.root);
+    // So does the canvas — but it cannot be mounted until there is a dev
+    // server to mount it against, so it waits for the ready URL.
+    pendingCanvas = loadCanvas(project.root);
     set({
       // Nothing is mounted until the user picks a page, so Pages is the only
       // tab with anything to act on — land there rather than on empty Layers.
@@ -1312,6 +1369,11 @@ export const useStore = create<AppState>((set, get) => ({
       scanning: false,
       scanProgress: null,
       scanResult: null,
+      driftRunning: false,
+      driftProgress: null,
+      driftResult: null,
+      driftError: null,
+      openDriftId: null,
       scanError: null,
       liveSizes: loadLiveSizes(project.root),
       dismissed: loadDismissed(project.root),
@@ -1376,6 +1438,9 @@ export const useStore = create<AppState>((set, get) => ({
     // A previewed edit is uncommitted work the user never accepted. Closing
     // the project is not a decision to keep it, so it comes back off first.
     const { project, pendingEdit } = get();
+    // Leaving before the dev server ever came up: the remembered canvas stays
+    // on disk for the next open, but nothing is left waiting to mount it.
+    pendingCanvas = null;
     if (project && pendingEdit) void revertPreview(project.root, pendingEdit);
     set({
       sidebarTab: "pages",
@@ -1386,6 +1451,11 @@ export const useStore = create<AppState>((set, get) => ({
       scanning: false,
       scanProgress: null,
       scanResult: null,
+      driftRunning: false,
+      driftProgress: null,
+      driftResult: null,
+      driftError: null,
+      openDriftId: null,
       scanError: null,
       liveSizes: {},
       dismissed: {},
@@ -1446,7 +1516,12 @@ export const useStore = create<AppState>((set, get) => ({
 
   setInstrumentation: (instrumentation) => set({ instrumentation }),
 
-  setDevReady: (url, port) =>
+  setDevReady: (url, port) => {
+    // The first ready URL after opening a project is the one moment the
+    // remembered canvas can be mounted; a restart later in the session is
+    // not, so it is consumed here rather than read.
+    const restore = pendingCanvas;
+    pendingCanvas = null;
     set({
       devStatus: "ready",
       devUrl: url,
@@ -1454,15 +1529,37 @@ export const useStore = create<AppState>((set, get) => ({
       crashed: false,
       // A restart clears the pages row rather than re-mounting what was
       // open: the artboards are the user's choice, and silently reloading
-      // three frames of their app is the thing this defers.
-      routes: [],
+      // three frames of their app is the thing this defers. Reopening the
+      // project is the exception — the choice was already made, and dedup
+      // asking for it again every morning is the same thing from the other
+      // side.
+      routes: restore?.routes ?? [],
       detectedRoutes: null,
       pageHeights: {},
       layers: {},
       pageMeta: null,
       // A restart rebuilds the pages row — the old selection may be gone.
-      selectedRoute: null,
-    }),
+      selectedRoute: restore?.selectedRoute ?? null,
+      // Restored with the artboards they belong to, and cleared with them:
+      // an entry keyed to a route that is no longer on the canvas is a stale
+      // choice waiting to surprise whoever opens that page next.
+      sessionModes: restore?.sessionModes ?? {},
+      heldRoutes: Object.fromEntries(
+        (restore?.heldRoutes ?? []).map((r) => [r, true as const]),
+      ),
+      offlineRoutes: Object.fromEntries(
+        (restore?.offlineRoutes ?? []).map((r) => [r, true as const]),
+      ),
+      // Whichever origin the last run's frames drifted onto, this run starts
+      // every artboard on the shared session and lets the fallback decide.
+      frameOrigins: {},
+    });
+    // Land on the artboard they were working on. Restoring the row without
+    // this leaves the canvas panned at the origin, which for a row of five
+    // reads as "it didn't remember" no matter how much of it is mounted.
+    const landing = restore?.selectedRoute ?? restore?.routes[0];
+    if (landing) get().focusRoute(landing);
+  },
 
   setCrashed: (code) =>
     set({ devStatus: "crashed", crashed: true, exitCode: code }),
@@ -1550,12 +1647,14 @@ export const useStore = create<AppState>((set, get) => ({
   setZoomPan: (zoom, pan) =>
     set({ zoom: Math.min(2, Math.max(0.25, zoom)), pan }),
 
-  visitRoute: (path) =>
+  visitRoute: (path) => {
     set((s) =>
-      s.routes.includes(path) || s.routes.length >= 40
+      s.routes.includes(path) || s.routes.length >= MAX_ARTBOARDS
         ? {}
         : { routes: [...s.routes, path] },
-    ),
+    );
+    rememberCanvas(get());
+  },
 
   closeRoute: (path) => {
     const s = get();
@@ -1592,6 +1691,8 @@ export const useStore = create<AppState>((set, get) => ({
       sourceInfo: null,
     });
 
+    rememberCanvas(get());
+
     // Closing shifts every later artboard one slot left, so a fixed pan would
     // silently show a different page. Land on whatever took this one's place.
     const neighbour = routes[Math.min(idx, routes.length - 1)];
@@ -1614,6 +1715,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       pan: { x: -(idx * (vp.width + PAGE_GAP)) * s.zoom + 232, y: 120 },
     });
+    rememberCanvas(get());
   },
 
   fetchDetectedRoutes: async () => {
@@ -1697,6 +1799,7 @@ export const useStore = create<AppState>((set, get) => ({
     // app redirected it to — so ask for a reload at the pinned route either
     // way. Landing twice is harmless; not reloading leaves a stale page.
     sendToFrame(route, { type: "reload", path: route });
+    rememberCanvas(get());
   },
 
   originForRoute: (route) => resolveOrigin(route, get()),
@@ -1710,12 +1813,14 @@ export const useStore = create<AppState>((set, get) => ({
       delete held[route];
       set({ heldRoutes: held });
       sendToFrame(route, { type: "release-hold" });
+      rememberCanvas(get());
       return;
     }
     // Holding has to be armed before the app boots, so it rides in on the
     // frame's URL and takes effect on the reload that flag causes.
     held[route] = true;
     set({ heldRoutes: held });
+    rememberCanvas(get());
   },
 
   toggleOffline: (route) => {
@@ -1727,6 +1832,7 @@ export const useStore = create<AppState>((set, get) => ({
     // that is already running. React re-points the frame when the flag on its
     // URL changes — the reload *is* the mechanism, not a side effect of it.
     set({ offlineRoutes: offline });
+    rememberCanvas(get());
   },
 
   setPageHeight: (route, h) =>
@@ -1741,7 +1847,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   setPageMeta: (pageMeta) => set({ pageMeta }),
 
-  setSelectedRoute: (selectedRoute) => set({ selectedRoute }),
+  setSelectedRoute: (selectedRoute) => {
+    set({ selectedRoute });
+    rememberCanvas(get());
+  },
 
   loadSessionSeed: async () => {
     const { project } = get();
@@ -3188,6 +3297,66 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setScanProgress: (scanProgress) => set({ scanProgress }),
+
+  runDrift: async () => {
+    const { project, driftRunning } = get();
+    if (!project || driftRunning) return;
+    // Same refusal as the scan, for the same reason: the detector reads JSX.
+    if (project.framework === "static") {
+      set({
+        driftError:
+          "Drift detection reads JSX subtrees — a static HTML site has none.",
+        sidebarTab: "drift",
+      });
+      return;
+    }
+    set({
+      driftRunning: true,
+      driftError: null,
+      driftProgress: null,
+      sidebarTab: "drift",
+      openDriftId: null,
+    });
+    try {
+      // Deliberately NOT scoped to the selected artboard, which is where the
+      // scan differs: the scan needs an artboard because its output is
+      // rendered previews of what is on that page, while drift is *by
+      // definition* cross-file — "the same button in nine files" cannot be
+      // seen one page at a time. Scoping it to a page turns the finding into
+      // a much smaller and much less true one. The sidecar still takes a file
+      // list; nothing here has a reason to pass one.
+      const result = await extractProject(project.root, null);
+      if (!result.ok) throw new Error(result.error ?? "drift scan failed");
+      set({ driftResult: result });
+    } catch (e) {
+      set({ driftError: String(e instanceof Error ? e.message : e) });
+    } finally {
+      set({ driftRunning: false, driftProgress: null });
+    }
+  },
+
+  restoreDrift: async () => {
+    const { project, driftResult, driftRunning } = get();
+    if (!project || driftResult || driftRunning) return;
+    try {
+      const saved = await loadExtractResult(project.root);
+      // Still relevant? Saves from older builds are ignored — just rerun.
+      if (
+        saved?.ok &&
+        saved.schema === DRIFT_SCHEMA &&
+        get().project?.root === project.root &&
+        !get().driftResult
+      ) {
+        set({ driftResult: saved });
+      }
+    } catch {
+      // No saved run is a perfectly fine state.
+    }
+  },
+
+  setDriftProgress: (driftProgress) => set({ driftProgress }),
+
+  openDrift: (openDriftId) => set({ openDriftId }),
 
   openCluster: (openClusterId) => set({ openClusterId }),
 

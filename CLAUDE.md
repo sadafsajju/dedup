@@ -25,6 +25,8 @@ pnpm test:proposal      # merge proposal parse + review diff + gate rules
 pnpm test:highlight     # code-panel syntax colouring (round-trip invariant)
 pnpm test:html          # static sites: HTML walk/stamp/write-back + the server
 pnpm test:prompts       # chat composer: ↑/↓ prompt history state machine
+pnpm test:openprefs     # when the compatibility card is shown on open
+pnpm test:canvas        # the canvas a project reopens with (routes + choices)
 cargo test              # from src-tauri/ — all Rust tests
 ```
 

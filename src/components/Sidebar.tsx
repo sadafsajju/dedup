@@ -1,7 +1,13 @@
 import { useMemo } from "react";
 import { PANEL_BOUNDS, rankClusters, useStore } from "../lib/store";
 import type { SidebarTab } from "../lib/types";
-import { CopyIcon, FileTextIcon, LayersIcon } from "@radix-ui/react-icons";
+import {
+  CopyIcon,
+  FileTextIcon,
+  LayersIcon,
+  MixerHorizontalIcon,
+} from "@radix-ui/react-icons";
+import { DriftTab } from "./Drift";
 import { DuplicatesTab } from "./Duplicates";
 import { LayersTab } from "./Layers";
 import { PagesTab } from "./Pages";
@@ -15,6 +21,7 @@ const TABS: {
   { id: "pages", label: "Pages", icon: FileTextIcon },
   { id: "layers", label: "Layers", icon: LayersIcon },
   { id: "duplicates", label: "Duplicates", icon: CopyIcon },
+  { id: "drift", label: "Drift", icon: MixerHorizontalIcon },
 ];
 
 export function Sidebar() {
@@ -26,6 +33,7 @@ export function Sidebar() {
     () => rankClusters(scanResult, dismissed).length,
     [scanResult, dismissed],
   );
+  const driftCount = useStore((s) => s.driftResult?.candidates.length ?? 0);
   const width = useStore((s) => s.panelWidths.sidebar);
   const setPanelWidth = useStore((s) => s.setPanelWidth);
 
@@ -75,6 +83,11 @@ export function Sidebar() {
                     {clusterCount}
                   </span>
                 )}
+                {t.id === "drift" && driftCount > 0 && (
+                  <span className="rounded-full bg-accent px-1 text-[9px] leading-3 text-white tabular-nums">
+                    {driftCount}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -83,6 +96,8 @@ export function Sidebar() {
 
       {tab === "duplicates" ? (
         <DuplicatesTab />
+      ) : tab === "drift" ? (
+        <DriftTab />
       ) : tab === "layers" ? (
         <LayersTab />
       ) : (

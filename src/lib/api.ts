@@ -15,6 +15,8 @@ import type {
   ProjectInfo,
   ReadyEvent,
   RecentProject,
+  DriftProgress,
+  DriftResult,
   ScanProgress,
   ScanResult,
   SessionSeed,
@@ -185,6 +187,15 @@ export const scanProject = (root: string, files?: string[] | null) =>
 export const loadScanResult = (root: string) =>
   invoke<ScanResult | null>("load_scan_result", { root });
 
+/** Inline drift (FR-5.10): repeated JSX subtrees that were never components.
+ * `files` scopes it to the current canvas page, as with the scan. */
+export const extractProject = (root: string, files?: string[] | null) =>
+  invoke<DriftResult>("extract_project", { root, files: files ?? null });
+
+/** Last persisted drift run, or null when it has never run here. */
+export const loadExtractResult = (root: string) =>
+  invoke<DriftResult | null>("load_extract_result", { root });
+
 /** Is this coding-agent CLI installed? (preferred AI backends — they run on
  *  a subscription the user already has; an API key is the fallback). */
 export const agentAvailable = (agent: CliAgent) =>
@@ -235,6 +246,11 @@ export const saveCategories = (
   root: string,
   categories: Record<string, { hash: string; category: string }>,
 ) => invoke<void>("save_categories", { root, categories });
+
+export const onDriftProgress = (
+  cb: (e: DriftProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<DriftProgress>("drift://progress", (e) => cb(e.payload));
 
 export const onScanProgress = (
   cb: (e: ScanProgress) => void,

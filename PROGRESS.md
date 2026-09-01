@@ -1880,6 +1880,56 @@ neighbours a beat apart, an id this frame does not hold drawing nothing rather
 than erroring (every artboard hears the same broadcast), and the grid stopping
 when the turn ends. The badge's size is style, and untested as such.
 
+## The canvas comes back with the project (2026-08-31)
+
+Reported: *"every time I open the project I have to reopen the canvas"*. True,
+and by design — the pages row started empty every time, because each artboard
+runs the user's real app (their dev server, their auth guards, their data
+fetching) and dedup does not boot one on a hunch. But the hunch was never the
+problem. The user already answered the question yesterday; asking again every
+morning is the same guess from the other side, and it cost three clicks before
+any work started.
+
+**What is remembered** (`lib/canvasMemory.ts`, per project, localStorage —
+same shape as `openPrefs` and the per-project scan/chat state): the open
+routes in canvas order, which artboard the scan was pointed at, and the
+per-artboard choices that ride on the frame URL — session mode, hold, offline.
+Not `frameOrigins`: that is the automatic guest-origin fallback's verdict about
+a dev-server run that is over, so the next run starts every frame on the shared
+session and lets the fallback decide again with fresh evidence. Not zoom or
+pan either — the restore lands the canvas on the artboard that was selected,
+which is a better answer than the pixel offset it was left at.
+
+**When it is restored.** `enterEditor` loads it into `pendingCanvas` (module
+scope, deliberately not store state — nothing renders it), where it waits for
+a dev server to mount it against; `setDevReady` **consumes** it. That is the
+whole reason it is consumed rather than read: a dev-server *restart* mid-
+session still clears the pages row, which is the settled decision that dedup
+does not silently reload three frames of a running app. Reopening the project
+is the exception, and it is the only one.
+
+**When it is written.** From each gesture that changes the row —
+`visitRoute`, `closeRoute`, `focusRoute`, `setSelectedRoute`, `setSessionMode`,
+`toggleHold`, `toggleOffline` — rather than from a subscription on the store.
+A subscription would also have caught the restart's clear and dutifully
+remembered an empty canvas, erasing the thing this exists to keep. Dropping a
+project from the launch screen forgets its canvas along with its verdict:
+nothing about a forgotten project should outlive it.
+
+Everything read back is re-validated. It is dedup's own blob, but it is also
+the only state that survives to point iframes at URLs: a route must be a path
+(no origin, no scheme, no protocol-relative `//host` that a URL join would
+read as one), the row is capped at the same `MAX_ARTBOARDS` the canvas
+mounts, and a mode, hold or selection keyed to an artboard that did not come
+back is dropped rather than restored as a stale choice.
+
+**Tests:** `pnpm test:canvas` (13, new) — the round trip, per-project
+isolation, forgetting one project leaving the others alone, an empty row
+restoring an empty canvas rather than a guess, a corrupt entry costing one
+empty canvas and never a project that will not open, and the refusals: a
+non-path route, a duplicate, a row over the cap, an unknown session mode, and
+every choice keyed to an artboard that is no longer open.
+
 ## Verification inventory
 
 - `cargo test` (src-tauri): 90 — URL/ANSI parsing, project detection,
@@ -1976,6 +2026,11 @@ when the turn ends. The badge's size is style, and untested as such.
   rest of the file, comment markers inside strings and vice versa, keywords vs
   identifiers that merely start with one, JSX tag names, and a `<` that isn't
   a tag.
+- `pnpm test:canvas`: 13 — the canvas a project reopens with: the round trip,
+  per-project isolation, an empty or corrupt entry restoring an empty canvas,
+  and the validation every restored row goes through (paths only, no
+  duplicates, capped at what the canvas mounts, and no mode, hold or selection
+  keyed to an artboard that did not come back).
 - `pnpm test:prompts`: 6 — the chat composer's ↑/↓ prompt history: the list it
   walks (newest first, consecutive repeats collapsed but distant ones kept),
   both directions, the swallowed ↑ at the oldest entry, an interrupted draft
@@ -2033,3 +2088,138 @@ when the turn ends. The badge's size is style, and untested as such.
   webview; its comparison and hashing halves are unit-tested), and the Next.js
   webpack loader against a real Next build (the transform it calls is the same
   one 38 tagger tests cover).
+
+---
+
+## Addendum — inline duplicate detection (FR-5.10, detector landed 2026-08-31)
+
+The scan's unit of comparison is a *named component's whole tree*. That makes
+the most common form of UI duplication invisible to it by construction: markup
+that was never a component at all — the same styled `<button>` pasted into
+twelve pages. It is three nodes buried inside each page's tree, and no signal
+the scan has ever compares it to its twin.
+
+`plugin-src/extract.mjs` is the second detector: same deterministic contract,
+different unit. It finds repeated JSX **subtrees**, and reports exactly what
+varies between the copies.
+
+**Why it is a separate sidecar, not a mode of the scan.** Different unit,
+different algorithm (shape hashing, not O(n²) tree edit distance), and a
+different codemod on the other end — the merge *retags existing call sites*,
+while extraction has no call sites and must replace an arbitrary source range
+with a new element plus an import. Sharing the entry point would have meant one
+command with two unrelated halves.
+
+**What the two detectors must agree on, and where that lives.**
+`plugin-src/jsxfacts.mjs` now holds the facts both read off a node — tag name,
+static class tokens — and the arithmetic both score with — `knobOf`, `jaccard`,
+`djb2`. Forked, the same button would be a duplicate to one tab and not to the
+other, and the user would be told two different things about one element (the
+rule `jsxwalk.mjs` already holds for ids). It is its own module rather than an
+export of `scan.mjs` because **each detector is bundled as its own sidecar and
+both bundles end with an `isMainModule` stdin loop** — importing one from the
+other inlines that loop into the wrong bundle, where it *is* main, and two
+handlers then answer one request on one stdout.
+
+**The rules, each with a test in `pnpm test:extract`:**
+
+- **Shape is exact, classes are fuzzy.** Bucket by structural shape
+  (`tag(child,child)`), then group within a bucket by the scan's own class
+  blend (0.6 knob + 0.4 token) at 0.75 — tighter than the scan's 0.8, because
+  these are supposed to be literal pastes and the shape already matched. The
+  exactness pays for itself twice: it collapses the space so the pairwise pass
+  only ever runs inside a bucket, and it means every occurrence's pre-order
+  node list **lines up index for index**, so "what varies" is a column-wise
+  comparison rather than a diff.
+- **Weight, not size, is the floor.** `elements + class tokens + attributes`
+  ≥ 5. `<div className="flex">` is not a component waiting to happen however
+  often it appears; weight rises with how much *decision* the markup carries.
+- **A capitalized root is not markup.** `<Button …>` repeated is usage, not
+  duplication — that is the scan's business, or nobody's.
+- **Layout knobs stay at the call site.** `LAYOUT_KNOBS` in `jsxfacts.mjs` is
+  the rule that decides whether the output is trustworthy: two buttons that
+  differ in `bg-blue-600` vs `bg-red-600` differ in what they *are*, and that
+  is a variant; two that differ in `mt-4` differ in where they were *put*, and
+  baking that into a shared component makes it fight every later use. Written
+  down and tested rather than left to the model's taste.
+- **The outer candidate claims its range.** Groups are accepted in value order
+  (`occurrences × weight`) and claim source ranges as they go, so a card and
+  the button inside it don't both get extracted into overlapping edits.
+- **A copy dedup can't describe is reported, not dropped.** A spread attribute
+  makes the prop signature unknowable and a computed `className` makes the
+  classes unreadable; both refuse the *occurrence* and say why, listed
+  alongside the group it would have joined.
+- **The best answer is "you already have this."** When one occurrence is a
+  component's entire body, `existing` names it — the canonical component the
+  user is looking for already exists and everything else should point at it.
+
+**Dogfooded on dedup's own frontend** (26 files, 483ms): 7 candidates. The top
+one is a primary button written out **10 times across 10 files**, and the
+finding is not that they are duplicated but that they have *drifted* —
+`rounded`/`rounded-md`/`rounded-lg`, `px-2`/`px-2.5`/`px-3`,
+`py-0.5`/`py-1`/`py-1.5`, `disabled:opacity-40`/`-50`/`-60`, and one that lost
+`font-medium` entirely. Second is a secondary button, 9 copies across 6 files,
+drifting the same way. That drift is the argument for the feature: nobody
+chose those differences.
+
+**The open question the dogfood raised, which the proposal half has to answer.**
+When copies have drifted, is `px-2` vs `px-3` (a) noise to be normalized onto
+one canonical value, or (b) a real `size` variant? (a) is almost always what
+was meant and is the whole consistency win — but it *changes pixels*, so the
+FR-5.6 visual regression gate will correctly flag it, and for extraction that
+gate cannot simply be "nothing moved". (b) is safe and produces three variants
+of what should be one button. Not yet decided; it changes the prompt, the
+codemod and the gate.
+
+**The Drift tab (landed 2026-09-01).** `extract.rs` runs the sidecar exactly
+as `scan.rs` runs its own — progress relayed as `drift://progress`, last JSON
+line kept, result persisted under `sidecar::support_dir` (not a hardcoded
+`node_modules/.dedup`, which `scan.rs` predates the rule for).
+`components/Drift.tsx` is the fourth sidebar tab.
+
+It is **read-only on purpose**, and that is the design, not a shortfall: the
+detector is deterministic and the extraction codemod does not exist, so the tab
+shows evidence and jumps to source rather than offering a fix it cannot land —
+the same rule the merge gates follow. There is no Fix button and the absence is
+the honest answer to why.
+
+The one thing the tab must communicate is the *drift*, not the repetition. A
+row saying "15 copies" would be a lint rule; the per-knob **value spread with
+counts** (`px-3 ×11  px-4 ×4`) is the part no one can see by reading the code.
+Layout knobs are marked with a `*` and a footnote, because the whole
+trustworthiness of a future extraction rests on that distinction being visible
+before anyone acts on it. A copy that sets no value for a knob shows `—` as a
+real value: "three of these have no hover state at all" is a finding, not a
+gap in the data.
+
+**Drift is deliberately not artboard-scoped**, which is the one place it
+departs from the scan's shape. The scan needs a selected artboard because its
+output is *rendered previews of what is on that page*. Drift's finding is by
+definition cross-file — "the same button in nine files" cannot be seen one page
+at a time — so scoping it to a page turns a true finding into a much smaller
+false one. Measured on the Harbor demo project: whole-project finds 5
+candidates including a button repeated 15 times across 9 files; scoped to a
+single artboard the same run finds 1. The sidecar still accepts a file list;
+nothing in the app has a reason to pass one.
+
+**Not yet built:** the proposal boundary (model writes the canonical component
++ per-occurrence prop map, same strict parse as `lib/mergeProposal.ts`) and the
+extraction codemod (replace each range with `<Name …>`, add the import, reusing
+`renderProps` / `importAnchor` / `takenNames` collision-aliasing from
+`merge.mjs`, all-or-nothing across files).
+
+**Two gaps found while building the demo, neither fixed:**
+
+- **The weight floor swallows the very copies the refusal exists to report.**
+  Weight counts *static* class tokens, so an element whose classes are all
+  computed (`cn(…)`) scores near zero and is filtered out before it can reach
+  the `dynamicClass` refusal. The refusal therefore only fires for an element
+  that has some static classes *and* a dynamic one. Harbor's Orders filter
+  buttons are invisible for exactly this reason. Fixing it means giving a
+  dynamic `className` nominal weight — but a dynamic element has empty token
+  and knob sets, so `classSimilarity` returns 1 against *anything* of the same
+  shape, and it would join an arbitrary group. Both halves need doing together.
+- **Structurally identical SVG icons cluster as duplicates** in the component
+  scan (`svg(path,path)` twice is a 1.0 match with no classes to separate
+  them). Harbor's icons were deliberately given distinct child shapes so the
+  demo doesn't show it. On a real codebase it will.

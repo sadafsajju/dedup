@@ -702,6 +702,100 @@ export interface ScanProgress {
   total: number;
 }
 
+// --- Inline drift (FR-5.10) -------------------------------------------------
+//
+// The scan's unit is a named component. This one's is a repeated JSX *subtree*
+// — markup that was never a component at all. Everything here is reported by
+// `plugin-src/extract.mjs`; keep the shapes in step with it.
+
+/** One copy of a drifted subtree, in the file where it was written out. */
+export interface DriftOccurrence {
+  file: string;
+  line: number;
+  col: number;
+  /** Source range of the subtree — what a future codemod replaces. */
+  start: number;
+  end: number;
+  /** The component this copy was found inside, when it was inside one. */
+  component: string | null;
+  source: string;
+}
+
+/** A class knob whose value differs between copies. `layout` is the load-
+ * bearing bit: a varying layout knob belongs at the call site, not in the
+ * extracted component (see LAYOUT_KNOBS in plugin-src/jsxfacts.mjs). */
+export interface DriftClassVariance {
+  node: number;
+  knob: string;
+  layout: boolean;
+  /** Per-occurrence value; null where that copy doesn't set the knob at all. */
+  values: (string | null)[];
+}
+
+export interface DriftAttrVariance {
+  node: number;
+  name: string;
+  values: (string | null)[];
+}
+
+export interface DriftTextVariance {
+  node: number;
+  values: string[];
+}
+
+/** A copy dedup found but cannot describe — reported rather than dropped. */
+export interface DriftRefusal {
+  file: string;
+  line: number;
+  reason: string;
+}
+
+export interface DriftCandidate {
+  id: string;
+  /** Host tag of the repeated subtree's root. */
+  tag: string;
+  shape: string;
+  elements: number;
+  weight: number;
+  fileCount: number;
+  /** Source bytes currently spent on the copies. */
+  bytes: number;
+  /** Elements extracting this would remove from the codebase. */
+  elementsRemoved: number;
+  /** Shared structure, carrying only the classes every copy agrees on. */
+  skeleton: string;
+  /** Set when one copy is already a component's whole body — the canonical
+   * component exists and the rest of the copies are ignoring it. */
+  existing: { file: string; name: string } | null;
+  occurrences: DriftOccurrence[];
+  varies: {
+    classes: DriftClassVariance[];
+    attrs: DriftAttrVariance[];
+    texts: DriftTextVariance[];
+  };
+  refused: DriftRefusal[];
+}
+
+/** Bump alongside extract.mjs's `schema` whenever the result shape changes. */
+export const DRIFT_SCHEMA = 1;
+
+export interface DriftResult {
+  ok: boolean;
+  schema?: number;
+  error?: string;
+  files: number;
+  skipped: number;
+  candidates: DriftCandidate[];
+  durationMs: number;
+  scannedAt?: number;
+}
+
+export interface DriftProgress {
+  stage: "inventory" | "grouping";
+  done: number;
+  total: number;
+}
+
 // --- Mock session (zero-login editing, FR-6.3) ------------------------------
 
 /** A user-reviewed browser-storage seed that makes a client-side auth guard
@@ -737,7 +831,7 @@ export interface AuthContext {
   files: AuthContextFile[];
 }
 
-export type SidebarTab = "pages" | "layers" | "duplicates";
+export type SidebarTab = "pages" | "layers" | "duplicates" | "drift";
 
 // Canvas viewport presets (FR-1.4).
 export interface Viewport {

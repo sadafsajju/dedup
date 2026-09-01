@@ -18,6 +18,13 @@ import {
   relOf,
   walk,
 } from "./files.mjs";
+import {
+  djb2,
+  jaccard,
+  jsxTagName,
+  knobOf,
+  staticClassTokens,
+} from "./jsxfacts.mjs";
 
 // --- parsing + component extraction (FR-5.1) --------------------------------
 
@@ -57,36 +64,6 @@ function componentDeclOf(node) {
     if (fn) return { name: node.id.name, fn };
   }
   return null;
-}
-
-function jsxTagName(name) {
-  if (!name) return "?";
-  if (name.type === "JSXIdentifier") return name.name;
-  if (name.type === "JSXMemberExpression") {
-    return `${jsxTagName(name.object)}.${name.property?.name ?? "?"}`;
-  }
-  if (name.type === "JSXNamespacedName") {
-    return `${name.namespace?.name}:${name.name?.name}`;
-  }
-  return "?";
-}
-
-/** Static class tokens of a JSX opening element ([] when absent/dynamic). */
-function staticClassTokens(opening) {
-  const attr = opening.attributes.find(
-    (a) => a.type === "JSXAttribute" && a.name?.name === "className",
-  );
-  if (!attr?.value) return [];
-  let value = null;
-  if (attr.value.type === "StringLiteral") value = attr.value.value;
-  else if (attr.value.type === "JSXExpressionContainer") {
-    const e = attr.value.expression;
-    if (e.type === "StringLiteral") value = e.value;
-    else if (e.type === "TemplateLiteral" && e.expressions.length === 0) {
-      value = e.quasis[0].value.cooked ?? e.quasis[0].value.raw;
-    }
-  }
-  return value ? value.split(/\s+/).filter(Boolean) : [];
 }
 
 /** Simplified JSX tree: { tag, classes, children } — expression containers
@@ -231,38 +208,6 @@ function extractComponents(program, relFile) {
 }
 
 // --- similarity (FR-5.2, structural signal) ---------------------------------
-
-const COLOR_NAMES = new Set(
-  ("slate gray zinc neutral stone red orange amber yellow lime green emerald " +
-    "teal cyan sky blue indigo violet purple fuchsia pink rose black white " +
-    "transparent current inherit").split(" "),
-);
-
-/** Reduce a Tailwind token to its "knob" so p-4/p-6 (and bg-red-500 /
- * bg-blue-600) compare as the same knob with a different value. */
-function knobOf(token) {
-  const sep = token.lastIndexOf(":");
-  const variant = sep >= 0 ? token.slice(0, sep + 1) : "";
-  let base = sep >= 0 ? token.slice(sep + 1) : token;
-  if (base.startsWith("-")) base = base.slice(1);
-  base = base.replace(/-\[[^\]]*\]$/, ""); // arbitrary values are just values
-  const parts = base.split("-");
-  if (parts.length >= 2) {
-    if (COLOR_NAMES.has(parts[1])) return `${variant}${parts[0]}-color`;
-    const last = parts[parts.length - 1];
-    if (/^(\d+(\.\d+)?|\d+\/\d+|px|full|none|auto|xs|sm|md|lg|xl|\d+xl)$/.test(last)) {
-      return variant + parts.slice(0, -1).join("-");
-    }
-  }
-  return variant + base;
-}
-
-function jaccard(a, b) {
-  if (a.size === 0 && b.size === 0) return null;
-  let inter = 0;
-  for (const x of a) if (b.has(x)) inter++;
-  return inter / (a.size + b.size - inter);
-}
 
 function levenshtein(a, b) {
   const m = a.length;
@@ -446,9 +391,7 @@ function clusterId(members) {
     .map((m) => `${m.file}#${m.name}`)
     .sort()
     .join("|");
-  let h = 5381;
-  for (let i = 0; i < key.length; i++) h = ((h * 33) ^ key.charCodeAt(i)) >>> 0;
-  return h.toString(16).padStart(8, "0");
+  return djb2(key);
 }
 
 function cluster(components, emitProgress) {
