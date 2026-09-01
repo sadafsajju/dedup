@@ -8,6 +8,7 @@ import {
 } from "../lib/bridge";
 import { Toolbar } from "./Toolbar";
 import { PAGE_GAP, useStore } from "../lib/store";
+import { zoomToward } from "../lib/panZoom";
 
 /** Inset from a floating panel's outer edge to the artboards: the panel's own
  * 12px margin plus a little air. */
@@ -24,13 +25,11 @@ import { Cross2Icon, FileTextIcon, ReloadIcon } from "@radix-ui/react-icons";
  * point visually fixed (Figma semantics). */
 function zoomAt(cx: number, cy: number, factor: number) {
   const s = useStore.getState();
-  const next = Math.min(2, Math.max(0.25, s.zoom * factor));
-  if (next === s.zoom) return;
-  const k = next / s.zoom;
-  s.setZoomPan(next, {
-    x: cx - (cx - s.pan.x) * k,
-    y: cy - (cy - s.pan.y) * k,
-  });
+  // The math lives in lib/panZoom so the drift view zooms identically — two
+  // canvas-like surfaces that anchored zoom differently would feel like two
+  // different apps.
+  const next = zoomToward({ zoom: s.zoom, pan: s.pan }, cx, cy, factor);
+  if (next) s.setZoomPan(next.zoom, next.pan);
 }
 
 /**

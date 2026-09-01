@@ -53,6 +53,7 @@ import {
 } from "./visualPass";
 import { generateSeed } from "./session";
 import { resolveOrigin } from "./origins";
+import { clampZoom } from "./panZoom";
 import {
   loadCanvas,
   saveCanvas,
@@ -338,6 +339,10 @@ interface AppState {
   driftError: string | null;
   /** Candidate expanded in the drift list, and shown in the drift view. */
   openDriftId: string | null;
+  /** The drift view's own viewport. Separate from the canvas's: switching
+   *  tabs is a change of scene, not of viewport. */
+  driftZoom: number;
+  driftPan: { x: number; y: number };
   /** The model's proposed component for the current selection, once asked. */
   driftProposal: ExtractionProposal | null;
   driftProposing: boolean;
@@ -565,6 +570,7 @@ interface AppState {
    *  rendered together in the main view. */
   openDrift: (id: string | null) => void;
   toggleDriftOccurrence: (key: string) => void;
+  setDriftTransform: (t: { zoom: number; pan: { x: number; y: number } }) => void;
   /** Ask the model for the component that replaces the selected copies. This
    *  never writes: the extraction codemod does not exist, so a proposal is
    *  shown and nothing lands. */
@@ -1347,6 +1353,8 @@ export const useStore = create<AppState>((set, get) => ({
   driftError: null,
   openDriftId: null,
   driftSelection: {},
+  driftZoom: 1,
+  driftPan: { x: 120, y: 96 },
   driftProposal: null,
   driftProposing: false,
   driftProposalError: null,
@@ -1400,6 +1408,8 @@ export const useStore = create<AppState>((set, get) => ({
       driftError: null,
       openDriftId: null,
       driftSelection: {},
+      driftZoom: 1,
+      driftPan: { x: 120, y: 96 },
       driftProposal: null,
       driftProposing: false,
       driftProposalError: null,
@@ -1486,6 +1496,8 @@ export const useStore = create<AppState>((set, get) => ({
       driftError: null,
       openDriftId: null,
       driftSelection: {},
+      driftZoom: 1,
+      driftPan: { x: 120, y: 96 },
       driftProposal: null,
       driftProposing: false,
       driftProposalError: null,
@@ -1673,12 +1685,11 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  setZoom: (zoom) => set({ zoom: Math.min(2, Math.max(0.25, zoom)) }),
+  setZoom: (zoom) => set({ zoom: clampZoom(zoom) }),
 
   setPan: (pan) => set({ pan }),
 
-  setZoomPan: (zoom, pan) =>
-    set({ zoom: Math.min(2, Math.max(0.25, zoom)), pan }),
+  setZoomPan: (zoom, pan) => set({ zoom: clampZoom(zoom), pan }),
 
   visitRoute: (path) => {
     set((s) =>
@@ -3402,6 +3413,9 @@ export const useStore = create<AppState>((set, get) => ({
       driftSelection,
       driftProposal: null,
       driftProposalError: null,
+      // A new candidate is a new scene — open it framed, not wherever the
+      // last one was left.
+      ...(openDriftId ? { driftZoom: 1, driftPan: { x: 120, y: 96 } } : {}),
       // Opening a candidate is the request to *see* the copies — that is the
       // whole point of the tab, and a list of file:line is what every other
       // tool already gives you.
@@ -3449,6 +3463,9 @@ export const useStore = create<AppState>((set, get) => ({
       set({ driftProposing: false });
     }
   },
+
+  setDriftTransform: ({ zoom, pan }) =>
+    set({ driftZoom: clampZoom(zoom), driftPan: pan }),
 
   toggleDriftOccurrence: (key) => {
     const next = { ...get().driftSelection };

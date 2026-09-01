@@ -11,6 +11,7 @@ import {
   parseExtractReply,
 } from "../src/lib/driftProposal.ts";
 import type { DriftCandidate, DriftOccurrence } from "../src/lib/types.ts";
+import { clampZoom, zoomToward, ZOOM_MAX, ZOOM_MIN } from "../src/lib/panZoom.ts";
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -153,6 +154,41 @@ test("a source that never mentions the name it promised is refused", () => {
     () => parseExtractReply(GOOD.replace(/NAME: Button/, "NAME: PrimaryAction")),
     /never mentions/,
   );
+});
+
+// --- pan/zoom ----------------------------------------------------------------
+//
+// Shared by the artboard canvas and the drift view. Both surfaces must feel
+// identical, so the arithmetic is pinned here rather than trusted twice.
+
+test("zoom keeps the point under the cursor exactly where it is", () => {
+  const before = { zoom: 1, pan: { x: 40, y: 20 } };
+  // Content coordinate under the cursor, before and after.
+  const contentAt = (t: typeof before, cx: number, cy: number) => [
+    (cx - t.pan.x) / t.zoom,
+    (cy - t.pan.y) / t.zoom,
+  ];
+  const [bx, by] = contentAt(before, 300, 200);
+  const after = zoomToward(before, 300, 200, 1.5)!;
+  const [ax, ay] = contentAt(after, 300, 200);
+  assert.ok(Math.abs(ax - bx) < 1e-9, `x drifted: ${bx} -> ${ax}`);
+  assert.ok(Math.abs(ay - by) < 1e-9, `y drifted: ${by} -> ${ay}`);
+});
+
+test("zoom is clamped, and a clamped no-op reports itself as one", () => {
+  assert.equal(clampZoom(99), ZOOM_MAX);
+  assert.equal(clampZoom(0.01), ZOOM_MIN);
+  // Already at the ceiling: returning a transform anyway would write a
+  // pan built from a zoom that never changed, sliding the view on every tick.
+  assert.equal(zoomToward({ zoom: ZOOM_MAX, pan: { x: 0, y: 0 } }, 10, 10, 2), null);
+  assert.equal(zoomToward({ zoom: ZOOM_MIN, pan: { x: 0, y: 0 } }, 10, 10, 0.5), null);
+});
+
+test("a partial zoom into the clamp still anchors on the cursor", () => {
+  const t = { zoom: 1.8, pan: { x: 0, y: 0 } };
+  const next = zoomToward(t, 100, 100, 4)!;
+  assert.equal(next.zoom, ZOOM_MAX);
+  assert.equal(next.pan.x, 100 - 100 * (ZOOM_MAX / 1.8));
 });
 
 console.log(`\n${passed} passed`);

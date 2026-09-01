@@ -2202,9 +2202,53 @@ candidates including a button repeated 15 times across 9 files; scoped to a
 single artboard the same run finds 1. The sidecar still accepts a file list;
 nothing in the app has a reason to pass one.
 
-**Not yet built:** the proposal boundary (model writes the canonical component
-+ per-occurrence prop map, same strict parse as `lib/mergeProposal.ts`) and the
-extraction codemod (replace each range with `<Name …>`, add the import, reusing
+**The drift view is a canvas, not a list** (2026-09-01). Clicking a candidate
+renders every copy of it together on a pan/zoom surface with the same gesture
+vocabulary as the artboard canvas — because a list of `file:line` is a lint
+rule and ESLint could print it, while fifteen buttons side by side, three
+visibly a different size and one visibly a lighter weight, is the finding no
+one can get from reading code. That is the reason a duplicate-finder runs the
+user's app at all.
+
+The copies cannot use the component harness, which imports a module and mounts
+an export: a drift occurrence has neither. It has markup, so `extract.mjs`
+emits a static preview per occurrence from the tree it already parsed, and the
+tagger's new `/__dedup/snippet` route drops that markup into a page carrying
+the project's own stylesheets — real Tailwind, real pixels, nothing to import.
+It is a picture rather than a translation: handlers and computed values are
+dropped rather than approximated, because a preview that invented an `href` or
+a `disabled` state would be lying about the very thing the user is judging. A
+component child renders as an empty box wearing its own classes, which is
+enough for its sizing to hold the layout together.
+
+`lib/panZoom.ts` holds the gesture arithmetic for both surfaces. Two canvas-like
+views that anchored zoom differently, or clamped at different points, would
+feel like two different applications; `Canvas.tsx` delegates to it too, and
+`test:drift` pins the cursor-anchoring invariant. Each surface keeps its *own*
+transform, though: switching tabs is a change of scene, not of viewport, and
+carrying the canvas's pan into the drift view would open it on empty space
+thousands of pixels from any card.
+
+Selecting is the interaction, because the tool's job is evidence and the user's
+is the decision. Opening a candidate selects every copy — "these are all the
+same thing" is the common case, and deselecting the odd one out beats picking
+fifteen — and the proposal is built from the selection, so the variance columns
+the model is shown follow what the user kept rather than what the detector
+found. A click that moved more than 4px is a pan that began on a card, not a
+selection (the rule the canvas already uses for click-to-deselect).
+
+`lib/driftProposal.ts` is the model boundary, shaped like `mergeProposal.ts`
+and strict for the same reason: nothing on this path writes to the project, but
+a proposal the user cannot trust is worse than none. It carries one rule the
+merge does not need, and it is the whole point of the feature — when copies
+have drifted, the model must pick one canonical value rather than preserve the
+spread as variants. Fifteen buttons with three paddings are not three sizes;
+they are one button and two accidents. Layout knobs are the exception, and the
+detector has already marked them. **Apply is present and disabled with its
+reason**: the extraction codemod does not exist, and offering an edit that
+cannot land safely is the one thing the merge gates have never done.
+
+**Not yet built:** the extraction codemod (replace each range with `<Name …>`, add the import, reusing
 `renderProps` / `importAnchor` / `takenNames` collision-aliasing from
 `merge.mjs`, all-or-nothing across files).
 

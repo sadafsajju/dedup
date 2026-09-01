@@ -11,13 +11,16 @@
 // for the harness to import. It has markup, and the route drops that markup
 // into a page carrying the project's own stylesheet, so these are the real
 // pixels rather than an approximation of them.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../lib/store";
+import { usePanZoom } from "../lib/panZoom";
 import type { DriftCandidate, DriftOccurrence } from "../lib/types";
 import {
   CheckIcon,
   ExclamationTriangleIcon,
   MagicWandIcon,
+  MinusIcon,
+  PlusIcon,
 } from "@radix-ui/react-icons";
 
 /** Cards start here and resize to whatever the snippet reports. */
@@ -61,9 +64,21 @@ function OccurrenceCard({
   const cardW = Math.round(size.w * scale);
   const cardH = Math.round(size.h * scale);
 
+  // A click that moved is a pan that happened to start on a card, not a
+  // selection — the same rule the canvas uses for click-to-deselect.
+  const press = useRef<{ x: number; y: number } | null>(null);
+
   return (
     <button
-      onClick={onToggle}
+      onPointerDown={(e) => {
+        press.current = { x: e.clientX, y: e.clientY };
+      }}
+      onClick={(e) => {
+        const p = press.current;
+        press.current = null;
+        if (p && Math.hypot(e.clientX - p.x, e.clientY - p.y) > 4) return;
+        onToggle();
+      }}
       className="group shrink-0 text-left"
       title={`${occ.file}:${occ.line}`}
     >
@@ -136,116 +151,201 @@ export function DriftView() {
   const proposal = useStore((s) => s.driftProposal);
   const proposalError = useStore((s) => s.driftProposalError);
 
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const zoom = useStore((s) => s.driftZoom);
+  const pan = useStore((s) => s.driftPan);
+  const setTransform = useStore((s) => s.setDriftTransform);
+
+  // Read through the store rather than the rendered values: the wheel
+  // listener is installed once and must never act on a stale transform.
+  const read = useCallback(
+    () => ({
+      zoom: useStore.getState().driftZoom,
+      pan: useStore.getState().driftPan,
+    }),
+    [],
+  );
+  const isBackground = useCallback(
+    (t: EventTarget | null) =>
+      t instanceof HTMLElement &&
+      (t === containerRef.current || t.dataset.driftSurface !== undefined),
+    [],
+  );
+  const panZoom = usePanZoom({
+    containerRef,
+    read,
+    write: setTransform,
+    // Nothing on this surface is dragged, so the left button pans too — it is
+    // the gesture people reach for, and a card only cares about a click that
+    // did not move.
+    dragButtons: [0, 1],
+    isBackground,
+  });
+
   return (
     <div
+      ref={containerRef}
       // Kept mounted and hidden, like the canvas and the gallery: switching
       // tabs must not reload every preview iframe.
-      className={`absolute inset-0 overflow-y-auto ${
-        editorTab === "drift" ? "" : "hidden"
-      }`}
+      className={`absolute inset-0 overflow-hidden ${
+        panZoom.dragging ? "cursor-grabbing" : ""
+      } ${editorTab === "drift" ? "" : "hidden"}`}
+      style={{
+        // Same dot grid as the canvas, moving and scaling with the content,
+        // because this is the same kind of surface and should read as one.
+        backgroundImage:
+          "radial-gradient(var(--color-line) 1px, transparent 1px)",
+        backgroundSize: `${22 * zoom}px ${22 * zoom}px`,
+        backgroundPosition: `${pan.x}px ${pan.y}px`,
+        touchAction: "none",
+      }}
+      onPointerDown={panZoom.onPointerDown}
+      onPointerMove={panZoom.onPointerMove}
+      onPointerUp={panZoom.onPointerUp}
+      onPointerCancel={panZoom.onPointerCancel}
     >
       {!candidate ? (
         <div className="flex h-full items-center justify-center px-8 text-center text-2xs text-ink-dim">
           Pick something from the Drift tab to see every copy of it here.
         </div>
       ) : (
-        <div className="px-8 pb-24 pt-20">
-          <div className="mb-1 flex items-baseline gap-2">
-            <span className="font-mono text-sm text-ink">
-              &lt;{candidate.tag}&gt;
-            </span>
-            <span className="text-2xs text-ink-dim">
-              {candidate.occurrences.length} copies in {candidate.fileCount}{" "}
-              file{candidate.fileCount === 1 ? "" : "s"}
-            </span>
-          </div>
-          <div className="mb-5 text-2xs text-ink-faint">
-            {selectedCount} selected · click a copy to include or exclude it.
-            {candidate.existing && (
-              <span className="text-warn">
-                {" "}
-                <ExclamationTriangleIcon
-                  width={11}
-                  height={11}
-                  className="inline align-[-1px]"
-                />{" "}
-                {candidate.existing.name} already exists in{" "}
-                {candidate.existing.file}.
+        <>
+          <div
+            data-drift-surface
+            className="absolute left-0 top-0 origin-top-left"
+            style={{
+              transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+              width: 1180,
+            }}
+          >
+            <div className="mb-1 flex items-baseline gap-2">
+              <span className="font-mono text-sm text-ink">
+                &lt;{candidate.tag}&gt;
               </span>
-            )}
-          </div>
+              <span className="text-2xs text-ink-dim">
+                {candidate.occurrences.length} copies in {candidate.fileCount}{" "}
+                file{candidate.fileCount === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div className="mb-5 text-2xs text-ink-faint">
+              {selectedCount} selected · click a copy to include or exclude it.
+              {candidate.existing && (
+                <span className="text-warn">
+                  {" "}
+                  <ExclamationTriangleIcon
+                    width={11}
+                    height={11}
+                    className="inline align-[-1px]"
+                  />{" "}
+                  {candidate.existing.name} already exists in{" "}
+                  {candidate.existing.file}.
+                </span>
+              )}
+            </div>
 
-          <div className="flex flex-wrap items-start gap-5">
-            {candidate.occurrences.map((o) => {
-              const key = `${o.file}:${o.start}`;
-              return (
-                <OccurrenceCard
-                  key={key}
-                  occ={o}
-                  origin={origin}
-                  selected={!!selection[key]}
-                  onToggle={() => toggle(key)}
-                />
-              );
-            })}
-          </div>
+            <div data-drift-surface className="flex flex-wrap items-start gap-5">
+              {candidate.occurrences.map((o) => {
+                const key = `${o.file}:${o.start}`;
+                return (
+                  <OccurrenceCard
+                    key={key}
+                    occ={o}
+                    origin={origin}
+                    selected={!!selection[key]}
+                    onToggle={() => toggle(key)}
+                  />
+                );
+              })}
+            </div>
 
-          <div className="mt-7 flex items-center gap-2">
-            <button
-              onClick={() => void propose()}
-              disabled={proposing || selectedCount < 2}
-              className="flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-2xs font-medium text-white hover:brightness-110 disabled:opacity-50"
-            >
-              <MagicWandIcon width={12} height={12} />
-              {proposing
-                ? "Designing the component…"
-                : `Combine ${selectedCount} into one component`}
-            </button>
-            {proposalError && (
-              <span className="text-2xs text-danger">{proposalError}</span>
-            )}
-          </div>
+            <div className="mt-7 flex items-center gap-2">
+              <button
+                onClick={() => void propose()}
+                disabled={proposing || selectedCount < 2}
+                className="flex items-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-2xs font-medium text-white hover:brightness-110 disabled:opacity-50"
+              >
+                <MagicWandIcon width={12} height={12} />
+                {proposing
+                  ? "Designing the component…"
+                  : `Combine ${selectedCount} into one component`}
+              </button>
+              {proposalError && (
+                <span className="text-2xs text-danger">{proposalError}</span>
+              )}
+            </div>
 
-          {proposal && (
-            <div className="panel mt-4 max-w-3xl overflow-hidden">
-              <div className="border-b border-line px-4 py-2.5">
-                <div className="text-2xs text-ink">
-                  <span className="font-medium">{proposal.name}</span>
-                  <span className="text-ink-faint"> · {proposal.file}</span>
+            {proposal && (
+              <div className="panel mt-4 max-w-3xl overflow-hidden">
+                <div className="border-b border-line px-4 py-2.5">
+                  <div className="text-2xs text-ink">
+                    <span className="font-medium">{proposal.name}</span>
+                    <span className="text-ink-faint"> · {proposal.file}</span>
+                  </div>
+                  {proposal.summary && (
+                    <div className="mt-0.5 text-2xs text-ink-dim">
+                      {proposal.summary}
+                    </div>
+                  )}
                 </div>
-                {proposal.summary && (
-                  <div className="mt-0.5 text-2xs text-ink-dim">
-                    {proposal.summary}
+                <pre className="overflow-x-auto px-4 py-3 font-mono text-[11px] leading-5 text-ink-dim">
+                  {proposal.source}
+                </pre>
+                {proposal.notes && proposal.notes.toLowerCase() !== "none" && (
+                  <div className="border-t border-line px-4 py-2.5 text-2xs leading-relaxed text-ink-dim">
+                    {proposal.notes}
                   </div>
                 )}
-              </div>
-              <pre className="overflow-x-auto px-4 py-3 font-mono text-[11px] leading-5 text-ink-dim">
-                {proposal.source}
-              </pre>
-              {proposal.notes && proposal.notes.toLowerCase() !== "none" && (
-                <div className="border-t border-line px-4 py-2.5 text-2xs leading-relaxed text-ink-dim">
-                  {proposal.notes}
+                {/* Honesty over magic: the write-back for this path does not
+                    exist, and a disabled Apply with the reason on it is the
+                    same answer the merge gates give when they cannot run. */}
+                <div className="flex items-center gap-2 border-t border-line bg-surface-2 px-4 py-2.5">
+                  <button
+                    disabled
+                    title="The extraction codemod isn't built yet — this proposal is read-only."
+                    className="rounded-md bg-surface-3 px-2.5 py-1 text-2xs text-ink-faint"
+                  >
+                    Apply
+                  </button>
+                  <span className="text-2xs text-ink-faint">
+                    Not writable yet — dedup won't offer an edit it can't land
+                    safely. Copy it, or wait for the codemod.
+                  </span>
                 </div>
-              )}
-              {/* Honesty over magic: the write-back for this path does not
-                  exist, and a disabled Apply with the reason on it is the
-                  same answer the merge gates give when they cannot run. */}
-              <div className="flex items-center gap-2 border-t border-line bg-surface-2 px-4 py-2.5">
-                <button
-                  disabled
-                  title="The extraction codemod isn't built yet — this proposal is read-only."
-                  className="rounded-md bg-surface-3 px-2.5 py-1 text-2xs text-ink-faint"
-                >
-                  Apply
-                </button>
-                <span className="text-2xs text-ink-faint">
-                  Not writable yet — dedup won't offer an edit it can't land
-                  safely. Copy it, or wait for the codemod.
-                </span>
               </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+
+          {/* Floating chrome, in screen pixels so it stays legible however far
+              the surface is zoomed out — the same rule the overlay's badges
+              follow. */}
+          <div className="panel absolute bottom-4 left-1/2 z-30 flex -translate-x-1/2 items-center gap-0.5 px-1.5 py-1 select-none">
+            <button
+              onClick={() => setTransform({ zoom: zoom - 0.1, pan })}
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-ink-dim hover:bg-surface-2 hover:text-ink"
+              title="Zoom out (⌘−scroll)"
+            >
+              <MinusIcon width={14} height={14} />
+            </button>
+            <span className="w-10 text-center text-2xs tabular-nums text-ink-dim">
+              {Math.round(zoom * 100)}%
+            </span>
+            <button
+              onClick={() => setTransform({ zoom: zoom + 0.1, pan })}
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-ink-dim hover:bg-surface-2 hover:text-ink"
+              title="Zoom in (⌘+scroll)"
+            >
+              <PlusIcon width={14} height={14} />
+            </button>
+            <div className="mx-1 h-5 w-px bg-line" />
+            <button
+              onClick={() => setTransform({ zoom: 1, pan: { x: 120, y: 96 } })}
+              className="rounded-lg px-2 py-1 text-2xs text-ink-dim hover:bg-surface-2 hover:text-ink"
+              title="Reset the view"
+            >
+              Reset
+            </button>
+          </div>
+        </>
       )}
     </div>
   );
