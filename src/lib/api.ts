@@ -2,7 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   CoreKind,
   DynamicKind,
@@ -39,6 +39,49 @@ export const detectProject = (root: string) =>
 export const gitStatus = (root: string) =>
   invoke<GitStatus>("git_status", { root });
 
+/** One artboard export. Rendered by WebKit at the artboard's real size in an
+ *  off-screen view — not a crop of the canvas (see export.rs). */
+export interface ExportRequest {
+  url: string;
+  width: number;
+  height: number;
+  format: "png" | "pdf";
+  /** PNG pixels per CSS px. */
+  scale?: number;
+  path: string;
+}
+
+export const exportArtboard = (request: ExportRequest) =>
+  invoke<{ path: string; bytes: number; width: number; height: number }>(
+    "export_artboard",
+    { request },
+  );
+
+/** Ask where to save an export. null when the user cancels. */
+export const chooseExportPath = async (
+  defaultName: string,
+  format: "png" | "pdf",
+): Promise<string | null> =>
+  (await save({
+    defaultPath: defaultName,
+    filters: [{ name: format === "png" ? "PNG image" : "PDF document", extensions: [format] }],
+  })) ?? null;
+
+/** A region of the app window as a PNG data URL, rendered `width` points
+ *  wide — a parked element's picture, taken while it is still on its page. */
+export const snapshotRegion = (rect: Rect, width: number) =>
+  invoke<string>("snapshot_region", { rect, width });
+
+/** The project's parked canvas pieces, as stored (validated by the caller). */
+export const loadParked = (root: string) => invoke<unknown>("load_parked", { root });
+export const saveParked = (root: string, items: unknown) =>
+  invoke<void>("save_parked", { root, items });
+
+/** Make a folder with no git a repository whose first commit is its files as
+ *  they stand. Refuses one already inside a repository. */
+export const gitInitBaseline = (root: string) =>
+  invoke<GitStatus>("git_init_baseline", { root });
+
 /** Start the project's dev server. Takes the whole detection result because
  *  what to launch is a property of the project, not five loose arguments —
  *  and a static site needs `staticDir`, which only detection knows. */
@@ -48,6 +91,7 @@ export const startDevServer = (project: ProjectInfo, customCommand?: string) =>
     packageManager: project.packageManager,
     framework: project.framework,
     devScript: project.devScript,
+    devScriptName: project.devScriptName,
     staticDir: project.staticDir,
     customCommand: customCommand ?? null,
   });
@@ -209,6 +253,11 @@ export const agentPrompt = (
   model?: string | null,
 ) => invoke<string>("agent_prompt", { agent, prompt, model: model ?? null });
 
+/** The models this agent's installed CLI offers, in its own order. Empty for
+ *  a CLI with no catalog (Claude Code — its aliases are in CLI_AGENTS). */
+export const agentModels = (agent: CliAgent) =>
+  invoke<{ value: string; label: string }[]>("agent_models", { agent });
+
 /** Copy a file the agent generated into the project — an image, the one
  *  output it cannot put in its reply. Every gate is in `asset.rs`: the source
  *  must be inside that agent's own output directory, the bytes must sniff as
@@ -218,12 +267,17 @@ export const importAgentAsset = (
   agent: CliAgent,
   source: string,
   dest: string,
+  /** For a destination named before the image existed (an IMAGE request):
+   *  correct a disagreeing extension rather than refuse. `file` in the result
+   *  is then where it actually landed. */
+  adaptExtension = false,
 ) =>
   invoke<{ file: string; bytes: number; kind: string }>("import_agent_asset", {
     root,
     agent,
     source,
     dest,
+    adaptExtension,
   });
 
 /** Cached AI category assignments (file#name → {hash, category}). */
@@ -396,7 +450,7 @@ export const revertCommit = (root: string, hash: string) =>
 
 // --- Visual pass (FR-5.2 visual signal, FR-5.6 #3) --------------------------
 
-type Rect = { x: number; y: number; width: number; height: number };
+export type Rect = { x: number; y: number; width: number; height: number };
 
 /** Snapshot a canvas region under `label`, held in Rust for a later compare. */
 export const visualCapture = (label: string, rect?: Rect | null) =>

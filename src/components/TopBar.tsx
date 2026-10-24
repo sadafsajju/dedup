@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { captureCanvasThumbnail, stopDevServer } from "../lib/api";
+import { SetUpGit } from "./SetUpGit";
 import { useStore } from "../lib/store";
 import { isValueAction } from "../lib/types";
 import { VIEWPORTS } from "../lib/types";
@@ -124,6 +125,17 @@ export function TopBar() {
                 <span className="ml-0.5">●</span>
               </span>
             )}
+          </span>
+        )}
+        {/* No repository: everything can be looked at, nothing can be saved.
+            Said here, where it stays visible, with the way out beside it. */}
+        {git && !git.isRepo && (
+          <span
+            className="inline-flex items-center gap-1.5 text-2xs text-warn shrink-0"
+            title="dedup saves every change as a commit on its own branch. With no git it can only write into your files in place — it warns before the first save."
+          >
+            <span>no git — saves overwrite files</span>
+            <SetUpGit compact />
           </span>
         )}
       </div>
@@ -274,9 +286,19 @@ export function TopBar() {
         ) : lastSave ? (
           <span
             className="text-2xs text-ink-faint px-1.5"
-            title={`Committed on ${lastSave.branch}`}
+            title={
+              lastSave.direct
+                ? "Written into the files in place — no git, so no commit"
+                : `Committed on ${lastSave.branch}`
+            }
           >
-            Saved <span className="font-mono">{lastSave.hash}</span>
+            {lastSave.direct ? (
+              "Saved in place"
+            ) : (
+              <>
+                Saved <span className="font-mono">{lastSave.hash}</span>
+              </>
+            )}
           </span>
         ) : null}
         {reviewOpen && <ReviewPanel onClose={() => setReviewOpen(false)} />}

@@ -1,7 +1,10 @@
 /* `theme(static)` emits every theme variable, not just the used ones — the
    inspector's colour swatches resolve Tailwind tokens by painting
-   `var(--color-zinc-400)` directly, so the whole palette has to be present. */
-@import "tailwindcss" theme(static);
+   `var(--color-zinc-400)` directly, so the whole palette has to be present.
+   `source(".")` scopes class detection to src/, where every editor class
+   lives. Auto-detection from the repo root also stats src-tauri/target, and
+   one wedged file there can hang the scan — and with it every CSS request. */
+@import "tailwindcss" source(".") theme(static);
 
 /* dedup — dark-first canvas UI (FR-6.5).
  *
@@ -92,6 +95,203 @@ body {
   box-shadow: var(--elevation);
 }
 
+/* Reference-inspired right inspector.
+ *
+ * Keep this treatment deliberately scoped: the reference is a dense, nearly
+ * black properties rail, while the rest of dedup uses floating translucent
+ * chrome. The semantic hooks live on the inspector primitives so none of the
+ * canvas, sidebar, toolbar, or dialog styling is affected. */
+.inspector-panel {
+  --inspector-surface: #111112;
+  --inspector-control: #202022;
+  --inspector-control-hover: #28282b;
+  --inspector-line: rgba(255, 255, 255, 0.075);
+  --inspector-muted: #a4a4aa;
+
+  background: color-mix(in srgb, var(--inspector-surface) 97%, transparent);
+}
+
+.inspector-panel .inspector-tabs {
+  padding: 8px 10px 9px;
+  border-bottom: 1px solid var(--inspector-line);
+}
+
+.inspector-panel .inspector-tabs-track,
+.inspector-panel .inspector-control,
+.inspector-panel .inspector-segmented {
+  background: var(--inspector-control);
+}
+
+.inspector-panel .inspector-tabs-track {
+  border-radius: 9px;
+}
+
+.inspector-panel .inspector-selection {
+  padding: 13px 12px 14px;
+  border-color: var(--inspector-line);
+}
+
+.inspector-panel .inspector-alignment-toolbar {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 3px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--inspector-line);
+}
+
+.inspector-panel .inspector-alignment-group {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  justify-content: space-around;
+}
+
+.inspector-panel .inspector-alignment-divider {
+  width: 1px;
+  height: 22px;
+  flex: none;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.inspector-panel .inspector-alignment-button {
+  display: flex;
+  width: 26px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: #85858b;
+  transition:
+    color 120ms ease,
+    background 120ms ease;
+}
+
+.inspector-panel .inspector-alignment-button:hover {
+  color: #d7d7db;
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.inspector-panel .inspector-alignment-button.is-active {
+  color: #f4f4f5;
+  background: var(--inspector-control);
+}
+
+.inspector-panel .inspector-section {
+  padding: 10px 12px 12px;
+  border-color: var(--inspector-line);
+}
+
+.inspector-panel .inspector-section.is-collapsed {
+  padding-block: 10px;
+}
+
+.inspector-panel .inspector-section-header {
+  height: 28px;
+}
+
+.inspector-panel .inspector-section-title {
+  color: #f4f4f5;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.inspector-panel .inspector-section-toggle {
+  cursor: pointer;
+}
+
+.inspector-panel .inspector-disclosure {
+  flex: none;
+  color: #99999f;
+}
+
+.inspector-panel .inspector-section-toggle:hover .inspector-disclosure {
+  color: #f4f4f5;
+}
+
+.inspector-panel .inspector-section-body {
+  margin-top: 10px;
+  gap: 12px;
+}
+
+.inspector-panel .inspector-group {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+
+.inspector-panel .inspector-group > :first-child {
+  width: 72px;
+  height: 30px;
+  flex: none;
+}
+
+.inspector-panel .inspector-group > :last-child:not(:first-child) {
+  min-width: 0;
+  flex: 1;
+}
+
+/* Two labelled groups sharing one row still use compact captions above their
+ * controls; the horizontal label/control rule is for full-width rows. */
+.inspector-panel .inspector-control-row > .inspector-group {
+  align-items: stretch;
+  flex: 1;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.inspector-panel .inspector-control-row > .inspector-group > :first-child {
+  width: auto;
+  height: 16px;
+}
+
+.inspector-panel .inspector-group-label {
+  color: var(--inspector-muted);
+  font-size: 12px;
+}
+
+.inspector-panel .inspector-control-row {
+  gap: 10px;
+}
+
+.inspector-panel .inspector-control,
+.inspector-panel .inspector-segmented {
+  min-height: 30px;
+  height: 30px;
+  border-radius: 9px;
+}
+
+.inspector-panel .inspector-control {
+  padding-inline: 9px;
+}
+
+.inspector-panel .inspector-control:hover {
+  background: var(--inspector-control-hover);
+}
+
+.inspector-panel .inspector-icon-button {
+  color: #96969d;
+}
+
+.inspector-panel .inspector-icon-button:hover {
+  background: var(--inspector-control);
+  color: #f4f4f5;
+}
+
+.inspector-panel .inspector-swatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+}
+
+.inspector-panel .inspector-footer {
+  border-color: var(--inspector-line);
+  background: rgba(0, 0, 0, 0.08);
+}
+
 /* Thin, unobtrusive scrollbars — the chrome should not compete with the app
    being designed inside it. */
 ::-webkit-scrollbar {
@@ -111,3 +311,115 @@ body {
 ::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+/* The reference is a 2× capture: 30px controls and 48px section rows. */
+.inspector-panel {
+  --inspector-surface: #111111;
+  --inspector-control: #202020;
+  --inspector-muted: #c3c3c3;
+  --inspector-line: #252525;
+  background: #111111;
+}
+.reference-properties { padding: 0 7px; color: #fafafa; }
+.inspector-panel .reference-properties .inspector-alignment-toolbar {
+  height: 48px; min-height: 48px; padding: 0; gap: 0;
+}
+.inspector-panel .reference-properties .inspector-alignment-group { display: contents; }
+.inspector-panel .reference-properties .inspector-alignment-divider { display: none; }
+.inspector-panel .reference-properties .inspector-alignment-button { flex: 1; color: #808080; }
+.inspector-panel .reference-properties .inspector-alignment-button svg { width: 18px; height: 18px; }
+.reference-section { border-bottom: 1px solid #252525; }
+.reference-section:last-child { border-bottom: 0; }
+.reference-heading-row { display: flex; align-items: center; padding-right: 7px; }
+.reference-heading-row > .reference-heading { flex: 1; min-width: 0; }
+/* Content promoted out of a nested section: the rail's own inset and rhythm,
+   without a second layer of section chrome around it. */
+.reference-group { display: flex; flex-direction: column; gap: 12px; padding: 0 12px 2px; }
+.reference-heading { width: 100%; height: 47px; display: flex; align-items: center; justify-content: space-between; padding: 0 5px; text-align: left; }
+button.reference-heading { cursor: pointer; }
+.reference-heading h3 { font-size: 13px; font-weight: 600; margin: 0; line-height: 18px; letter-spacing: -.1px; }
+.reference-disclosure { display: grid; place-items: center; color: #999; width: 18px; height: 26px; }
+button.reference-heading:hover .reference-disclosure { color: white; }
+.reference-body { padding: 0 0 10px; display: flex; flex-direction: column; gap: 10px; }
+.reference-row { display: grid; grid-template-columns: 42% minmax(0, 1fr); align-items: center; min-height: 30px; }
+.reference-row > span { padding-left: 20px; font-size: 13px; color: #c3c3c3; }
+.reference-values { display: flex; min-width: 0; gap: 10px; }
+.reference-pixel { position: relative; min-width: 0; flex: 1; }
+.reference-pixel > span { position: absolute; right: 9px; top: 9px; font-size: 10px; line-height: 12px; color: #999; pointer-events: none; }
+.reference-pixel:has(> span) input { padding-right: 17px; }
+.inspector-panel .reference-properties .inspector-control { height: 30px; min-height: 30px; border-radius: 9px; padding: 0 7px; }
+.inspector-panel .reference-properties input, .inspector-panel .reference-properties select { font-family: inherit; font-size: 13px; }
+.reference-select { display: flex; align-items: center; position: relative; flex: 1; min-width: 0; background: #202020; border-radius: 9px; }
+.reference-select select { width: 100%; appearance: none; height: 30px; padding: 0 20px 0 9px; outline: none; }
+.reference-select svg { position: absolute; right: 7px; width: 12px; height: 12px; pointer-events: none; color: #999; }
+.reference-select option { background: #202020; }
+.reference-dimensions { display: flex; flex-direction: column; gap: 10px; position: relative; }
+.reference-lock { position: absolute; left: 33%; top: 23px; color: #999; width: 12px; height: 24px; cursor: pointer; }
+.reference-lock::before, .reference-lock::after { content: ''; position: absolute; left: 5px; width: 6px; height: 8px; border-left: 1.5px solid #444; }
+.reference-lock::before { top: -8px; border-top: 1.5px solid #444; border-radius: 4px 0 0; }
+.reference-lock::after { bottom: -8px; border-bottom: 1.5px solid #444; border-radius: 0 0 0 4px; }
+.reference-lock svg { width: 12px; }
+.reference-lock[aria-pressed=true] { color: #fff; }
+.reference-stepper { display: flex; flex: 1; min-width: 0; align-items: center; background: #202020; border-radius: 9px; }
+.reference-stepper button { height: 30px; flex: 1; display: grid; place-items: center; color: #999; cursor: pointer; }
+.reference-stepper span { height: 14px; width: 1px; background: #444; }
+.reference-stepper button:hover { color: white; }
+.reference-fill { display: flex; position: relative; width: 100%; }
+.reference-fill .inspector-control { padding-left: 3px !important; padding-right: 24px !important; gap: 8px; }
+.inspector-panel .reference-fill .inspector-swatch { width: 22px; height: 22px; border-radius: 5px; }
+.reference-fill > button { position: absolute; right: 7px; top: 8px; color: #999; }
+.reference-fill > button svg { width: 14px; height: 14px; }
+.reference-row { grid-template-columns: 43.5% minmax(0, 1fr); }
+
+.reference-fill.has-color-picker .inspector-control { padding-left: 33px !important; }
+.reference-fill > .color-picker-trigger { left: 4px; right: auto; top: 4px; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 5px; z-index: 1; cursor: pointer; }
+.color-picker-trigger:hover { outline: 2px solid #777; outline-offset: 2px; }
+.color-picker-dialog { position: fixed; margin: 0; width: 282px; max-width: calc(100vw - 24px); max-height: calc(100vh - 24px); overflow: auto; padding: 14px; border: 1px solid #3b3b3b; border-radius: 16px; color: #f4f4f4; background: #1a1a1a; box-shadow: 0 20px 70px #0009, 0 3px 12px #0006; font-family: inherit; font-size: 12px; color-scheme: dark; }
+.color-picker-dialog::backdrop { background: transparent; }
+.color-picker-dialog button { cursor: pointer; }
+.color-picker-dialog :focus-visible { outline: 2px solid #a3a3ff; outline-offset: 3px; }
+.color-picker-dialog header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
+.color-picker-dialog h3 { font-size: 13px; font-weight: 600; margin: 0 0 3px; }
+.color-picker-dialog header span { color: #888; font-size: 11px; }
+.color-picker-dialog header button { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 6px; color: #999; }
+.color-picker-dialog header button:hover { color: white; background: #303030; }
+.color-picker-plane { position: relative; height: 158px; border-radius: 9px; background-image: linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, transparent); touch-action: none; cursor: crosshair; }
+.color-picker-thumb { position: absolute; width: 12px; height: 12px; transform: translate(-50%, -50%); border: 2px solid white; border-radius: 50%; box-shadow: 0 0 0 1px #0004, 0 2px 4px #0008; pointer-events: none; }
+.color-picker-sliders { display: flex; align-items: center; gap: 12px; margin: 16px 0; }
+.color-picker-preview { width: 34px; height: 34px; border: 1px solid #ffffff20; overflow: hidden; border-radius: 50%; flex: none; background: conic-gradient(#555 25%, #333 0 50%, #555 0 75%, #333 0) 0 0 / 8px 8px; }
+.color-picker-preview span { display: block; width: 100%; height: 100%; }
+.color-picker-sliders > div:last-child { display: grid; gap: 12px; flex: 1; }
+.color-picker-sliders input { appearance: none; width: 100%; height: 10px; border-radius: 6px; cursor: pointer; margin: 0; }
+.color-picker-hue { background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00); }
+.color-picker-alpha { background-size: 100% 100%, 8px 8px; }
+.color-picker-sliders input::-webkit-slider-thumb { appearance: none; background: #fff; width: 13px; height: 13px; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 1px 4px #0008; }
+.color-picker-inputs { display: flex; gap: 8px; }
+.color-picker-inputs label { display: flex; align-items: center; min-width: 0; gap: 5px; background: #272727; border: 1px solid #373737; border-radius: 7px; padding: 8px; width: 93px; }
+.color-picker-inputs .color-picker-hex { flex: 1; }
+.color-picker-inputs span { color: #929292; font-size: 10px; }
+.color-picker-inputs input { width: 100%; min-width: 0; font-size: 11px; background: transparent; outline: none; font-variant-numeric: tabular-nums; }
+.color-picker-inputs input[type=number] { appearance: textfield; }
+.color-picker-inputs input::-webkit-inner-spin-button { appearance: none; }
+.color-picker-inputs label:focus-within { border-color: #a3a3ff; }
+.color-picker-inputs label:has([aria-invalid=true]) { border-color: #ef4444; }
+.color-picker-error { color: #fca5a5; font-size: 11px; margin-top: 8px; }
+.color-picker-precision { color: #999; margin-top: 12px; font-size: 11px; }
+.color-picker-precision summary { cursor: pointer; }
+.color-picker-precision label { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
+.color-picker-precision input { width: 145px; accent-color: #aaa; }
+.color-picker-presets { border-top: 1px solid #303030; padding-top: 12px; margin-top: 12px; }
+.color-picker-presets > span { color: #999; font-size: 11px; }
+.color-picker-presets > div { display: grid; grid-template-columns: repeat(12, 1fr); gap: 5px; margin-top: 9px; }
+.color-picker-presets button { aspect-ratio: 1; border-radius: 50%; border: 1px solid #ffffff26; display: grid; place-items: center; transition: transform .12s; }
+.color-picker-presets button:hover { transform: scale(1.2); }
+.color-picker-presets svg { width: 12px; height: 12px; }
+.color-picker-dialog footer { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
+.color-picker-current { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #999; }
+.color-picker-current i { width: 8px; height: 8px; border-radius: 50%; }
+.color-picker-dialog footer button { padding: 6px 14px; background: #ededed; color: #191919; border-radius: 6px; font-size: 11px; font-weight: 600; }
+.color-picker-dialog footer button:hover { background: white; }
+
+.color-picker-dialog header { cursor: grab; touch-action: none; user-select: none; }
+.color-picker-dialog header:focus { outline: none; }
+.color-picker-dialog.is-dragging, .color-picker-dialog.is-dragging header { cursor: grabbing; }
+.color-picker-dialog header button { cursor: pointer; }

@@ -17,6 +17,9 @@ dist-ssr
 !.vscode/extensions.json
 .idea
 .DS_Store
+# macOS writes an AppleDouble `._name` beside every file on non-Apple
+# filesystems (exFAT, network shares). Metadata, never source.
+._*
 *.suo
 *.ntvs*
 *.njsproj

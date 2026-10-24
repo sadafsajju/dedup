@@ -6,7 +6,13 @@
 // control still names the literal Tailwind class it writes in its `title`, so
 // the panel keeps teaching the vocabulary instead of hiding it.
 import { useEffect, useRef, useState } from "react";
-import { CheckIcon, ChevronDownIcon, CopyIcon } from "@radix-ui/react-icons";
+import {
+  CheckIcon,
+  ChevronDownIcon,
+  CopyIcon,
+  MinusIcon,
+  PlusIcon,
+} from "@radix-ui/react-icons";
 import { cssColor } from "../lib/tailwind";
 
 /** Structural shape of a Radix icon — narrow on purpose: the package's own
@@ -97,19 +103,56 @@ export function Section({
   title,
   right,
   children,
+  collapsible = false,
+  defaultOpen = true,
 }: {
   title: string;
   right?: React.ReactNode;
   children?: React.ReactNode;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
 }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const expanded = !collapsible || open;
   return (
-    <div className="border-b border-line px-3 py-3">
-      <div className="flex h-6 items-center select-none">
-        <span className="text-[13px] font-medium text-ink">{title}</span>
-        <span className="flex-1" />
+    <div
+      className={`inspector-section border-b border-line px-3 py-3 ${
+        expanded ? "is-open" : "is-collapsed"
+      }`}
+    >
+      <div className="inspector-section-header flex h-6 items-center select-none">
+        {collapsible ? (
+          <button
+            type="button"
+            aria-expanded={open}
+            onClick={() => setOpen((value) => !value)}
+            className="inspector-section-toggle flex h-full min-w-0 flex-1 items-center text-left"
+          >
+            <span className="inspector-section-title text-[13px] font-medium text-ink">
+              {title}
+            </span>
+            <span className="flex-1" />
+            {open ? (
+              <MinusIcon className="inspector-disclosure" width={14} height={14} />
+            ) : (
+              <PlusIcon className="inspector-disclosure" width={14} height={14} />
+            )}
+          </button>
+        ) : (
+          <>
+            <span className="inspector-section-title text-[13px] font-medium text-ink">
+              {title}
+            </span>
+            <span className="flex-1" />
+          </>
+        )}
         <div className="flex items-center gap-0.5">{right}</div>
       </div>
-      {children && <div className="mt-2 flex flex-col gap-3">{children}</div>}
+      {children && expanded && (
+        <div className="inspector-section-body mt-2 flex flex-col gap-3">
+          {children}
+        </div>
+      )}
     </div>
   );
 }
@@ -125,10 +168,12 @@ export function Group({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex min-w-0 flex-col gap-1">
+    <div className="inspector-group flex min-w-0 flex-col gap-1">
       {(label || right) && (
         <div className="flex h-4 items-center select-none">
-          <span className="text-2xs text-ink-dim">{label}</span>
+          <span className="inspector-group-label text-2xs text-ink-dim">
+            {label}
+          </span>
           <span className="flex-1" />
           {right}
         </div>
@@ -140,7 +185,11 @@ export function Group({
 
 /** Controls side by side on one line. */
 export function Row({ children }: { children: React.ReactNode }) {
-  return <div className="flex min-w-0 items-center gap-2">{children}</div>;
+  return (
+    <div className="inspector-control-row flex min-w-0 items-center gap-2">
+      {children}
+    </div>
+  );
 }
 
 /** Ghost button for a section or group header. */
@@ -159,7 +208,7 @@ export function IconButton({
     <button
       title={title}
       onClick={onClick}
-      className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${
+      className={`inspector-icon-button flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${
         active
           ? "bg-surface-3 text-ink"
           : "text-ink-dim hover:text-ink hover:bg-surface-2"
@@ -211,7 +260,7 @@ function useScrub(onScrub?: (dir: 1 | -1, group: string) => void) {
 // --- fields ------------------------------------------------------------------
 
 const SHELL =
-  "flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded-lg border border-transparent bg-surface-2 px-2 hover:border-line-strong focus-within:border-accent focus-within:hover:border-accent";
+  "inspector-control flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded-lg border border-transparent bg-surface-2 px-2 hover:border-line-strong focus-within:border-accent focus-within:hover:border-accent";
 
 /** Text input that commits on Enter/blur only (undo stays coarse-grained). */
 export function Field({
@@ -324,7 +373,7 @@ export function ToggleGroup<T extends string>({
   onChange: (v: T | null) => void;
 }) {
   return (
-    <div className="flex h-7 min-w-0 flex-1 items-center gap-0.5 rounded-lg bg-surface-2 p-0.5">
+    <div className="inspector-segmented flex h-7 min-w-0 flex-1 items-center gap-0.5 rounded-lg bg-surface-2 p-0.5">
       {options.map((o) => {
         const active = value === o.v;
         return (
@@ -361,7 +410,7 @@ export function Swatch({ value }: { value: string | null }) {
     <span
       title={css ?? (value ? `${value} — not a resolvable colour` : "no colour")}
       style={css ? { background: css } : CHECKER}
-      className="h-4 w-4 shrink-0 rounded ring-1 ring-inset ring-white/15"
+      className="inspector-swatch h-4 w-4 shrink-0 rounded ring-1 ring-inset ring-white/15"
     />
   );
 }

@@ -9,7 +9,8 @@
 //      chat with nothing selected finds its way around the project: the model
 //      never touches the filesystem, it asks and dedup answers.
 //   2. "here is the edit" — SEARCH/REPLACE blocks, optionally addressed to a
-//      file, plus whole CREATE files and ASSET imports. Output tokens scale
+//      file, plus whole CREATE files, ASSET imports and IMAGE requests (an
+//      image the model asks another agent to generate). Output tokens scale
 //      with the size of the *change*, which is what makes chat edits land in
 //      seconds.
 //   3. "here is my answer" — prose, no code written.
@@ -49,6 +50,23 @@ export interface AssetImport {
   source: string;
 }
 
+/**
+ * An image the model wants but cannot make, asked of an agent that can.
+ *
+ * Where an ASSET block says "I generated this file, import it", an IMAGE block
+ * says "have one generated". It names no source path at all — the model only
+ * describes the picture — so the request adds nothing to what can reach the
+ * project: dedup asks the generating agent, and *that* agent's answer is an
+ * ordinary ASSET import through the same gates as if it had been asked
+ * directly (`pickGeneratedImage`, then `asset.rs`).
+ */
+export interface ImageRequest {
+  /** Project-relative destination. */
+  file: string;
+  /** What the image should show, in the requesting model's words. */
+  prompt: string;
+}
+
 /** Read-only context requests. `arg` is a path for read, a pattern for grep,
  *  and ignored for list. */
 export interface ToolCall {
@@ -64,6 +82,7 @@ export type ChatReply =
       blocks: EditBlock[];
       creates: NewFile[];
       assets: AssetImport[];
+      images: ImageRequest[];
       summary: string;
     }
   | { kind: "file"; content: string; summary: string }
@@ -74,6 +93,7 @@ const DIVIDE_MARK = "=======";
 const REPLACE_MARK = ">>>>>>> REPLACE";
 const CREATE_MARK = "<<<<<<< CREATE";
 const ASSET_MARK = "<<<<<<< ASSET";
+const IMAGE_MARK = "<<<<<<< IMAGE";
 const END_MARK = ">>>>>>> END";
 const TOOL_RE = /^TOOL:\s*(read|grep|list)\b\s*(.*)$/i;
 
@@ -137,11 +157,14 @@ function parseEdits(text: string): {
   blocks: EditBlock[];
   creates: NewFile[];
   assets: AssetImport[];
+  images: ImageRequest[];
 } {
   const blocks: EditBlock[] = [];
   const creates: NewFile[] = [];
   const assets: AssetImport[] = [];
-  let state: "outside" | "search" | "replace" | "create" | "asset" = "outside";
+  const images: ImageRequest[] = [];
+  let state: "outside" | "search" | "replace" | "create" | "asset" | "image" =
+    "outside";
   let file: string | null = null;
   let search: string[] = [];
   let replace: string[] = [];
@@ -171,6 +194,13 @@ function parseEdits(text: string): {
       state = "asset";
       file = named;
       body = [];
+    } else if (trimmed.startsWith(IMAGE_MARK)) {
+      if (state !== "outside") throw new Error("nested IMAGE marker");
+      const named = fileOfMarker(trimmed, IMAGE_MARK);
+      if (!named) throw new Error("IMAGE marker without a destination path");
+      state = "image";
+      file = named;
+      body = [];
     } else if (trimmed === DIVIDE_MARK && state === "search") {
       state = "replace";
     } else if (trimmed === REPLACE_MARK) {
@@ -194,6 +224,14 @@ function parseEdits(text: string): {
         }
         assets.push({ file: file as string, source: lines[0] });
         state = "outside";
+      } else if (state === "image") {
+        // The description is prose and kept as written; only an empty one is
+        // refused, because "generate something" is not a request the other
+        // agent can answer and its failure would be blamed on the wrong one.
+        const prompt = body.join("\n").trim();
+        if (prompt === "") throw new Error("an IMAGE block must describe the image");
+        images.push({ file: file as string, prompt });
+        state = "outside";
       } else {
         if (state !== "create") throw new Error("END marker outside a CREATE block");
         if (body.join("\n").trim() === "") throw new Error("empty CREATE block");
@@ -204,12 +242,12 @@ function parseEdits(text: string): {
       search.push(line);
     } else if (state === "replace") {
       replace.push(line);
-    } else if (state === "create" || state === "asset") {
+    } else if (state === "create" || state === "asset" || state === "image") {
       body.push(line);
     }
   }
   if (state !== "outside") throw new Error("unterminated edit block");
-  return { blocks, creates, assets };
+  return { blocks, creates, assets, images };
 }
 
 function parseTools(text: string): ToolCall[] {
@@ -232,10 +270,18 @@ export function parseChatReply(raw: string): ChatReply {
   if (
     text.includes(SEARCH_MARK) ||
     text.includes(CREATE_MARK) ||
-    text.includes(ASSET_MARK)
+    text.includes(ASSET_MARK) ||
+    text.includes(IMAGE_MARK)
   ) {
-    const { blocks, creates, assets } = parseEdits(text);
-    return { kind: "blocks", blocks, creates, assets, summary: parseSummary(text) };
+    const { blocks, creates, assets, images } = parseEdits(text);
+    return {
+      kind: "blocks",
+      blocks,
+      creates,
+      assets,
+      images,
+      summary: parseSummary(text),
+    };
   }
 
   const calls = parseTools(text);
@@ -263,6 +309,83 @@ export function parseChatReply(raw: string): ChatReply {
   }
 
   return { kind: "answer", text };
+}
+
+/**
+ * The generated file in the answer to an IMAGE request — the one thing dedup
+ * takes from that reply.
+ *
+ * The generating agent was asked for an image and nothing else, so anything
+ * else in its answer is refused rather than salvaged: an edit or a created
+ * file would be a second agent writing source the user asked a *different*
+ * agent about, which nobody reviewed the request for. Exactly one ASSET block;
+ * its destination is ignored in favour of the one the requester chose, because
+ * that is the path the requester's markup already points at.
+ */
+export function pickGeneratedImage(raw: string): string {
+  let reply: ChatReply;
+  try {
+    reply = parseChatReply(raw);
+  } catch (e) {
+    throw new Error(
+      `its answer was malformed (${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+  if (reply.kind !== "blocks") {
+    const said = reply.kind === "answer" ? reply.text : "";
+    throw new Error(
+      said
+        ? `it didn't produce an image: ${said.slice(0, 200)}`
+        : "it didn't produce an image",
+    );
+  }
+  if (reply.blocks.length || reply.creates.length || reply.images.length) {
+    throw new Error("it answered with code changes instead of only an image");
+  }
+  if (reply.assets.length !== 1) {
+    throw new Error(
+      `it returned ${reply.assets.length} images where one was asked for`,
+    );
+  }
+  return reply.assets[0].source;
+}
+
+/**
+ * Point a proposal's references at the name an image actually landed under.
+ *
+ * An IMAGE request names its destination before the image exists, and the
+ * generating agent decides the format — so `hero.jpg` can come back as a PNG,
+ * and the import names it `hero.png` (the name must agree with the bytes).
+ * The requester's markup still says `hero.jpg`; this renames those references.
+ *
+ * Only references **this edit introduced**. The file did not exist until now,
+ * so a reference to it in a file's *before* contents is something the user
+ * wrote, about something else, and is refused rather than renamed. Matched on
+ * the file name with path-character boundaries on both sides, so
+ * `big-hero.jpg` is not a reference to `hero.jpg`.
+ */
+export function retargetReferences<
+  F extends { file: string; before: string | null; after: string },
+>(files: F[], from: string, to: string): F[] {
+  const fromName = from.split("/").pop() ?? from;
+  const toName = to.split("/").pop() ?? to;
+  if (fromName === toName) return files;
+  const ref = new RegExp(
+    `(?<![\\w.-])${fromName.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&")}(?![\\w.-])`,
+    "g",
+  );
+  return files.map((f) => {
+    ref.lastIndex = 0;
+    if (!ref.test(f.after)) return f;
+    ref.lastIndex = 0;
+    if (f.before !== null && ref.test(f.before)) {
+      throw new Error(
+        `${f.file} already mentioned ${fromName} before this edit, so dedup can't tell which references to rename to ${toName}`,
+      );
+    }
+    ref.lastIndex = 0;
+    return { ...f, after: f.after.replace(ref, toName) };
+  });
 }
 
 /** Apply blocks to `source`. Each SEARCH must match exactly once — anything

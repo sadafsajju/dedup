@@ -98,11 +98,20 @@ fn inside(dir: &Path, path: &Path) -> bool {
 
 /// Copy an agent-generated file into the project. See the module comment for
 /// what each refusal is protecting against.
+///
+/// `adapt_extension` is for a destination the requester named *before the
+/// image existed* — a model asking another agent for one (an IMAGE block)
+/// cannot know what format it will get back. With it, a name that disagrees
+/// with the bytes is corrected (`hero.jpg` → `hero.png`) instead of refused,
+/// and the result says where the file actually landed. The rule is unchanged
+/// either way: the name always ends up agreeing with the bytes, and it is the
+/// bytes that decide.
 pub fn import(
     root: &str,
     agent: Agent,
     source: &str,
     dest_rel: &str,
+    adapt_extension: bool,
 ) -> Result<ImportedAsset, String> {
     let Some(dir) = agent.asset_dir() else {
         return Err(format!(
@@ -152,6 +161,21 @@ pub fn import(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    let adapted;
+    let dest_rel = if !kind.extensions.contains(&ext.as_str()) && adapt_extension {
+        adapted = Path::new(dest_rel)
+            .with_extension(kind.extensions[0])
+            .to_string_lossy()
+            .replace('\\', "/");
+        adapted.as_str()
+    } else {
+        dest_rel
+    };
+    let ext = Path::new(dest_rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if !kind.extensions.contains(&ext.as_str()) {
         // Names the destination it was actually handed. The first version of
         // this message reported the extension alone, which for a path wearing
@@ -160,7 +184,7 @@ pub fn import(
         // parser strips that decoration now; this stays legible if anything
         // else ever gets here.
         return Err(format!(
-            "that image is a {}, but the AI asked to save it as `{dest_rel}` —              it needs a .{} name",
+            "that image is a {}, but the AI asked to save it as `{dest_rel}` — it needs a .{} name",
             kind.label,
             kind.extensions[0]
         ));
@@ -217,6 +241,7 @@ mod tests {
             Agent::Codex,
             secret.to_str().unwrap(),
             "public/key.png",
+            false,
         )
         .unwrap_err();
         assert!(err.contains("only imports from"), "got: {err}");
@@ -236,6 +261,7 @@ mod tests {
                     Agent::Codex,
                     link.to_str().unwrap(),
                     "public/key.png",
+                    false,
                 )
                 .unwrap_err();
                 assert!(err.contains("only imports from"), "symlink escaped: {err}");
@@ -248,6 +274,55 @@ mod tests {
 
     /// Inside the directory, the bytes still have to be an image, and the name
     /// still has to agree with them.
+    /// An IMAGE request names its destination before the image exists, so a
+    /// disagreeing extension is corrected rather than refused — and the gates
+    /// that are not about the name still hold exactly as before.
+    #[test]
+    fn a_delegated_image_is_renamed_to_what_its_bytes_are() {
+        let Some(base) = Agent::Codex.asset_dir() else {
+            return;
+        };
+        let tag = std::process::id();
+        let dir = base.join(format!("dedup-adapt-{tag}"));
+        std::fs::create_dir_all(&dir).ok();
+        let root = temp("adapt");
+
+        let png = dir.join(format!("dedup-adapt-{tag}.png"));
+        std::fs::write(&png, PNG).unwrap();
+        let ok = import(
+            root.to_str().unwrap(),
+            Agent::Codex,
+            png.to_str().unwrap(),
+            "images/hero-container-lift.jpg",
+            true,
+        )
+        .unwrap();
+        assert_eq!(ok.file, "images/hero-container-lift.png", "the result says where it landed");
+        assert_eq!(ok.kind, "PNG");
+        assert_eq!(std::fs::read(root.join("images/hero-container-lift.png")).unwrap(), PNG);
+        assert!(!root.join("images/hero-container-lift.jpg").exists());
+
+        // Adapting the name is not adapting anything else: a non-image is
+        // still refused, and so is a name already taken.
+        let text = dir.join(format!("dedup-adapt-{tag}-text.png"));
+        std::fs::write(&text, "not an image").unwrap();
+        let err = import(root.to_str().unwrap(), Agent::Codex, text.to_str().unwrap(), "a.jpg", true)
+            .unwrap_err();
+        assert!(err.contains("not an image"), "got: {err}");
+        let err = import(
+            root.to_str().unwrap(),
+            Agent::Codex,
+            png.to_str().unwrap(),
+            "images/hero-container-lift.webp",
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("already exists"), "the corrected name is the one checked: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn sniffs_the_bytes_and_makes_the_name_agree() {
         let Some(base) = Agent::Codex.asset_dir() else {
@@ -267,6 +342,7 @@ mod tests {
             Agent::Codex,
             text.to_str().unwrap(),
             "public/a.png",
+            false,
         )
         .unwrap_err();
         assert!(err.contains("not an image"), "got: {err}");
@@ -278,6 +354,7 @@ mod tests {
             Agent::Codex,
             png.to_str().unwrap(),
             "public/a.jpg",
+            false,
         )
         .unwrap_err();
         assert!(err.contains("needs a .png name"), "got: {err}");
@@ -289,6 +366,7 @@ mod tests {
             Agent::Codex,
             png.to_str().unwrap(),
             "public/a.png",
+            false,
         )
         .unwrap();
         assert_eq!(ok.kind, "PNG");
@@ -300,6 +378,7 @@ mod tests {
             Agent::Codex,
             png.to_str().unwrap(),
             "public/a.png",
+            false,
         )
         .unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
@@ -310,6 +389,7 @@ mod tests {
             Agent::Codex,
             png.to_str().unwrap(),
             "../escaped.png",
+            false,
         )
         .unwrap_err();
         assert!(err.contains("outside the project"), "got: {err}");
@@ -326,6 +406,7 @@ mod tests {
             Agent::ClaudeCode,
             "/tmp/whatever.png",
             "public/a.png",
+            false,
         )
         .unwrap_err();
         assert!(err.contains("does not generate"), "got: {err}");

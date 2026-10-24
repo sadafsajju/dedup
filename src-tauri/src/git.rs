@@ -74,13 +74,53 @@ fn git(root: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Make an existing folder a git repository whose first commit is its files as
+/// they stand — the baseline every dedup edit is then committed on top of.
+///
+/// The user's explicit request, from a button: dedup's safety model needs git
+/// and a folder of hand-written pages often has none. Refuses a folder that is
+/// already inside a repository (including a parent's — that repository is the
+/// user's, and a nested one would hide their files from it). If the baseline
+/// commit fails, the `.git` this just created is removed again, so a failure
+/// leaves the folder exactly as it was found rather than half set up.
+pub fn init_baseline(root: &str) -> Result<(), String> {
+    if status(root).is_repo {
+        return Err("This folder is already in a git repository.".into());
+    }
+    let dot_git = std::path::Path::new(root).join(".git");
+    if dot_git.exists() {
+        return Err(
+            "There is a .git folder here that git doesn't recognise as a repository — repair or remove it first."
+                .into(),
+        );
+    }
+    git(root, &["init", "-q", "-b", "main"])?;
+    let result = git(root, &["add", "-A"]).and_then(|_| {
+        // Nothing to commit (every file ignored) still leaves a valid repo.
+        if git(root, &["diff", "--cached", "--name-only"])?.trim().is_empty() {
+            return Ok(());
+        }
+        git(root, &["commit", "-q", "-m", "Baseline before dedup edits"]).map(|_| ())
+    });
+    if let Err(e) = result {
+        // Ours to remove: it did not exist a moment ago (checked above).
+        let _ = std::fs::remove_dir_all(&dot_git);
+        return Err(if e.contains("tell me who you are") || e.contains("user.email") {
+            "git doesn't know who to commit as yet. Run `git config --global user.name \"Your Name\"` and `git config --global user.email you@example.com` in a terminal, then try again.".into()
+        } else {
+            e
+        });
+    }
+    Ok(())
+}
+
 /// Make sure we're on a dedup session branch (FR-4.6); create/switch on the
 /// first write. Uncommitted user changes travel along (git switch keeps them).
 /// Returns the branch name.
 pub fn ensure_session_branch(root: &str) -> Result<String, String> {
     let st = status(root);
     if !st.is_repo {
-        return Err("This project is not a git repository — dedup requires git to save (its safety model is branch + commit per change).".into());
+        return Err("This project is not a git repository — dedup requires git to save (its safety model is branch + commit per change). Use “Set up git” in the top bar to make one.".into());
     }
     if let Some(branch) = &st.branch {
         if branch.starts_with("dedup/session-") {
@@ -285,6 +325,51 @@ mod tests {
         let err = commit_paths(root, "dedup: x", &["generated/Card.tsx".into()]).unwrap_err();
         assert!(err.contains("generated/Card.tsx"), "{err}");
         assert!(err.contains(".gitignore"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Needs a commit identity, which a developer machine has globally; a bare
+    /// CI box may not, and then there is nothing meaningful to assert.
+    fn has_identity() -> bool {
+        Command::new("git")
+            .args(["config", "user.email"])
+            .output()
+            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
+    }
+
+    #[test]
+    fn a_plain_folder_becomes_a_repo_with_its_files_as_the_baseline() {
+        if !has_identity() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dedup-git-baseline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("vendor")).unwrap();
+        std::fs::write(dir.join("Main.dc.html"), "<h1>hi</h1>").unwrap();
+        std::fs::write(dir.join("vendor/react.js"), "x").unwrap();
+        let root = dir.to_str().unwrap();
+
+        init_baseline(root).unwrap();
+        let st = status(root);
+        assert!(st.is_repo);
+        assert!(!st.is_dirty, "every file is in the baseline");
+        assert_eq!(st.branch.as_deref(), Some("main"));
+        assert_eq!(git(root, &["rev-list", "--count", "HEAD"]).unwrap(), "1");
+        // And the safety model can now do its job.
+        assert!(ensure_session_branch(root).unwrap().starts_with("dedup/session-"));
+
+        // Never twice, and never over a repository that already exists.
+        assert!(init_baseline(root).unwrap_err().contains("already"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_folder_inside_someone_elses_repo_is_refused() {
+        let dir = temp_repo("nested");
+        std::fs::create_dir_all(dir.join("site")).unwrap();
+        let err = init_baseline(dir.join("site").to_str().unwrap()).unwrap_err();
+        assert!(err.contains("already"), "{err}");
+        assert!(!dir.join("site/.git").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -2,19 +2,33 @@
 // the zoom controls that used to live in the TopBar.
 import { useStore } from "../lib/store";
 import { PALETTE, PALETTE_ORDER } from "../lib/palette";
+import { KIND_LABEL, PENS, type AnnotationKind } from "../lib/annotate";
 import {
+  ArrowTopRightIcon,
   BoxIcon,
   ButtonIcon,
+  CircleIcon,
   CursorArrowIcon,
   GlobeIcon,
   HandIcon,
   ImageIcon,
   MinusIcon,
+  Pencil1Icon,
+  Pencil2Icon,
   PlusIcon,
+  SquareIcon,
   TextAlignLeftIcon,
   TextIcon,
 } from "@radix-ui/react-icons";
 import type { IconType } from "./ui";
+
+/** The shapes the annotate tool can draw. Order is the order of the row. */
+const MARK_KINDS: { id: AnnotationKind; icon: IconType }[] = [
+  { id: "ellipse", icon: CircleIcon },
+  { id: "box", icon: SquareIcon },
+  { id: "arrow", icon: ArrowTopRightIcon },
+  { id: "pen", icon: Pencil1Icon },
+];
 
 const PALETTE_ICONS: Record<string, IconType> = {
   div: BoxIcon,
@@ -51,6 +65,12 @@ const TOOLS = [
     label: "Browse",
     hint: "Browse — clicks reach your app so you can navigate it (B)",
   },
+  {
+    id: "annotate" as const,
+    icon: Pencil2Icon,
+    label: "Annotate",
+    hint: "Annotate — draw on top of your app and write what's wrong (A). Marks never touch your code.",
+  },
 ];
 
 export function Toolbar() {
@@ -60,8 +80,10 @@ export function Toolbar() {
   const textEditing = useStore((s) => s.textEditing);
   const zoom = useStore((s) => s.zoom);
   const setZoom = useStore((s) => s.setZoom);
-  const insertKind = useStore((s) => s.insertKind);
-  const setInsertKind = useStore((s) => s.setInsertKind);
+  const annotateKind = useStore((s) => s.annotateKind);
+  const setAnnotateKind = useStore((s) => s.setAnnotateKind);
+  const annotateColor = useStore((s) => s.annotateColor);
+  const setAnnotateColor = useStore((s) => s.setAnnotateColor);
 
   return (
     <div
@@ -100,29 +122,52 @@ export function Toolbar() {
 
       <div className="mx-1 h-5 w-px bg-line" />
 
-      {/* Insert palette: arm a kind, then click where it goes on the canvas.
-          Only in the select tool — the others own the click. */}
-      {PALETTE_ORDER.map((kind) => {
-        const Icon = PALETTE_ICONS[kind];
-        const active = insertKind === kind;
-        return (
-          <button
-            key={kind}
-            onClick={() => {
-              setTool("select");
-              setInsertKind(active ? null : kind);
-            }}
-            title={`Insert ${PALETTE[kind].label} — then click where it goes`}
-            className={`flex h-8 w-8 items-center justify-center rounded-lg ${
-              active
-                ? "bg-accent text-white"
-                : "text-ink-dim hover:text-ink hover:bg-surface-2"
-            }`}
-          >
-            <Icon width={15} height={15} />
-          </button>
-        );
-      })}
+      {/* One row, two meanings. In the annotate tool the middle group is the
+          pen — shape and ink — because the insert palette is dead there
+          anyway: it arms a canvas click, and the markup layer owns every
+          click that tool makes. */}
+      {tool === "annotate" ? (
+        <>
+          {MARK_KINDS.map((k) => {
+            const Icon = k.icon;
+            const active = annotateKind === k.id;
+            return (
+              <button
+                key={k.id}
+                onClick={() => setAnnotateKind(k.id)}
+                title={`${KIND_LABEL[k.id]} — drag on the canvas to draw one`}
+                className={`flex h-8 w-8 items-center justify-center rounded-lg ${
+                  active
+                    ? "bg-accent text-white"
+                    : "text-ink-dim hover:text-ink hover:bg-surface-2"
+                }`}
+              >
+                <Icon width={15} height={15} />
+              </button>
+            );
+          })}
+          <div className="mx-1 h-5 w-px bg-line" />
+          {PENS.map((pen) => (
+            <button
+              key={pen}
+              onClick={() => setAnnotateColor(pen)}
+              title="Ink colour"
+              className="flex h-8 w-6 items-center justify-center"
+            >
+              <span
+                className={`h-4 w-4 rounded-full ${
+                  annotateColor === pen
+                    ? "ring-2 ring-ink ring-offset-1 ring-offset-surface-1"
+                    : ""
+                }`}
+                style={{ background: pen }}
+              />
+            </button>
+          ))}
+        </>
+      ) : (
+        <PaletteGroup />
+      )}
 
       <div className="mx-1 h-5 w-px bg-line" />
 
@@ -144,5 +189,38 @@ export function Toolbar() {
         <PlusIcon width={14} height={14} />
       </button>
     </div>
+  );
+}
+
+/** Insert palette: arm a kind, then click where it goes on the canvas. Only in
+ *  the select tool — the others own the click. */
+function PaletteGroup() {
+  const insertKind = useStore((s) => s.insertKind);
+  const setInsertKind = useStore((s) => s.setInsertKind);
+  const setTool = useStore((s) => s.setTool);
+  return (
+    <>
+      {PALETTE_ORDER.map((kind) => {
+        const Icon = PALETTE_ICONS[kind];
+        const active = insertKind === kind;
+        return (
+          <button
+            key={kind}
+            onClick={() => {
+              setTool("select");
+              setInsertKind(active ? null : kind);
+            }}
+            title={`Insert ${PALETTE[kind].label} — then click where it goes`}
+            className={`flex h-8 w-8 items-center justify-center rounded-lg ${
+              active
+                ? "bg-accent text-white"
+                : "text-ink-dim hover:text-ink hover:bg-surface-2"
+            }`}
+          >
+            <Icon width={15} height={15} />
+          </button>
+        );
+      })}
+    </>
   );
 }

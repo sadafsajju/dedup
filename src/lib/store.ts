@@ -2,8 +2,16 @@ import { create } from "zustand";
 import {
   captureCanvasThumbnail,
   agentAvailable,
+  agentModels,
   agentPrompt,
+  chooseExportPath,
+  exportArtboard as renderArtboardExport,
+  loadParked,
+  saveParked,
+  snapshotRegion,
+  type Rect,
   commitSession,
+  gitInitBaseline,
   gitStatus,
   copyElement,
   importAgentAsset,
@@ -52,17 +60,29 @@ import {
   type VisualScore,
 } from "./visualPass";
 import { generateSeed } from "./session";
-import { resolveOrigin } from "./origins";
+import { artboardUrl, resolveOrigin } from "./origins";
 import { clampZoom } from "./panZoom";
 import {
+  layoutArtboards,
   loadCanvas,
   saveCanvas,
   MAX_ARTBOARDS,
   type SavedCanvas,
 } from "./canvasMemory";
 import {
+  MAX_ANNOTATIONS,
+  MAX_NOTE,
+  PENS,
+  annotationNotes,
+  loadAnnotations,
+  saveAnnotations,
+  type Annotation,
+  type AnnotationKind,
+} from "./annotate";
+import {
   buildTurnPrompt,
   formatToolResult,
+  imageRequestPrompt,
   isHtmlFile,
   runChatPrompt,
   systemPromptFor,
@@ -73,9 +93,21 @@ import {
   MAX_TOOL_ROUNDS,
   applyProgram,
   parseChatReply,
+  pickGeneratedImage,
+  retargetReferences,
   type ChatReply,
   type ToolCall,
 } from "./chatEdits";
+import { mentionAlias, routeMention } from "./mentions";
+import { redoStep, undoStep } from "./undo";
+import {
+  persistable,
+  reconcileParked,
+  sanitizeParked,
+  settleParked,
+  type ParkedPiece,
+  type Point,
+} from "./parking";
 import {
   categorizeComponents,
   needingCategorization,
@@ -120,7 +152,7 @@ import {
   type InsertKind,
 } from "./palette";
 import { foldLine, type ParsedError } from "./errors";
-import { CLI_AGENTS } from "./types";
+import { CLI_AGENTS, agentOn, artboardHeight } from "./types";
 import type {
   AgentState,
   ChatMessage,
@@ -290,13 +322,34 @@ interface AppState {
   draggingId: string | null;
   /** Palette entry armed for the next canvas click (insert tool). */
   insertKind: InsertKind | null;
+
+  /** Hand-drawn marks over the artboards (lib/annotate), every route of this
+   * project — the layer renders the ones whose page is open. */
+  annotations: Annotation[];
+  /** Shape the annotate tool draws next. */
+  annotateKind: AnnotationKind;
+  /** Ink colour for the next mark. */
+  annotateColor: string;
+  /** The mark whose note is open for typing, if any. */
+  noteEditing: string | null;
   /** What a copy or a cut put down, until the next one replaces it. Not
    * the system clipboard: what is being carried is a piece of the user's
    * source with a rendering attached, and neither half survives a round trip
    * through plain text. */
   clipboard: Clipboard | null;
   saving: boolean;
-  lastSave: { branch: string; hash: string } | null;
+  /** `direct`: written in place in a project with no git — no branch, no
+   *  commit, so there is no hash to show. */
+  lastSave: { branch: string; hash: string; direct?: boolean } | null;
+  /** The user has been warned, this session, that saving into a project with
+   *  no git replaces their files in place — no branch to put the change on,
+   *  no commit to undo it. Reset with the project. */
+  directWriteOk: boolean;
+  /** A save waiting on that warning: the files it would replace, and how to
+   *  run it once the user confirms. */
+  directWritePrompt: { files: string[]; run: () => void } | null;
+  confirmDirectWrite: () => void;
+  cancelDirectWrite: () => void;
   saveError: string | null;
   /** A passing message about the gesture just made — what was copied, or why
    * it could not be. Distinct from `saveError`, which is specifically a save
@@ -312,6 +365,10 @@ interface AppState {
   chatSessions: ChatSession[];
   activeChatId: string | null;
   chatBusy: boolean;
+  /** What a turn in flight is doing right now, when it is worth saying —
+   *  another agent generating an image takes long enough that a bare
+   *  "Working…" reads as a hang. null while there is nothing to add. */
+  chatActivity: string | null;
   /** The edit the agent has proposed and the user hasn't resolved yet — a
    *  diff on screen, nothing on disk. One at a time: a second proposal is
    *  computed against file contents the first one would have changed, so
@@ -374,8 +431,9 @@ interface AppState {
    * record rather than a set of fields per agent, so a third agent is a row
    * in CLI_AGENTS rather than five more pieces of state. */
   agents: Record<CliAgent, AgentState>;
-  /** Which backend the user chose (persisted). null = not chosen yet. */
-  aiPref: CliAgent | "api" | null;
+  /** The API-key backend's switch (persisted). The agents' switches live in
+   *  `agents[…].enabled`; this is the same thing for the key. */
+  apiEnabled: boolean;
 
   // Guarded merge (FR-5.4 → FR-5.7). One at a time: a merge rewrites the
   // project behind gates, so a second one running underneath the first would
@@ -523,6 +581,15 @@ interface AppState {
    * the write-back says that element's text is editable. */
   requestTextEdit: (dedupId: string) => Promise<void>;
   setInsertKind: (kind: InsertKind | null) => void;
+  setAnnotateKind: (kind: AnnotationKind) => void;
+  setAnnotateColor: (color: string) => void;
+  /** Put a finished mark on the canvas. Returns it so the caller can open its
+   * note straight away — drawing a circle and writing what is wrong with it
+   * is one gesture, not two. */
+  addAnnotation: (a: Annotation) => void;
+  setNote: (id: string, note: string) => void;
+  setNoteEditing: (id: string | null) => void;
+  removeAnnotation: (id: string) => void;
   /** Re-send the staged program to the canvas (a frame reloaded). */
   resyncCanvas: () => void;
   /** Discard one staged action by list position (review panel), redoable. */
@@ -585,9 +652,58 @@ interface AppState {
   setAnthropicKey: (key: string) => void;
   /** Detect a coding-agent CLI once per app run. */
   detectAgent: (agent: CliAgent) => Promise<void>;
-  /** Pick the AI backend (persisted). */
-  setAiPref: (pref: CliAgent | "api" | null) => void;
+  /** Switch an agent on or off. On for one never connected runs Connect
+   *  (the live test); off keeps its consent, so on again is instant. */
+  setAgentEnabled: (agent: CliAgent, on: boolean) => Promise<void>;
+  setApiEnabled: (on: boolean) => void;
   setAgentModel: (agent: CliAgent, model: string | null) => void;
+  /** Ask the installed CLI which models it offers, once per app run. */
+  loadAgentModels: (agent: CliAgent) => Promise<void>;
+  /** Export one artboard as a PNG (at `scale`) or a vector PDF, after asking
+   *  where to save it. Renders the page at its real size, off-screen. */
+  exportArtboard: (route: string, format: "png" | "pdf", scale?: number) => Promise<void>;
+  /** The route an export is running for, if any — one at a time. */
+  exporting: string | null;
+  /** Where the user has put each artboard, per viewport id (persisted with
+   *  the canvas). Missing entries fall back to the row — `artboardLayout`. */
+  artboardPos: Record<string, Record<string, Point>>;
+  /** Put an artboard somewhere on the canvas (dragged by its name label). */
+  moveArtboard: (route: string, at: Point) => void;
+  /** Elements dragged off every artboard onto the canvas (see lib/parking). */
+  parked: ParkedPiece[];
+  /** A drag that has left its artboard: where the pointer is on screen and
+   *  which artboard, if any, it is over. Drawn as a ghost by the canvas. */
+  dragOut: { route: string; id: string; label: string; screen: Point; over: string | null } | null;
+  setDragOut: (d: AppState["dragOut"]) => void;
+  /** Drop an element on the empty canvas: stage its removal from its page
+   *  and park it at `at` (surface coordinates). `rect` is where it is on
+   *  screen now, for its picture. */
+  parkElement: (a: {
+    id: string;
+    route: string;
+    element: SelectedElement;
+    at: Point;
+    rect: Rect | null;
+  }) => Promise<void>;
+  /** Drop an element into another artboard: a cut and a paste, staged as one
+   *  gesture by the same rules as ⌘X then ⌘V. */
+  moveAcross: (a: {
+    id: string;
+    element: SelectedElement;
+    drop: { id: string; position: DropPosition };
+  }) => Promise<void>;
+  /** Drop a parked piece into an artboard: a paste of what it holds. */
+  placeParked: (pieceId: string, drop: { id: string; position: DropPosition }) => Promise<void>;
+  moveParked: (pieceId: string, at: Point) => void;
+  deleteParked: (pieceId: string) => void;
+  /** How the last export went, until dismissed. */
+  exportNotice: { text: string; error: boolean; path?: string } | null;
+  dismissExportNotice: () => void;
+  /** Make a project with no git a repository, with its files as the first
+   *  commit. A live preview is set aside for the baseline and put back after,
+   *  so it can then be kept. Resolves to an error message, or null. */
+  setUpGit: () => Promise<string | null>;
+  settingUpGit: boolean;
   /** Consent + live test: verifies Claude Code login and enables it. */
   /** Consent moment: a live round-trip that proves the CLI is installed and
    * signed in. dedup never spends someone's subscription before it passes. */
@@ -676,6 +792,68 @@ async function revertPreview(
 }
 
 /**
+ * Stop a save for the no-git warning when it needs one. dedup's safety model
+ * is a session branch and a commit per change; a folder with no git has
+ * neither, so a save there replaces the user's files in place with nothing in
+ * git to undo it. That is allowed — it is their folder — but only once they
+ * have been told, in so many words, once per session. `run` is how the save
+ * gets back in after they confirm. Returns whether the save must stop here.
+ */
+function needsDirectWriteWarning(
+  set: Setter,
+  get: Getter,
+  files: string[],
+  run: () => void,
+): boolean {
+  const { git, directWriteOk } = get();
+  if (git?.isRepo !== false || directWriteOk) return false;
+  set({ directWritePrompt: { files: [...new Set(files)], run } });
+  return true;
+}
+
+/**
+ * Record a save: a commit on the session branch, or — in a project with no
+ * git, after the warning — nothing more. The write has already landed and
+ * there is no history to put it in; `direct` says so, so nothing downstream
+ * presents a hash that does not exist.
+ */
+async function commitOrDirect(
+  get: Getter,
+  root: string,
+  message: string,
+  paths: string[],
+): Promise<{ branch: string; hash: string; direct: boolean }> {
+  if (get().git?.isRepo === false) return { branch: "", hash: "", direct: true };
+  const [branch, hash] = await commitSession(root, message, paths);
+  return { branch, hash, direct: false };
+}
+
+/**
+ * Put a set-aside preview back on disk exactly as it was: images first (new
+ * files, so they can be taken back if the text write fails), then the text.
+ * The images are re-imported from where the agent left them, under the same
+ * gates — under their final names, so no extension is adapted twice.
+ */
+async function reapplyPreview(root: string, edit: PendingEdit): Promise<string | null> {
+  const imported: string[] = [];
+  try {
+    for (const a of edit.assets) {
+      imported.push((await importAgentAsset(root, a.agent, a.source, a.file)).file);
+    }
+    const res = edit.files.length > 0
+      ? await writeSources(root, edit.files.map((f) => [f.file, f.after] as [string, string]))
+      : { ok: true };
+    if (!res.ok) throw new Error(res.error ?? "write failed");
+    return null;
+  } catch (e) {
+    if (imported.length > 0) {
+      await revertSources(root, imported.map((f) => [f, null] as [string, string | null])).catch(() => {});
+    }
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
  * Rewrite one message in the active chat session — how a proposal records
  * what became of it (accepted with its commit, rejected, superseded). The
  * transcript is the audit trail for AI edits, so an outcome that never got
@@ -701,6 +879,30 @@ function patchChatMessage(
 const KEY_STORAGE = "dedup:anthropic-key";
 const AI_PREF_STORAGE = "dedup:ai-pref";
 const AGENTS_STORAGE = "dedup:cli-agents";
+const API_ON_STORAGE = "dedup:api-enabled";
+
+/** The single backend choice that predates per-agent switches. Read only to
+ *  carry it over: whichever backend was chosen is the one that starts on. */
+function legacyAiPref(): string | null {
+  try {
+    return localStorage.getItem(AI_PREF_STORAGE);
+  } catch {
+    return null;
+  }
+}
+
+/** Whether the API-key backend is switched on. Before the switches existed a
+ *  saved key with no other choice meant "use the key", so that carries over. */
+function loadApiEnabled(): boolean {
+  try {
+    const saved = localStorage.getItem(API_ON_STORAGE);
+    if (saved !== null) return saved === "1";
+    const pref = legacyAiPref();
+    return pref === "api" || (!pref && !!localStorage.getItem(KEY_STORAGE));
+  } catch {
+    return false;
+  }
+}
 const PANEL_WIDTH_STORAGE = "dedup:panel-widths";
 
 /** Panel width bounds. Below the minimum the sidebar's three tabs stop fitting
@@ -726,6 +928,8 @@ function loadAgents(): Record<CliAgent, AgentState> {
     installed: null,
     consent: false,
     model: null,
+    enabled: false,
+    catalog: null,
     connecting: false,
     error: null,
   });
@@ -736,14 +940,21 @@ function loadAgents(): Record<CliAgent, AgentState> {
     const raw = localStorage.getItem(AGENTS_STORAGE);
     if (!raw) return agents;
     const saved = JSON.parse(raw) as Partial<
-      Record<CliAgent, { consent?: unknown; model?: unknown }>
+      Record<CliAgent, { consent?: unknown; model?: unknown; enabled?: unknown }>
     >;
+    const pref = legacyAiPref();
     for (const agent of CLI_AGENTS) {
       const entry = saved[agent.id];
       if (!entry) continue;
       agents[agent.id].consent = entry.consent === true;
       agents[agent.id].model =
         typeof entry.model === "string" && entry.model ? entry.model : null;
+      // Saved before the switches: on only if it was *the* chosen backend,
+      // so nobody finds a second subscription quietly switched on.
+      agents[agent.id].enabled =
+        typeof entry.enabled === "boolean"
+          ? entry.enabled
+          : agents[agent.id].consent && pref === agent.id;
     }
   } catch {
     // A corrupt blob just means everyone reconnects — never a broken app.
@@ -759,7 +970,7 @@ function saveAgentPrefs(agents: Record<CliAgent, AgentState>) {
         Object.fromEntries(
           Object.entries(agents).map(([id, a]) => [
             id,
-            { consent: a.consent, model: a.model },
+            { consent: a.consent, model: a.model, enabled: a.enabled },
           ]),
         ),
       ),
@@ -907,7 +1118,24 @@ function rememberCanvas(s: AppState) {
     sessionModes: s.sessionModes,
     heldRoutes: Object.keys(s.heldRoutes),
     offlineRoutes: Object.keys(s.offlineRoutes),
+    positions: s.artboardPos,
   });
+}
+
+/** Where each open artboard sits on the canvas surface, for the current
+ *  viewport — the one layout every consumer reads (canvas, markup, focus). */
+export function artboardLayout(s: Pick<AppState, "routes" | "artboardPos" | "viewportId">) {
+  const vp = VIEWPORTS.find((v) => v.id === s.viewportId) ?? VIEWPORTS[0];
+  return layoutArtboards(s.routes, s.artboardPos[vp.id], vp.width, PAGE_GAP);
+}
+
+/** Remember this project's marks. Called from each gesture that changes them,
+ * for the same reason the canvas is: a subscription would also fire for the
+ * clear that happens when a project closes, which is dedup tidying up rather
+ * than the user rubbing anything out. */
+function rememberAnnotations(s: AppState) {
+  if (!s.project) return;
+  saveAnnotations(s.project.root, s.annotations);
 }
 
 const chatsKey = (root: string) => `dedup:chats:${root}`;
@@ -1083,7 +1311,7 @@ function stagedValue(
 let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
- * The copy that both ⌘C and ⌘X go through.
+ * Capture one element as a clip, for a copy, a cut or a park.
  *
  * A copied section needs the same two renderings a palette entry has, and they
  * come from the two places that actually know: the *source* from the
@@ -1096,27 +1324,22 @@ let noticeTimer: ReturnType<typeof setTimeout> | null = null;
  * Staged edits inside the copied section are not in it, and that difference is
  * said out loud rather than papered over.
  *
- * Returns whether anything was copied — a cut only deletes if it did.
+ * This captures any element on the canvas — the selection (⌘C/⌘X) or one
+ * being dragged off its page, which is not necessarily selected. `unsaved`
+ * counts the staged edits inside it that the clip does not carry.
  */
-async function copyToClipboard(
+async function captureClip(
   get: () => AppState,
-  set: (partial: Partial<AppState>) => void,
-  cut: boolean,
-): Promise<boolean> {
-  const { selected, project, actions } = get();
-  if (!selected) {
-    get().setNotice("Select something on the canvas first.");
-    return false;
-  }
-  const preview = await requestElementHtml(selected.dedupId);
-  if (!preview) {
-    get().setNotice("Couldn't read that element from the canvas.");
-    return false;
-  }
+  dedupId: string,
+  element: { component: string | null; tag: string },
+): Promise<{ clip: Omit<Clipboard, "cut">; unsaved: number } | { error: string }> {
+  const { project, actions } = get();
+  const preview = await requestElementHtml(dedupId);
+  if (!preview) return { error: "Couldn't read that element from the canvas." };
 
   // A staged insert has no node in any file — its snippet *is* its source, so
   // the edits made to it since have to be folded in exactly as a save would.
-  const staged = pendingInsert(actions, selected.dedupId);
+  const staged = pendingInsert(actions, dedupId);
   if (staged) {
     let snippet = staged.snippet;
     const className = stagedValue(actions, "class", staged.id);
@@ -1125,45 +1348,27 @@ async function copyToClipboard(
       snippet = withAttr(snippet, classAttrFor(staged.lang), className) ?? snippet;
     }
     if (text !== null) snippet = withText(snippet, text) ?? snippet;
-    set({
-      clipboard: {
+    return {
+      clip: {
         snippet,
         lang: staged.lang,
         preview,
         label: staged.label,
         file: staged.target.file,
         refs: [],
-        cut,
       },
-    });
-    get().setNotice(`${cut ? "Cut" : "Copied"} ${staged.label}.`);
-    return true;
+      unsaved: 0,
+    };
   }
 
-  const target = targetOf(selected.dedupId);
-  if (!target || !project) return false;
+  const target = targetOf(dedupId);
+  if (!target || !project) return { error: "That element can't be copied." };
   const result = await copyElement(project.root, target.file, target.index).catch(
     (e) => ({ ok: false, error: String(e instanceof Error ? e.message : e) }) as const,
   );
   if (!result.ok || !("snippet" in result) || !result.snippet || !result.lang) {
-    get().setNotice(
-      ("error" in result && result.error) || "That element can't be copied.",
-    );
-    return false;
+    return { error: ("error" in result && result.error) || "That element can't be copied." };
   }
-
-  const label = labelOfElement(selected);
-  set({
-    clipboard: {
-      snippet: result.snippet,
-      lang: result.lang,
-      preview,
-      label,
-      file: target.file,
-      refs: result.refs ?? [],
-      cut,
-    },
-  });
 
   // Ordinals the copy swallowed, from the same parse that produced it — an
   // exact answer to "is there staged work in here?", which the DOM cannot give
@@ -1173,13 +1378,157 @@ async function copyToClipboard(
   const unsaved = actions.filter(
     (a) => a.target.file === target.file && inside.has(a.target.index),
   ).length;
+  return {
+    clip: {
+      snippet: result.snippet,
+      lang: result.lang,
+      preview,
+      label: labelOfElement(element),
+      file: target.file,
+      refs: result.refs ?? [],
+    },
+    unsaved,
+  };
+}
+
+/**
+ * Stage a paste of `clip` at `target`/`position` — what ⌘V, dropping a
+ * parked piece and dragging between artboards all go through, so every way of
+ * putting markup somewhere obeys the same rules. Returns the pending insert's
+ * id, or null when it was refused (and the notice says why).
+ */
+async function stagePaste(
+  get: () => AppState,
+  clip: Omit<Clipboard, "cut">,
+  target: EditTarget,
+  position: DropPosition,
+  verb: string,
+  gesture?: string,
+): Promise<string | null> {
+  const { project } = get();
+  // One language per file, and no translation exists for an arbitrary
+  // subtree — see SnippetLang. Refused here, where the user can still see
+  // what they aimed at, rather than at save time.
+  const destLang = isHtmlFile(target.file) ? "html" : "jsx";
+  if (clip.lang !== destLang) {
+    get().setNotice(
+      destLang === "html"
+        ? "That came from a React component — this page is plain HTML."
+        : "That came from an HTML page — this file is a React component.",
+    );
+    return null;
+  }
+
+  // Names the snippet reads but does not carry: a `<Card title={title} />`
+  // needs both wherever it lands. dedup cannot resolve bindings from here,
+  // so it asks the one question it can answer for certain — does the
+  // destination file mention this name at all? A no is proof; a yes proves
+  // nothing and is left alone. Said out loud rather than refused, because
+  // the paste is staged and undoable and the user can see the result.
+  let missing: string[] = [];
+  if (clip.refs.length > 0 && project && target.file !== clip.file) {
+    try {
+      const code = await readSource(project.root, target.file);
+      missing = clip.refs.filter(
+        (name) => !new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(code),
+      );
+    } catch {
+      // Couldn't read it — say nothing rather than guess.
+    }
+  }
+
+  const id = `${PENDING_PREFIX}${crypto.randomUUID()}`;
+  if (
+    !get().stage({
+      kind: "insert",
+      id,
+      target,
+      position,
+      snippet: clip.snippet,
+      lang: clip.lang,
+      preview: clip.preview,
+      label: clip.label,
+      gesture,
+    })
+  ) {
+    // Refused — the anchor is on its way out. Whatever was being pasted keeps
+    // its contents, so it can be put somewhere that still exists.
+    return null;
+  }
   get().setNotice(
-    unsaved > 0
-      ? `${cut ? "Cut" : "Copied"} ${label} as it is saved — ${unsaved} unsaved edit${
-          unsaved === 1 ? "" : "s"
-        } inside it ${unsaved === 1 ? "isn't" : "aren't"} included.`
-      : `${cut ? "Cut" : "Copied"} ${label}.`,
+    missing.length > 0
+      ? `${verb} ${clip.label} — but ${target.file.split("/").pop()} has no ${missing
+          .slice(0, 3)
+          .join(", ")}, so it won't build until you add ${missing.length === 1 ? "it" : "them"}.`
+      : `${verb} ${clip.label}.`,
   );
+  return id;
+}
+
+/** Where a drop next to `id` lands in source. A pending insert has no node of
+ *  its own to aim at, so a drop beside one reuses the anchor it used — the
+ *  same rule as pasting twice in a row. */
+function dropAnchor(
+  actions: EditAction[],
+  id: string,
+  position: DropPosition,
+): { target: EditTarget; position: DropPosition } | null {
+  const staged = pendingInsert(actions, id);
+  if (staged) return { target: staged.target, position: staged.position };
+  const target = targetOf(id);
+  return target ? { target, position } : null;
+}
+
+/** Stage the removal of one element by id (selected or not). Returns whether
+ *  it was staged. A selection on it is dropped, since it leaves the canvas. */
+function stageRemoval(
+  get: () => AppState,
+  set: (partial: Partial<AppState>) => void,
+  dedupId: string,
+  label: string,
+  gesture?: string,
+): boolean {
+  const target = targetOf(dedupId);
+  if (!target) return false;
+  if (!get().stage({ kind: "remove", target, label, gesture })) return false;
+  if (get().selected?.dedupId === dedupId) {
+    set({ selected: null, sourceInfo: null });
+    sendToOverlay({ type: "clear" });
+  }
+  return true;
+}
+
+/** How a capture reads in a notice: what it was, and what it leaves behind. */
+function captureNotice(verb: string, label: string, unsaved: number): string {
+  return unsaved > 0
+    ? `${verb} ${label} as it is saved — ${unsaved} unsaved edit${
+        unsaved === 1 ? "" : "s"
+      } inside it ${unsaved === 1 ? "isn't" : "aren't"} included.`
+    : `${verb} ${label}.`;
+}
+
+/**
+ * The copy that both ⌘C and ⌘X go through: capture the selection onto
+ * dedup's clipboard. Returns whether anything was copied — a cut only deletes
+ * if it did.
+ */
+async function copyToClipboard(
+  get: () => AppState,
+  set: (partial: Partial<AppState>) => void,
+  cut: boolean,
+): Promise<boolean> {
+  const { selected } = get();
+  if (!selected) {
+    get().setNotice("Select something on the canvas first.");
+    return false;
+  }
+  const captured = await captureClip(get, selected.dedupId, selected);
+  if ("error" in captured) {
+    get().setNotice(captured.error);
+    return false;
+  }
+  set({ clipboard: { ...captured.clip, cut } });
+  get().setNotice(captureNotice(cut ? "Cut" : "Copied", captured.clip.label, captured.unsaved));
   return true;
 }
 
@@ -1240,6 +1589,22 @@ function patchMerge(set: Setter, get: Getter, patch: Partial<MergeSession>) {
   const current = get().merge;
   if (!current) return;
   set({ merge: { ...current, ...patch } });
+}
+
+/** An agent the user has connected (a live round-trip, not just installed) —
+ *  the only kind a message may be sent to, by mention or by default. */
+function agentConnected(state: AppState, agent: CliAgent): boolean {
+  return agentOn(state.agents[agent]);
+}
+
+/** The connected agent that can generate images on another's behalf, if any.
+ *  First in CLI_AGENTS order, so the answer is stable rather than whichever
+ *  was connected last. */
+function imageAgent(state: AppState): CliAgent | null {
+  return (
+    CLI_AGENTS.find((a) => a.generatesAssets && agentConnected(state, a.id))?.id ??
+    null
+  );
 }
 
 /** The AI backend the user explicitly chose, or null (never a silent one). */
@@ -1334,9 +1699,15 @@ export const useStore = create<AppState>((set, get) => ({
   redoStack: [],
   draggingId: null,
   insertKind: null,
+  annotations: [],
+  annotateKind: "ellipse",
+  annotateColor: PENS[0],
+  noteEditing: null,
   clipboard: null,
   saving: false,
   lastSave: null,
+  directWriteOk: false,
+  directWritePrompt: null,
   saveError: null,
   notice: null,
 
@@ -1345,6 +1716,7 @@ export const useStore = create<AppState>((set, get) => ({
   chatSessions: [],
   activeChatId: null,
   chatBusy: false,
+  chatActivity: null,
   pendingEdit: null,
   scanning: false,
   scanProgress: null,
@@ -1375,10 +1747,13 @@ export const useStore = create<AppState>((set, get) => ({
   categorizeError: null,
   anthropicKey: localStorage.getItem(KEY_STORAGE) ?? "",
   agents: loadAgents(),
-  aiPref:
-    (localStorage.getItem(AI_PREF_STORAGE) as CliAgent | "api" | null) ??
-    // Existing key users keep working without re-choosing.
-    (localStorage.getItem(KEY_STORAGE) ? "api" : null),
+  apiEnabled: loadApiEnabled(),
+  settingUpGit: false,
+  exporting: null,
+  exportNotice: null,
+  parked: [],
+  dragOut: null,
+  artboardPos: {},
   panelWidths: loadPanelWidths(),
 
   merge: null,
@@ -1387,6 +1762,16 @@ export const useStore = create<AppState>((set, get) => ({
   trash: [],
 
   enterEditor: (project, git, customCommand = null) => {
+    // Parked canvas pieces come back too — after the reset below has cleared
+    // the last project's, and only into the project that asked for them.
+    void loadParked(project.root)
+      .then((raw) => {
+        if (useStore.getState().project?.root === project.root) {
+          parkedLoaded = project.root;
+          useStore.setState({ parked: sanitizeParked(raw) });
+        }
+      })
+      .catch(() => {});
     // Past chats come back with the project; land on the most recent one.
     const chatSessions = loadChatSessions(project.root);
     // So does the canvas — but it cannot be mounted until there is a dev
@@ -1400,6 +1785,10 @@ export const useStore = create<AppState>((set, get) => ({
       chatSessions,
       activeChatId: chatSessions[chatSessions.length - 1]?.id ?? null,
       chatBusy: false,
+      chatActivity: null,
+      parked: [],
+      dragOut: null,
+      artboardPos: {},
       pendingEdit: null,
       scanning: false,
       scanProgress: null,
@@ -1462,10 +1851,16 @@ export const useStore = create<AppState>((set, get) => ({
       redoStack: [],
       draggingId: null,
       insertKind: null,
+      // Marks come back with the project — they are notes about pages, and
+      // the pages are about to be restored under them.
+      annotations: loadAnnotations(project.root),
+      noteEditing: null,
       // A copied snippet is a piece of one project's source; carrying it into
       // another one would paste markup from a codebase that isn't open.
       clipboard: null,
       lastSave: null,
+      directWriteOk: false,
+      directWritePrompt: null,
       saveError: null,
       notice: null,
       merge: null,
@@ -1488,6 +1883,10 @@ export const useStore = create<AppState>((set, get) => ({
       chatSessions: [],
       activeChatId: null,
       chatBusy: false,
+      chatActivity: null,
+      parked: [],
+      dragOut: null,
+      artboardPos: {},
       pendingEdit: null,
       scanning: false,
       scanProgress: null,
@@ -1550,10 +1949,14 @@ export const useStore = create<AppState>((set, get) => ({
       redoStack: [],
       draggingId: null,
       insertKind: null,
+      annotations: [],
+      noteEditing: null,
       // A copied snippet is a piece of one project's source; carrying it into
       // another one would paste markup from a codebase that isn't open.
       clipboard: null,
       lastSave: null,
+      directWriteOk: false,
+      directWritePrompt: null,
       saveError: null,
       notice: null,
     });
@@ -1581,6 +1984,7 @@ export const useStore = create<AppState>((set, get) => ({
       // asking for it again every morning is the same thing from the other
       // side.
       routes: restore?.routes ?? [],
+      artboardPos: restore?.positions ?? {},
       detectedRoutes: null,
       pageHeights: {},
       layers: {},
@@ -1657,7 +2061,12 @@ export const useStore = create<AppState>((set, get) => ({
   setTool: (tool) => {
     // Browse mode hands clicks back to the app — an active selection would
     // just be stale UI over a page the user is now navigating.
-    if (tool === "browse") get().clearSelection();
+    // Annotate clears it for the mirror-image reason: its capture layer sits
+    // over the frames, so the selection box and its resize grips would still
+    // be drawn on an element no gesture can reach any more.
+    if (tool === "browse" || tool === "annotate") get().clearSelection();
+    // A note left open belongs to the tool that opened it.
+    if (tool !== "annotate" && get().noteEditing) set({ noteEditing: null });
     // Leaving the text tool takes the caret off the canvas with it; a caret
     // still blinking in a page you are now panning is a lie about the mode.
     if (tool !== "text" && get().textEditing) {
@@ -1719,6 +2128,12 @@ export const useStore = create<AppState>((set, get) => ({
 
     set({
       routes,
+      // Its place on the canvas too, in every viewport: reopened later, it
+      // joins the end of the layout rather than reclaiming a spot that the
+      // pages around it may since have moved into.
+      artboardPos: Object.fromEntries(
+        Object.entries(s.artboardPos).map(([vp, byRoute]) => [vp, drop(byRoute)]),
+      ),
       pageHeights: drop(s.pageHeights),
       pagePaths: drop(s.pagePaths),
       layers: drop(s.layers),
@@ -1755,11 +2170,12 @@ export const useStore = create<AppState>((set, get) => ({
     // page I'm working on", and Scan needs a target — so it becomes one,
     // without ever overriding a choice the user made on the canvas.
     if (!wasOpen && !s.selectedRoute) set({ selectedRoute: path });
-    const vp = VIEWPORTS.find((v) => v.id === s.viewportId)!;
     // Same clearance the initial pan uses: the focused artboard has to land
-    // beside the floating sidebar and below the top bar, not under them.
+    // beside the floating sidebar and below the top bar, not under them —
+    // wherever the user has put it.
+    const at = artboardLayout(s)[path] ?? { x: 0, y: 0 };
     set({
-      pan: { x: -(idx * (vp.width + PAGE_GAP)) * s.zoom + 232, y: 120 },
+      pan: { x: -at.x * s.zoom + 232, y: 120 - at.y * s.zoom },
     });
     rememberCanvas(get());
   },
@@ -1989,7 +2405,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!backend) {
       set({
         sessionError:
-          "No AI backend connected — choose one in the AI switch (top bar), or write the seed by hand.",
+          "No AI backend is on — switch one on in the AI menu (top bar), or write the seed by hand.",
       });
       return;
     }
@@ -2060,13 +2476,17 @@ export const useStore = create<AppState>((set, get) => ({
     const { project, codePanel } = get();
     if (!project || !codePanel || codePanel.saving) return;
     if (codePanel.draft === codePanel.original) return;
+    if (needsDirectWriteWarning(set, get, [codePanel.file], () => void get().saveCode())) {
+      return;
+    }
     set({ codePanel: { ...codePanel, saving: true, error: null } });
     try {
       // Same gate as the AI chat's writes: the sidecar re-parses strictly and
       // refuses anything that doesn't, so a half-typed edit can't land.
       const res = await writeSource(project.root, codePanel.file, codePanel.draft);
       if (!res.ok) throw new Error(res.error ?? "the file could not be written");
-      const [, hash] = await commitSession(
+      const { hash, direct } = await commitOrDirect(
+        get,
         project.root,
         `dedup: edit ${codePanel.file}`,
         [codePanel.file],
@@ -2082,7 +2502,7 @@ export const useStore = create<AppState>((set, get) => ({
           },
         });
       }
-      set({ lastSave: { branch: "", hash } });
+      set({ lastSave: { branch: "", hash, direct } });
       gitStatus(project.root).then((g) => set({ git: g })).catch(() => {});
       // A hand edit can add or remove elements, which renumbers the ordinals
       // every dedup id is built from — the canvas must re-read its tags.
@@ -2426,7 +2846,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   pasteClipboard: async () => {
-    const { clipboard, selected, sourceInfo, actions, project } = get();
+    const { clipboard, selected, sourceInfo, actions } = get();
     if (!clipboard) {
       get().setNotice("Nothing to paste — copy something on the canvas first.");
       return;
@@ -2467,64 +2887,8 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
 
-    // One language per file, and no translation exists for an arbitrary
-    // subtree — see SnippetLang. Refused here, where the user can still see
-    // what they aimed at, rather than at save time.
-    const destLang = isHtmlFile(target.file) ? "html" : "jsx";
-    if (clipboard.lang !== destLang) {
-      get().setNotice(
-        destLang === "html"
-          ? "That was copied from a React component — this page is plain HTML."
-          : "That was copied from an HTML page — this file is a React component.",
-      );
-      return;
-    }
-
-    // Names the snippet reads but does not carry: a `<Card title={title} />`
-    // needs both wherever it lands. dedup cannot resolve bindings from here,
-    // so it asks the one question it can answer for certain — does the
-    // destination file mention this name at all? A no is proof; a yes proves
-    // nothing and is left alone. Said out loud rather than refused, because
-    // the paste is staged and undoable and the user can see the result.
-    let missing: string[] = [];
-    if (clipboard.refs.length > 0 && project && target.file !== clipboard.file) {
-      try {
-        const code = await readSource(project.root, target.file);
-        missing = clipboard.refs.filter(
-          (name) => !new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(code),
-        );
-      } catch {
-        // Couldn't read it — say nothing rather than guess.
-      }
-    }
-
-    const id = `${PENDING_PREFIX}${crypto.randomUUID()}`;
-    if (
-      !get().stage({
-        kind: "insert",
-        id,
-        target,
-        position,
-        snippet: clipboard.snippet,
-        lang: clipboard.lang,
-        preview: clipboard.preview,
-        label: clipboard.label,
-      })
-    ) {
-      // Refused — the anchor is on its way out. The clipboard keeps its
-      // contents, so the paste can be repeated somewhere that still exists.
-      return;
-    }
-    get().selectById(id);
-    get().setNotice(
-      missing.length > 0
-        ? `Pasted ${clipboard.label} — but ${target.file.split("/").pop()} has no ${missing
-            .slice(0, 3)
-            .join(", ")}, so it won't build until you add ${
-            missing.length === 1 ? "it" : "them"
-          }.`
-        : `Pasted ${clipboard.label}.`,
-    );
+    const id = await stagePaste(get, clipboard, target, position, "Pasted");
+    if (id) get().selectById(id);
   },
 
   setNotice: (message) => {
@@ -2600,6 +2964,42 @@ export const useStore = create<AppState>((set, get) => ({
     });
   },
 
+  setAnnotateKind: (annotateKind) => set({ annotateKind }),
+
+  setAnnotateColor: (annotateColor) => set({ annotateColor }),
+
+  addAnnotation: (a) => {
+    set((s) => ({
+      annotations:
+        s.annotations.length >= MAX_ANNOTATIONS
+          ? s.annotations
+          : [...s.annotations, a],
+      // Straight into the note: the mark and the words are one thought, and
+      // an empty shape is a pointer at nothing.
+      noteEditing: a.id,
+    }));
+    rememberAnnotations(get());
+  },
+
+  setNote: (id, note) => {
+    set((s) => ({
+      annotations: s.annotations.map((a) =>
+        a.id === id ? { ...a, note: note.slice(0, MAX_NOTE) } : a,
+      ),
+    }));
+    rememberAnnotations(get());
+  },
+
+  setNoteEditing: (noteEditing) => set({ noteEditing }),
+
+  removeAnnotation: (id) => {
+    set((s) => ({
+      annotations: s.annotations.filter((a) => a.id !== id),
+      noteEditing: s.noteEditing === id ? null : s.noteEditing,
+    }));
+    rememberAnnotations(get());
+  },
+
   resyncCanvas: () => syncCanvas(get().actions),
 
   revertAction: (index) => {
@@ -2633,21 +3033,17 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   undo: () => {
-    const { actions, redoStack } = get();
-    const top = actions[actions.length - 1];
-    if (!top) return;
-    const next = actions.slice(0, -1);
-    set({ actions: next, redoStack: [...redoStack, top] });
-    syncCanvas(next);
+    const step = undoStep(get().actions, get().redoStack);
+    if (!step) return;
+    set({ actions: step.actions, redoStack: step.redo });
+    syncCanvas(step.actions);
   },
 
   redo: () => {
-    const { actions, redoStack } = get();
-    const top = redoStack[redoStack.length - 1];
-    if (!top) return;
-    const next = [...actions, top];
-    set({ actions: next, redoStack: redoStack.slice(0, -1) });
-    syncCanvas(next);
+    const step = redoStep(get().actions, get().redoStack);
+    if (!step) return;
+    set({ actions: step.actions, redoStack: step.redo });
+    syncCanvas(step.actions);
   },
 
   saveAll: async () => {
@@ -2658,6 +3054,13 @@ export const useStore = create<AppState>((set, get) => ({
       (a) => !isValueAction(a) || a.before !== a.after,
     );
     if (dirty.length === 0) return;
+    if (
+      needsDirectWriteWarning(set, get, dirty.map((a) => a.target.file), () =>
+        void get().saveAll(),
+      )
+    ) {
+      return;
+    }
 
     set({ saving: true, saveError: null });
     try {
@@ -2678,17 +3081,17 @@ export const useStore = create<AppState>((set, get) => ({
       }
 
       const message = `dedup: ${describeProgram(dirty)}`;
-      const [branch, hash] = await commitSession(
-        project.root,
-        message,
-        [...byFile.keys()],
-      );
+      const saved = await commitOrDirect(get, project.root, message, [...byFile.keys()]);
 
       syncCanvas([]);
       set({
         actions: [],
         redoStack: [],
-        lastSave: { branch, hash },
+        lastSave: saved,
+        // In the same update as the program emptying: settled afterwards,
+        // the reconcile would see every removal gone and drop the pieces —
+        // which by now are the only copy (see lib/parking).
+        parked: settleParked(get().parked),
       });
       // Structural edits renumber the ordinals of everything after them in the
       // file, so the canvas must re-read its tags rather than trust the DOM it
@@ -2749,10 +3152,21 @@ export const useStore = create<AppState>((set, get) => ({
     const { project, selected, chatBusy } = get();
     const text = instruction.trim();
     if (!project || !text || chatBusy) return;
+    // `@claude` / `@codex` sends this one message to that agent — both can be
+    // connected, so who answers is a property of the message rather than a
+    // mode to flip. The mention is the user's words (kept in the transcript)
+    // but not the model's instruction (taken out of the prompt).
+    const { agent: mentioned, instruction: ask } = routeMention(text);
+    if (!ask) return; // a bare "@codex" asks nothing
+
+    // Who is answering this turn, stamped on every reply it produces. Set once
+    // the backend is known; the user's own message never carries it.
+    let by: CliAgent | "api" | undefined;
 
     // Append to the active session, materializing a new one on first use.
     // Returns the message's id so a proposal can be resolved onto it later.
     const push = (m: Omit<ChatMessage, "id">): string => {
+      if (m.role === "assistant" && by) m = { ...m, agent: by };
       const messageId = crypto.randomUUID();
       set((s) => {
         let sessions = s.chatSessions;
@@ -2775,13 +3189,27 @@ export const useStore = create<AppState>((set, get) => ({
       return messageId;
     };
 
+    // A mention picks the agent; without one, the top-bar default answers.
+    const kind = mentioned ?? get().activeAiBackend();
+    const agentLabel = (k: CliAgent | "api") =>
+      k === "api" ? "Claude (API key)" : (CLI_AGENTS.find((a) => a.id === k)?.label ?? k);
+
     // Conversation memory: prior turns of this session (texts only — files
-    // always go in fresh), captured before this message lands.
+    // always go in fresh), captured before this message lands. A reply some
+    // *other* agent wrote is labelled as such: the transcript otherwise hands
+    // it over as "You:", and a model defending a choice it never made is
+    // worse at the follow-up than one that knows a colleague made it.
     const active = get().chatSessions.find((x) => x.id === get().activeChatId);
     const history: ChatTurn[] = (active?.messages ?? [])
       .filter((m) => !m.error)
       .slice(-12)
-      .map((m) => ({ role: m.role, text: m.text }));
+      .map((m) => ({
+        role: m.role,
+        text:
+          m.role === "assistant" && m.agent && kind && m.agent !== kind
+            ? `(${agentLabel(m.agent)}, another assistant in this chat, replied:) ${m.text}`
+            : m.text,
+      }));
 
     const src = selected ? targetOf(selected.dedupId) : null;
     push({
@@ -2793,7 +3221,19 @@ export const useStore = create<AppState>((set, get) => ({
           : undefined,
     });
 
-    const kind = get().activeAiBackend();
+    // A mention is a request for that agent specifically, so it is answered
+    // by that agent or not at all — quietly handing the message to the
+    // default instead would be the silent backend the AI switch exists to
+    // rule out.
+    if (mentioned && !agentConnected(get(), mentioned)) {
+      push({
+        role: "assistant",
+        error: true,
+        text: `${agentLabel(mentioned)} is off — switch it on in the AI menu (top bar), then send again.`,
+      });
+      return;
+    }
+    by = kind ?? undefined;
     const backend =
       kind && kind !== "api"
         ? {
@@ -2808,7 +3248,7 @@ export const useStore = create<AppState>((set, get) => ({
       push({
         role: "assistant",
         error: true,
-        text: "No AI backend connected — choose one in the AI switch (top bar).",
+        text: "No AI backend is on — switch one on in the AI menu (top bar).",
       });
       return;
     }
@@ -2893,22 +3333,31 @@ export const useStore = create<AppState>((set, get) => ({
           ? ((await listProjectFiles(project.root)).files ?? null)
           : null;
 
+      // Only a CLI backend generates files, and only some of them do — a
+      // model told about a directive dedup would refuse for it would reach
+      // for it and then have to explain itself to the user. One that can't
+      // is offered the next best thing when it exists: a connected agent that
+      // can, asked on its behalf.
+      const generates =
+        backend.kind === "cli" &&
+        (CLI_AGENTS.find((a) => a.id === backend.agent)?.generatesAssets ?? false);
+      const painter = generates ? null : imageAgent(get());
       const system = systemPromptFor(
         attachments[0]?.file ?? null,
         project.framework === "static",
-        // Only a CLI backend generates files, and only some of them do — a
-        // model told about a directive dedup would refuse for it would reach
-        // for it and then have to explain itself to the user.
-        backend.kind === "cli" &&
-          (CLI_AGENTS.find((a) => a.id === backend.agent)?.generatesAssets ?? false),
+        generates,
+        painter ? agentLabel(painter) : null,
       );
       let prompt = buildTurnPrompt({
         instruction: staleSelection
-          ? `${text}\n\n(The canvas selection is out of date — the file changed since the user clicked. Re-read the file above rather than trusting any line number.)`
-          : text,
+          ? `${ask}\n\n(The canvas selection is out of date — the file changed since the user clicked. Re-read the file above rather than trusting any line number.)`
+          : ask,
         attachments,
         inventory,
         framework: project.framework,
+        // Only marks on pages that are actually open: a note about a page the
+        // user closed three sessions ago is not what they are pointing at now.
+        notes: annotationNotes(get().annotations, get().routes),
       });
       let turns = history;
       let reply: ChatReply | null = null;
@@ -2990,20 +3439,37 @@ export const useStore = create<AppState>((set, get) => ({
         });
         return;
       }
+      // Images it asked another agent to generate. Answered only by a
+      // connected agent that makes them; the prompt only offers the directive
+      // when there is one, but the connection can change mid-turn.
+      const images = reply.kind === "blocks" ? reply.images : [];
+      const imagePainter = images.length > 0 ? imageAgent(get()) : null;
+      if (images.length > 0 && !imagePainter) {
+        push({
+          role: "assistant",
+          error: true,
+          tools,
+          text: "The AI asked for a generated image, but no connected agent can make one — connect Codex and ask again. Nothing was changed.",
+        });
+        return;
+      }
+
       // A destination the same reply also writes as text is two answers to
-      // one question; neither can be the right one.
-      const clashing = assets.find((a) => program.has(a.file));
+      // one question; neither can be the right one. Checked on destinations,
+      // before anything is generated, because generating is the slow part.
+      const destinations = [...assets, ...images].map((a) => a.file);
+      const clashing = destinations.find((d) => program.has(d));
       if (clashing) {
         push({
           role: "assistant",
           error: true,
           tools,
-          text: `The AI tried to both write and import ${clashing.file} — nothing was changed.`,
+          text: `The AI tried to both write and import ${clashing} — nothing was changed.`,
         });
         return;
       }
 
-      if (files.length === 0 && assets.length === 0) {
+      if (files.length === 0 && destinations.length === 0) {
         push({
           role: "assistant",
           tools,
@@ -3011,6 +3477,7 @@ export const useStore = create<AppState>((set, get) => ({
         });
         return;
       }
+
 
       // A file rewrite renumbers the ordinals this file's staged style edits
       // are addressed by. Checked here rather than before the prompt, because
@@ -3028,6 +3495,53 @@ export const useStore = create<AppState>((set, get) => ({
         return;
       }
 
+      // Every import, and whose output it is. The agent matters: `asset.rs`
+      // only fetches from *that agent's* output directory, so a delegated
+      // image is checked exactly as if the user had asked that agent
+      // directly — delegating adds a conversation, not a way in.
+      // `delegated` marks a destination the requester named before the image
+      // existed — the one case where the import may correct the extension.
+      const imports: {
+        file: string;
+        source: string;
+        agent: CliAgent;
+        delegated: boolean;
+      }[] = assets.map((a) => ({
+        ...a,
+        agent: (backend as { agent: CliAgent }).agent,
+        delegated: false,
+      }));
+      if (imagePainter) {
+        const name = agentLabel(imagePainter);
+        for (const img of images) {
+          toolTrace.push(`@${mentionAlias(imagePainter)} image ${img.file}`);
+          set({ chatActivity: `${name} is generating ${img.file}…` });
+          try {
+            const raw = await agentPrompt(
+              imagePainter,
+              imageRequestPrompt(img.file, img.prompt),
+              get().agents[imagePainter].model,
+            );
+            imports.push({
+              file: img.file,
+              source: pickGeneratedImage(raw),
+              agent: imagePainter,
+              delegated: true,
+            });
+          } catch (e) {
+            push({
+              role: "assistant",
+              error: true,
+              tools: [...toolTrace],
+              text: `Asked ${name} for ${img.file}, but ${String(e instanceof Error ? e.message : e)} — nothing was changed.`,
+            });
+            return;
+          } finally {
+            set({ chatActivity: null });
+          }
+        }
+      }
+
       // One unresolved proposal at a time. The new one was computed against
       // file contents the old one put on disk, so keeping both would mean
       // keeping one that is quietly wrong — and the old preview has to come
@@ -3041,9 +3555,11 @@ export const useStore = create<AppState>((set, get) => ({
       const messageId = push({
         role: "assistant",
         text: reply.summary,
-        tools,
+        // Read again rather than reusing `tools`: a delegated image added its
+        // line to the trace after that was taken.
+        tools: toolTrace.length > 0 ? [...toolTrace] : undefined,
         proposal: {
-          files: [...files.map((f) => f.file), ...assets.map((a) => a.file)],
+          files: [...files.map((f) => f.file), ...imports.map((a) => a.file)],
           summary: reply.summary,
         },
       });
@@ -3063,15 +3579,23 @@ export const useStore = create<AppState>((set, get) => ({
           ).catch(() => {});
         }
       };
-      for (const a of assets) {
+      // The text the preview will write. Not `files` itself: a delegated image
+      // that lands under a corrected name has its references renamed here.
+      let toWrite = files;
+      for (const a of imports) {
         try {
           const done = await importAgentAsset(
             project.root,
-            (backend as { agent: CliAgent }).agent,
+            a.agent,
             a.source,
             a.file,
+            a.delegated,
           );
           imported.push(done.file);
+          if (done.file !== a.file) {
+            toWrite = retargetReferences(toWrite, a.file, done.file);
+            a.file = done.file;
+          }
         } catch (e) {
           await undoImports();
           patchChatMessage(set, messageId, { outcome: "rejected" });
@@ -3087,10 +3611,10 @@ export const useStore = create<AppState>((set, get) => ({
       // Show it. A diff says what changed; the canvas says how it looks, and
       // looking is why dedup renders the app at all. The write is parse-gated
       // and uncommitted — Apply commits it, Discard puts the files back.
-      const res = files.length > 0
+      const res = toWrite.length > 0
         ? await writeSources(
             project.root,
-            files.map((f) => [f.file, f.after] as [string, string]),
+            toWrite.map((f) => [f.file, f.after] as [string, string]),
           )
         : { ok: true };
       if (!res.ok) {
@@ -3103,8 +3627,24 @@ export const useStore = create<AppState>((set, get) => ({
         });
         return;
       }
+      // A renamed image changes what the proposal names, so the message says
+      // what is actually on disk rather than what was first asked for.
+      if (imports.some((a) => a.delegated)) {
+        patchChatMessage(set, messageId, {
+          proposal: {
+            files: [...toWrite.map((f) => f.file), ...imports.map((a) => a.file)],
+            summary: reply.summary,
+          },
+        });
+      }
       set({
-        pendingEdit: { messageId, summary: reply.summary, files, assets, previewing: true },
+        pendingEdit: {
+          messageId,
+          summary: reply.summary,
+          files: toWrite,
+          assets: imports.map(({ file, source, agent }) => ({ file, source, agent })),
+          previewing: true,
+        },
       });
       gitStatus(project.root)
         .then((g) => set({ git: g }))
@@ -3121,7 +3661,7 @@ export const useStore = create<AppState>((set, get) => ({
         text: String(e instanceof Error ? e.message : e),
       });
     } finally {
-      set({ chatBusy: false });
+      set({ chatBusy: false, chatActivity: null });
       // However the turn ended — answered, refused, or thrown — the canvas
       // must stop claiming work is under way. In the `finally` for exactly
       // that reason: an error path that left the squares running would be a
@@ -3138,6 +3678,16 @@ export const useStore = create<AppState>((set, get) => ({
   acceptChatEdit: async () => {
     const { project, pendingEdit, chatBusy } = get();
     if (!project || !pendingEdit || chatBusy) return;
+    if (
+      needsDirectWriteWarning(
+        set,
+        get,
+        [...pendingEdit.files.map((f) => f.file), ...pendingEdit.assets.map((a) => a.file)],
+        () => void get().acceptChatEdit(),
+      )
+    ) {
+      return;
+    }
 
     const push = (m: Omit<ChatMessage, "id">) =>
       set((s) => {
@@ -3169,16 +3719,18 @@ export const useStore = create<AppState>((set, get) => ({
         );
         if (!res.ok) throw new Error(res.error ?? "write failed");
       }
-      const [branch, hash] = await commitSession(
+      const saved = await commitOrDirect(
+        get,
         project.root,
         `dedup: ${pendingEdit.summary}`,
         paths,
       );
       patchChatMessage(set, pendingEdit.messageId, {
-        commit: hash,
+        commit: saved.direct ? undefined : saved.hash,
+        writtenInPlace: saved.direct || undefined,
         outcome: "accepted",
       });
-      set({ lastSave: { branch, hash }, pendingEdit: null });
+      set({ lastSave: saved, pendingEdit: null });
       gitStatus(project.root)
         .then((g) => set({ git: g }))
         .catch(() => {});
@@ -3451,7 +4003,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!backend) {
       set({
         driftProposalError:
-          "No AI backend connected — choose one in the AI switch (top bar).",
+          "No AI backend is on — switch one on in the AI menu (top bar).",
       });
       return;
     }
@@ -3534,19 +4086,279 @@ export const useStore = create<AppState>((set, get) => ({
     patchAgent(set, get, agent, { installed });
   },
 
-  setAiPref: (aiPref) => {
-    try {
-      if (aiPref) localStorage.setItem(AI_PREF_STORAGE, aiPref);
-      else localStorage.removeItem(AI_PREF_STORAGE);
-    } catch {
-      // In-memory pref still applies this session.
+  setAgentEnabled: async (agent, on) => {
+    if (!on) {
+      patchAgent(set, get, agent, { enabled: false });
+      saveAgentPrefs(get().agents);
+      return;
     }
-    set({ aiPref });
+    // Never connected: switching on *is* the consent moment, so it is the
+    // live test — and the switch only lands on if the test passes.
+    if (!get().agents[agent].consent) {
+      await get().connectAgent(agent);
+      return;
+    }
+    patchAgent(set, get, agent, { enabled: true, error: null });
+    saveAgentPrefs(get().agents);
+  },
+
+  setApiEnabled: (apiEnabled) => {
+    try {
+      localStorage.setItem(API_ON_STORAGE, apiEnabled ? "1" : "0");
+    } catch {
+      // In-memory switch still applies this session.
+    }
+    set({ apiEnabled });
   },
 
   setAgentModel: (agent, model) => {
     patchAgent(set, get, agent, { model });
     saveAgentPrefs(get().agents);
+  },
+
+  exportArtboard: async (route, format, scale = 1) => {
+    const s = get();
+    if (!s.project || s.exporting) return;
+    const viewport = VIEWPORTS.find((v) => v.id === s.viewportId) ?? VIEWPORTS[0];
+    // Exactly the frame the artboard loads — same origin (session), same
+    // flags (held, offline) — and exactly its size.
+    const url = artboardUrl(
+      route,
+      {
+        sessionModes: s.sessionModes,
+        frameOrigins: s.frameOrigins,
+        devUrl: s.devUrl,
+        devAltUrl: s.devAltUrl,
+      },
+      { held: !!s.heldRoutes[route], offline: !!s.offlineRoutes[route] },
+    );
+    if (!url) {
+      set({ exportNotice: { text: "The dev server isn't running, so there is nothing to export yet.", error: true } });
+      return;
+    }
+    const slug =
+      route === "/" ? "home" : route.replace(/^\/+|\/+$/g, "").replace(/[^\w.-]+/g, "-") || "page";
+    const suffix = format === "png" && scale !== 1 ? `@${scale}x` : "";
+    const name = `${s.project.name}-${slug}-${viewport.id}${suffix}.${format}`;
+    const path = await chooseExportPath(name, format);
+    if (!path) return; // cancelled
+    set({ exporting: route, exportNotice: null });
+    try {
+      const done = await renderArtboardExport({
+        url,
+        width: viewport.width,
+        height: artboardHeight(viewport, s.pageHeights[route]),
+        format,
+        scale: format === "png" ? scale : undefined,
+        path,
+      });
+      const size =
+        done.bytes >= 1024 * 1024
+          ? `${(done.bytes / (1024 * 1024)).toFixed(1)} MB`
+          : `${Math.max(1, Math.round(done.bytes / 1024))} KB`;
+      // An export shows what the *files* render. Staged edits are previewed
+      // on the canvas by the overlay, not written, so they are not in it —
+      // said, rather than discovered when the picture looks wrong.
+      const staged = get().actions.length > 0;
+      set({
+        exportNotice: {
+          text: `Exported ${route} as ${format.toUpperCase()} · ${done.width}×${done.height}${
+            format === "pdf" ? " pt" : " px"
+          } · ${size}${staged ? " — unsaved edits aren't included; save first to export them" : ""}`,
+          error: false,
+          path: done.path,
+        },
+      });
+    } catch (e) {
+      set({
+        exportNotice: {
+          text: `Couldn't export ${route}: ${e instanceof Error ? e.message : String(e)}`,
+          error: true,
+        },
+      });
+    } finally {
+      set({ exporting: null });
+    }
+  },
+
+  dismissExportNotice: () => set({ exportNotice: null }),
+
+  setDragOut: (dragOut) => set({ dragOut }),
+
+  moveArtboard: (route, at) => {
+    const s = get();
+    if (!s.routes.includes(route)) return;
+    // The whole layout as it stands, not just this one board: an artboard
+    // without a stored position is placed relative to the rightmost, so
+    // storing only the moved one would make every other one jump with it.
+    const layout = artboardLayout(s);
+    layout[route] = { x: Math.round(at.x), y: Math.round(at.y) };
+    set({ artboardPos: { ...s.artboardPos, [s.viewportId]: layout } });
+    rememberCanvas(get());
+  },
+
+  parkElement: async ({ id, route, element, at, rect }) => {
+    if (isPendingId(id)) {
+      get().setNotice("Save it first — something that was never written can't be parked yet.");
+      return;
+    }
+    // Whether it may leave its page is the write-back's call, the same one ⌫
+    // and ⌘X ask. Asked first, so a park that cannot remove never captures.
+    const info = await sourceInfoFor(get, id);
+    if (!info?.canRemove) {
+      get().setNotice(info?.structuralReason ?? "This element can't be moved off its page.");
+      return;
+    }
+    const captured = await captureClip(get, id, element);
+    if ("error" in captured) {
+      get().setNotice(captured.error);
+      return;
+    }
+    // The picture, taken while it is still on the page (a staged removal
+    // takes it off the canvas). Drawn at twice its page size so the card
+    // stays sharp when zoomed in; a failed capture just means a plainer card.
+    let picture: string | null = null;
+    if (rect && rect.width >= 1 && rect.height >= 1) {
+      try {
+        picture = await snapshotRegion(rect, Math.min(2400, element.rect.width * 2));
+      } catch {
+        picture = null;
+      }
+    }
+    if (!stageRemoval(get, set, id, captured.clip.label)) return;
+    const piece: ParkedPiece = {
+      id: crypto.randomUUID(),
+      x: at.x,
+      y: at.y,
+      width: element.rect.width,
+      height: element.rect.height,
+      clip: captured.clip,
+      picture,
+      fromRoute: route,
+      removal: id,
+      placement: null,
+      createdAt: Date.now(),
+    };
+    set({ parked: [...get().parked, piece] });
+    get().setNotice(
+      captureNotice("Parked", captured.clip.label, captured.unsaved) +
+        " Drag it into any artboard to place it.",
+    );
+  },
+
+  moveAcross: async ({ id, element, drop }) => {
+    if (isPendingId(id)) {
+      get().setNotice("Save it first — something that was never written can't move between pages yet.");
+      return;
+    }
+    const info = await sourceInfoFor(get, id);
+    if (!info?.canRemove) {
+      get().setNotice(info?.structuralReason ?? "This element can't be moved off its page.");
+      return;
+    }
+    const anchor = dropAnchor(get().actions, drop.id, drop.position);
+    if (!anchor) return;
+    const captured = await captureClip(get, id, element);
+    if ("error" in captured) {
+      get().setNotice(captured.error);
+      return;
+    }
+    // Paste first: it is the half that can be refused for reasons of its own
+    // (another language, an anchor on its way out), and a removal staged
+    // before a refused paste would delete the element with nowhere to go.
+    // One gesture, one undo step: the paste and the removal share an id.
+    const gesture = crypto.randomUUID();
+    const pasted = await stagePaste(get, captured.clip, anchor.target, anchor.position, "Moved", gesture);
+    if (!pasted) return;
+    if (!stageRemoval(get, set, id, captured.clip.label, gesture)) {
+      // The removal was refused (something staged depends on it): take the
+      // paste back too, so the gesture is all or nothing.
+      const next = get().actions.filter((a) => !(a.kind === "insert" && a.id === pasted));
+      set({ actions: next });
+      syncCanvas(next);
+      return;
+    }
+    get().selectById(pasted);
+  },
+
+  placeParked: async (pieceId, drop) => {
+    const piece = get().parked.find((p) => p.id === pieceId);
+    if (!piece) return;
+    const anchor = dropAnchor(get().actions, drop.id, drop.position);
+    if (!anchor) return;
+    const pasted = await stagePaste(get, piece.clip, anchor.target, anchor.position, "Placed");
+    if (!pasted) return;
+    set({
+      parked: get().parked.map((p) => (p.id === pieceId ? { ...p, placement: pasted } : p)),
+    });
+    get().selectById(pasted);
+  },
+
+  moveParked: (pieceId, at) =>
+    set({ parked: get().parked.map((p) => (p.id === pieceId ? { ...p, x: at.x, y: at.y } : p)) }),
+
+  deleteParked: (pieceId) => set({ parked: get().parked.filter((p) => p.id !== pieceId) }),
+
+  confirmDirectWrite: () => {
+    const prompt = get().directWritePrompt;
+    set({ directWriteOk: true, directWritePrompt: null });
+    prompt?.run();
+  },
+
+  cancelDirectWrite: () => set({ directWritePrompt: null }),
+
+  setUpGit: async () => {
+    const { project, pendingEdit, chatBusy, settingUpGit } = get();
+    if (!project || chatBusy || settingUpGit) return null;
+    const root = project.root;
+    set({ settingUpGit: true });
+    // A preview on disk is a proposal, not the user's work. The baseline must
+    // be what they had, or the first commit in their new history would quietly
+    // contain an AI edit they never accepted.
+    const preview = pendingEdit?.previewing ? pendingEdit : null;
+    try {
+      if (preview) {
+        const err = await revertPreview(root, preview);
+        if (err) return `Couldn't set the preview aside for the baseline (${err}) — git was not set up.`;
+      }
+      try {
+        set({ git: await gitInitBaseline(root) });
+      } catch (e) {
+        // Back to exactly where we were: no repo, preview on screen.
+        if (preview) await reapplyPreview(root, preview);
+        return e instanceof Error ? e.message : String(e);
+      }
+      if (preview) {
+        const err = await reapplyPreview(root, preview);
+        if (err) {
+          // Git is set up and the folder is its baseline — a safe place to
+          // stop. The proposal is gone from disk, so it is no longer pending.
+          patchChatMessage(set, preview.messageId, { outcome: "rejected" });
+          set({ pendingEdit: null });
+          return `Git is set up, but the preview couldn't be put back (${err}). Ask again to redo it.`;
+        }
+        gitStatus(root)
+          .then((g) => set({ git: g }))
+          .catch(() => {});
+      }
+      sendToOverlay({ type: "reload" });
+      return null;
+    } finally {
+      set({ settingUpGit: false });
+    }
+  },
+
+  loadAgentModels: async (agent) => {
+    const a = get().agents[agent];
+    if (a.catalog !== null || a.installed === false) return;
+    try {
+      const catalog = await agentModels(agent);
+      patchAgent(set, get, agent, { catalog });
+    } catch {
+      // No catalog is fine: the picker keeps "CLI default" and whatever was
+      // saved. Marked as asked, so a broken CLI is not re-run on every open.
+      patchAgent(set, get, agent, { catalog: [] });
+    }
   },
 
   connectAgent: async (agent) => {
@@ -3573,9 +4385,8 @@ export const useStore = create<AppState>((set, get) => ({
       if (!/ok/i.test(reply)) {
         throw new Error(`unexpected reply from ${label}: ${reply.slice(0, 120)}`);
       }
-      patchAgent(set, get, agent, { consent: true, error: null });
+      patchAgent(set, get, agent, { consent: true, enabled: true, error: null });
       saveAgentPrefs(get().agents);
-      get().setAiPref(agent);
       // Organize the current scan right away with the new backend.
       void get().categorize();
     } catch (e) {
@@ -3590,13 +4401,18 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  /**
+   * Who answers when nobody was named: the first agent switched on, in
+   * CLI_AGENTS order, then the API key. Fixed order rather than "last used"
+   * so the answer is stable and the AI menu can say which one it is — the
+   * other is one `@` away. Everything that isn't the chat (organizing scans,
+   * merges, the session seed) has no `@` to use, so this is its backend too.
+   */
   activeAiBackend: () => {
-    const { aiPref, agents, anthropicKey } = get();
-    if (aiPref && aiPref !== "api") {
-      const state = agents[aiPref];
-      if (state?.consent && state.installed !== false) return aiPref;
-    }
-    if (aiPref === "api" && anthropicKey) return "api";
+    const { agents, apiEnabled, anthropicKey } = get();
+    const first = CLI_AGENTS.find((a) => agentOn(agents[a.id]));
+    if (first) return first.id;
+    if (apiEnabled && anthropicKey) return "api";
     return null;
   },
 
@@ -3724,7 +4540,7 @@ export const useStore = create<AppState>((set, get) => ({
       patchMerge(set, get, {
         stage: "failed",
         error:
-          "A merge proposal needs an AI backend — connect Claude Code or add an API key in the AI switch.",
+          "A merge proposal needs an AI backend — switch an agent on, or add an API key, in the AI menu (top bar).",
       });
       return;
     }
@@ -3754,6 +4570,17 @@ export const useStore = create<AppState>((set, get) => ({
     const { project, merge, routes, devStatus } = get();
     if (!project || !merge?.proposal || merge.stage !== "review") return;
     const { proposal } = merge;
+    // The one save that never writes in place. Its gates undo a failed merge
+    // by restoring the commit — without git, a merge that fails its typecheck
+    // or build would stay applied, which is the codebase corruption the
+    // gates exist to prevent.
+    if (get().git?.isRepo === false) {
+      patchMerge(set, get, {
+        error:
+          "A merge needs git: if it fails its checks, dedup undoes it by restoring the commit. Use “Set up git” in the top bar first.",
+      });
+      return;
+    }
 
     patchMerge(set, get, { stage: "applying", error: null, gates: [] });
     // The "before" side of the visual gate has to be taken while the old
@@ -3914,3 +4741,31 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
 }));
+
+// --- parked pieces: kept in step with the staged program, and on disk --------
+
+/** The project whose parked pieces have been read back. Until they have, a
+ *  save would write an empty list over the ones on disk — the only copy. */
+let parkedLoaded: string | null = null;
+
+useStore.subscribe((state, prev) => {
+  // Undo, redo, discard and every other change to the program: a piece whose
+  // removal was taken back is back in its page; one whose placement was taken
+  // back is back on the canvas (lib/parking).
+  if (state.actions !== prev.actions) {
+    const next = reconcileParked(state.parked, state.actions);
+    if (next !== state.parked) {
+      useStore.setState({ parked: next });
+      return; // the update above re-enters with the pieces to save
+    }
+  }
+  if (state.parked !== prev.parked && state.project && parkedLoaded === state.project.root) {
+    void saveParked(state.project.root, persistable(state.parked)).catch((e) => {
+      useStore
+        .getState()
+        .setNotice(`Couldn't save the parked pieces: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
+  if (state.project?.root !== prev.project?.root) parkedLoaded = null;
+});
+

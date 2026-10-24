@@ -43,7 +43,7 @@ function ElementActions() {
   const text = actions.length >= 0 ? effectiveText() : null;
 
   return (
-    <Section title="Content">
+    <Section title="Content" collapsible>
       {sourceInfo.canEditText ? (
         <input
           value={text ?? ""}
@@ -195,6 +195,68 @@ function noInspectionReason(
   }
 }
 
+/**
+ * Which element you are looking at. Pinned above the scroll area rather than
+ * carried down it: the panel's first job is to name the context, and having to
+ * scroll back from Effects to answer "which element is this?" is the failure
+ * that a context-sensitive panel exists to prevent.
+ */
+function SelectionHeader({
+  selected,
+  src,
+  sourceInfo,
+}: {
+  selected: NonNullable<ReturnType<typeof useStore.getState>["selected"]>;
+  src: ReturnType<typeof parseDedupId>;
+  sourceInfo: ReturnType<typeof useStore.getState>["sourceInfo"];
+}) {
+  return (
+    <div className="inspector-selection shrink-0 border-b border-line px-3 py-3">
+      <div className="flex items-center gap-1.5">
+        {selected.component ? (
+          <Component1Icon
+            width={13}
+            height={13}
+            className="shrink-0 text-accent"
+          />
+        ) : (
+          <ComponentInstanceIcon
+            width={13}
+            height={13}
+            className="shrink-0 text-ink-faint"
+          />
+        )}
+        <span className="text-[13px] font-semibold truncate">
+          {selected.component ?? selected.tag}
+        </span>
+        <span className="text-2xs font-mono text-ink-faint bg-surface-2 rounded px-1 py-0.5">
+          {selected.tag}
+        </span>
+        {selected.instanceCount > 1 && (
+          <span
+            className="text-2xs text-warn bg-warn/10 rounded px-1.5 py-0.5 shrink-0"
+            title="This source element renders multiple DOM instances (e.g. inside a .map()). Edits affect all of them."
+          >
+            ×{selected.instanceCount}
+          </span>
+        )}
+      </div>
+      {src && (
+        <div className="mt-1.5 text-2xs font-mono text-ink-dim truncate">
+          {src.file}
+          {/* Position comes from the write-back's live parse, not from the id
+              — after an edit shifts the file, this stays true. */}
+          {sourceInfo && sourceInfo.line > 0 && (
+            <span className="text-ink-faint">
+              :{sourceInfo.line}:{sourceInfo.col}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Inspector() {
   const project = useStore((s) => s.project);
   const selected = useStore((s) => s.selected);
@@ -218,7 +280,7 @@ export function Inspector() {
   return (
     <aside
       style={{ width }}
-      className="panel absolute right-3 top-16 bottom-16 z-20 flex flex-col overflow-hidden"
+      className="panel inspector-panel absolute right-3 top-16 bottom-16 z-20 flex flex-col overflow-hidden"
     >
       <ResizeHandle
         side="left"
@@ -231,8 +293,8 @@ export function Inspector() {
       />
       {/* Same segmented control as the sidebar's — two panels of the same
           chrome must not each invent their own tab pattern. */}
-      <div className="shrink-0 p-2">
-        <div className="flex items-center gap-0.5 rounded-[10px] bg-surface-2 p-0.5">
+      <div className="inspector-tabs shrink-0 p-2">
+        <div className="inspector-tabs-track flex items-center gap-0.5 rounded-[10px] bg-surface-2 p-0.5">
           {TABS.map((t) => (
             <button
               key={t.id}
@@ -254,121 +316,82 @@ export function Inspector() {
       {tab === "chat" ? (
         <ChatPanel />
       ) : selected ? (
-        <div className="flex-1 overflow-y-auto">
-          {/* Selection header (FR-3.1 seed) */}
-          <div className="px-3 py-3 border-b border-line">
-            <div className="flex items-center gap-1.5">
-              {selected.component ? (
-                <Component1Icon
-                  width={13}
-                  height={13}
-                  className="shrink-0 text-accent"
-                />
-              ) : (
-                <ComponentInstanceIcon
-                  width={13}
-                  height={13}
-                  className="shrink-0 text-ink-faint"
-                />
-              )}
-              <span className="text-[13px] font-semibold truncate">
-                {selected.component ?? selected.tag}
-              </span>
-              <span className="text-2xs font-mono text-ink-faint bg-surface-2 rounded px-1 py-0.5">
-                {selected.tag}
-              </span>
-              {selected.instanceCount > 1 && (
-                <span
-                  className="text-2xs text-warn bg-warn/10 rounded px-1.5 py-0.5 shrink-0"
-                  title="This source element renders multiple DOM instances (e.g. inside a .map()). Edits affect all of them."
-                >
-                  ×{selected.instanceCount}
-                </span>
-              )}
-            </div>
-            {src && (
-              <div className="mt-1.5 text-2xs font-mono text-ink-dim truncate">
-                {src.file}
-                {/* Position comes from the write-back's live parse, not from
-                    the id — after an edit shifts the file, this stays true. */}
-                {sourceInfo && sourceInfo.line > 0 && (
-                  <span className="text-ink-faint">
-                    :{sourceInfo.line}:{sourceInfo.col}
-                  </span>
+        <div className="flex-1 flex min-h-0 flex-col">
+          <SelectionHeader selected={selected} src={src} sourceInfo={sourceInfo} />
+          <div className="flex-1 overflow-y-auto">
+            {sourceInfo === null ? (
+              <div className="px-3 py-3 text-2xs text-ink-faint">
+                Reading source…
+              </div>
+            ) : sourceInfo.editable && effective !== null ? (
+              <StylePanel className={effective} />
+            ) : (
+              <div className="px-3 py-3 border-b border-line">
+                <div className="flex gap-2 items-start">
+                  <ExclamationTriangleIcon
+                    width={13}
+                    height={13}
+                    className="text-warn shrink-0 mt-px"
+                  />
+                  <div className="flex-1 text-2xs text-ink-dim leading-relaxed">
+                    <span className="text-ink">Read-only:</span> this element's
+                    classes are {sourceInfo.reason ?? "not statically editable"}.
+                    dedup only rewrites what it can rewrite safely — open the
+                    source to change it yourself.
+                  </div>
+                  <OpenCodeButton line={sourceInfo.line} />
+                </div>
+                {selected.domClassName && (
+                  <div className="mt-2 text-2xs font-mono text-ink-faint break-words select-text">
+                    {selected.domClassName}
+                  </div>
                 )}
               </div>
             )}
-          </div>
-
-          {/* Component ancestry breadcrumb (FR-2.4) */}
-          <Section title="Ancestry">
-            <div className="flex flex-wrap items-center gap-y-1">
-              {crumbs.map((c, i) => {
-                const isLast = i === crumbs.length - 1;
-                return (
-                  <span key={`${c.dedupId}-${i}`} className="flex items-center">
-                    <button
-                      onClick={() => !isLast && selectById(c.dedupId)}
-                      disabled={isLast}
-                      className={`text-2xs rounded px-1 py-0.5 ${
-                        isLast
-                          ? "text-ink font-medium"
-                          : "text-ink-dim hover:text-ink hover:bg-surface-2"
-                      }`}
-                      title={c.dedupId}
-                    >
-                      {c.component ?? c.tag}
-                      {c.component && (
-                        <span className="text-ink-faint"> · {c.tag}</span>
+            {/* Where the element sits, and what may be done to it. Peers of
+                the style sections rather than a fold inside one: the panel is
+                a single flat list, so nothing in it is more than one click
+                deep. Identity itself is pinned above. (FR-2.4) */}
+            <Section title="Ancestry" collapsible defaultOpen={false}>
+              <div className="flex flex-wrap items-center gap-y-1">
+                {crumbs.map((c, i) => {
+                  const isLast = i === crumbs.length - 1;
+                  return (
+                    <span key={`${c.dedupId}-${i}`} className="flex items-center">
+                      <button
+                        onClick={() => !isLast && selectById(c.dedupId)}
+                        disabled={isLast}
+                        className={`text-2xs rounded px-1 py-0.5 ${
+                          isLast
+                            ? "text-ink font-medium"
+                            : "text-ink-dim hover:text-ink hover:bg-surface-2"
+                        }`}
+                        title={c.dedupId}
+                      >
+                        {c.component ?? c.tag}
+                        {c.component && (
+                          <span className="text-ink-faint"> · {c.tag}</span>
+                        )}
+                      </button>
+                      {!isLast && (
+                        <ChevronRightIcon
+                          width={11}
+                          height={11}
+                          className="text-ink-faint mx-0.5"
+                        />
                       )}
-                    </button>
-                    {!isLast && (
-                      <ChevronRightIcon
-                        width={11}
-                        height={11}
-                        className="text-ink-faint mx-0.5"
-                      />
-                    )}
-                  </span>
-                );
-              })}
-            </div>
-          </Section>
-
-          {/* Content + structure: what this element is made of, and what may
-              be done to it. Both are gated by the write-back's own report, so
-              a control is only offered when the save would accept it. */}
-          {sourceInfo !== null && <ElementActions />}
-
-          {sourceInfo === null ? (
-            <div className="px-3 py-3 text-2xs text-ink-faint">
-              Reading source…
-            </div>
-          ) : sourceInfo.editable && effective !== null ? (
-            <StylePanel className={effective} />
-          ) : (
-            <div className="px-3 py-3 border-b border-line">
-              <div className="flex gap-2 items-start">
-                <ExclamationTriangleIcon
-                  width={13}
-                  height={13}
-                  className="text-warn shrink-0 mt-px"
-                />
-                <div className="flex-1 text-2xs text-ink-dim leading-relaxed">
-                  <span className="text-ink">Read-only:</span> this element's
-                  classes are {sourceInfo.reason ?? "not statically editable"}.
-                  dedup only rewrites what it can rewrite safely — open the
-                  source to change it yourself.
-                </div>
-                <OpenCodeButton line={sourceInfo.line} />
+                    </span>
+                  );
+                })}
               </div>
-              {selected.domClassName && (
-                <div className="mt-2 text-2xs font-mono text-ink-faint break-words select-text">
-                  {selected.domClassName}
-                </div>
-              )}
-            </div>
-          )}
+            </Section>
+
+            {/* Content + structure: what this element is made of, and what
+                may be done to it. Both are gated by the write-back's own
+                report, so a control is only offered when the save would
+                accept it. */}
+            {sourceInfo !== null && <ElementActions />}
+          </div>
         </div>
       ) : instrumentation && !instrumentation.active ? (
         <div className="flex-1 flex flex-col justify-center gap-2 overflow-auto py-4">
@@ -396,7 +419,7 @@ export function Inspector() {
         </div>
       )}
 
-      <div className="border-t border-line px-3 py-2 text-2xs text-ink-faint flex items-center justify-between">
+      <div className="inspector-footer border-t border-line px-3 py-2 text-2xs text-ink-faint flex items-center justify-between">
         <span>{project?.hasTailwind ? "Tailwind detected" : "No Tailwind"}</span>
         <span className="font-mono">{project?.framework}</span>
       </div>

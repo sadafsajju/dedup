@@ -28,7 +28,7 @@ pub struct Rect {
 
 /// Stable file name per project root (FNV-1a — paths are arbitrary, file
 /// names can't be).
-fn key(root: &str) -> String {
+pub(crate) fn key(root: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in root.as_bytes() {
         hash ^= *b as u64;
@@ -79,31 +79,47 @@ pub fn capture(app: &AppHandle, root: &str, rect: Option<Rect>) -> Result<(), St
     std::fs::write(&out, png).map_err(|e| format!("write thumbnail: {e}"))
 }
 
+/// A WebKit snapshot's image as PNG bytes. Shared by the canvas captures and
+/// the artboard export. Runs on the main thread, inside the completion block.
 #[cfg(target_os = "macos")]
+pub(crate) unsafe fn encode_png(
+    image: *mut objc2_app_kit::NSImage,
+    error: *mut objc2_foundation::NSError,
+) -> Result<Vec<u8>, String> {
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
+    use objc2_foundation::NSDictionary;
+    if let Some(err) = error.as_ref() {
+        return Err(err.localizedDescription().to_string());
+    }
+    let image = image.as_ref().ok_or("snapshot returned no image")?;
+    let tiff = image
+        .TIFFRepresentation()
+        .ok_or("snapshot has no bitmap representation")?;
+    let rep = NSBitmapImageRep::imageRepWithData(&tiff).ok_or("snapshot bitmap unreadable")?;
+    let png = rep
+        .representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+        .ok_or("PNG encoding failed")?;
+    Ok(png.to_vec())
+}
+
+/// A region of the app window as PNG, scaled to the thumbnail width — what
+/// the launch grid and the visual gate compare.
 pub fn snapshot_png(app: &AppHandle, rect: Option<Rect>) -> Result<Vec<u8>, String> {
+    snapshot_png_at(app, rect, SNAPSHOT_WIDTH)
+}
+
+/// The same capture at an output width of the caller's choosing, in points —
+/// a parked element's card is drawn at its own size, and squeezing a button
+/// into a 640pt-wide thumbnail would blur it.
+#[cfg(target_os = "macos")]
+pub fn snapshot_png_at(app: &AppHandle, rect: Option<Rect>, width: f64) -> Result<Vec<u8>, String> {
     use block2::RcBlock;
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
-    use objc2_foundation::{NSDictionary, NSError, NSNumber, NSPoint, NSRect, NSSize};
+    use objc2_app_kit::NSImage;
+    use objc2_foundation::{NSError, NSNumber, NSPoint, NSRect, NSSize};
     use objc2_web_kit::{WKSnapshotConfiguration, WKWebView};
     use std::sync::mpsc;
     use std::time::Duration;
-
-    /// Runs on the main thread inside the completion block.
-    unsafe fn encode(image: *mut NSImage, error: *mut NSError) -> Result<Vec<u8>, String> {
-        if let Some(err) = error.as_ref() {
-            return Err(err.localizedDescription().to_string());
-        }
-        let image = image.as_ref().ok_or("snapshot returned no image")?;
-        let tiff = image
-            .TIFFRepresentation()
-            .ok_or("snapshot has no bitmap representation")?;
-        let rep = NSBitmapImageRep::imageRepWithData(&tiff).ok_or("snapshot bitmap unreadable")?;
-        let png = rep
-            .representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
-            .ok_or("PNG encoding failed")?;
-        Ok(png.to_vec())
-    }
 
     let window = app
         .get_webview_window("main")
@@ -125,12 +141,12 @@ pub fn snapshot_png(app: &AppHandle, rect: Option<Rect>) -> Result<Vec<u8>, Stri
                 ));
             }
             // Scales the snapshot down for us — no image resampling on our side.
-            config.setSnapshotWidth(Some(&NSNumber::new_f64(SNAPSHOT_WIDTH)));
+            config.setSnapshotWidth(Some(&NSNumber::new_f64(width)));
             // The canvas is already on screen; waiting for updates can hang
             // behind an in-flight HMR paint.
             config.setAfterScreenUpdates(false);
             let handler = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
-                let _ = tx.send(encode(image, error));
+                let _ = tx.send(encode_png(image, error));
             });
             webview.takeSnapshotWithConfiguration_completionHandler(Some(&config), &handler);
         })
@@ -141,7 +157,7 @@ pub fn snapshot_png(app: &AppHandle, rect: Option<Rect>) -> Result<Vec<u8>, Stri
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn snapshot_png(_app: &AppHandle, _rect: Option<Rect>) -> Result<Vec<u8>, String> {
+pub fn snapshot_png_at(_app: &AppHandle, _rect: Option<Rect>, _width: f64) -> Result<Vec<u8>, String> {
     Err("thumbnail capture is only implemented on macOS".to_string())
 }
 

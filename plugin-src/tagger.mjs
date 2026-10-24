@@ -12,6 +12,7 @@
 import { tagCode } from "./tagcode.mjs";
 import { buildBootScript } from "./boot.mjs";
 import { discoverRoutes } from "./routes.mjs";
+import { guardResponse, NOTICE } from "./frameable.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,6 +102,21 @@ export default function dedupTagger(options = {}) {
     },
 
     configureServer(server) {
+      // First in the chain, so nothing later can leave a framing guard on the
+      // response: the canvas is an iframe, and `X-Frame-Options` from a
+      // project's `server.headers` (or any plugin) is a blank white artboard
+      // with no error anywhere the user can see. See `frameable.mjs`.
+      let announced = false;
+      server.middlewares.use((_req, res, next) => {
+        guardResponse(res, () => {
+          if (announced) return;
+          announced = true;
+          // eslint-disable-next-line no-console
+          console.warn(NOTICE);
+        });
+        next();
+      });
+
       server.middlewares.use(OVERLAY_ROUTE, (_req, res) => {
         res.setHeader("content-type", "text/javascript");
         try {

@@ -14,8 +14,24 @@ export interface AgentState {
   consent: boolean;
   /** Model override for that CLI; null keeps its own default. */
   model: string | null;
+  /** Switched on in the AI menu (persisted). Both agents can be on at once —
+   * a message names one with `@claude`/`@codex` — so this is a per-agent
+   * switch rather than a single choice. Off keeps `consent`: switching back
+   * on is instant, with no second test prompt. */
+  enabled: boolean;
+  /** The models the installed CLI itself offers (`agent_models`), once asked;
+   * null until then or for a CLI with no catalog. Not persisted — it belongs
+   * to whichever binary is installed right now. */
+  catalog: { value: string; label: string }[] | null;
   connecting: boolean;
   error: string | null;
+}
+
+/** Whether a message may be sent to this agent: connected (a live
+ *  round-trip passed), switched on, and still installed. One rule, so the
+ *  store and the composer cannot disagree about who is available. */
+export function agentOn(a: AgentState | undefined): boolean {
+  return !!a && a.consent && a.enabled && a.installed !== false;
 }
 
 export const CLI_AGENTS: {
@@ -69,8 +85,10 @@ export type StarterKind = "react" | "html";
  * Active canvas tool (FR-6.1). `text` is a mode rather than a creator: it puts
  * the caret in existing text on the canvas. Inserting a *new* text element is
  * the palette's job, which is a different gesture (arm, then place).
+ * `annotate` draws over the artboards instead of into them — it is the one
+ * tool whose gestures never reach the user's page or their source.
  */
-export type Tool = "select" | "hand" | "browse" | "text";
+export type Tool = "select" | "hand" | "browse" | "text" | "annotate";
 
 export interface ProjectInfo {
   root: string;
@@ -86,6 +104,9 @@ export interface ProjectInfo {
    *  folder dedup serves. Element ids stay relative to the project root. */
   staticDir: string | null;
   devScript: string | null;
+  /** Which script that was (`dev` or `start`) — the launch needs the name,
+   *  not just the body. */
+  devScriptName: string | null;
   support: SupportLevel;
   summary: string;
   warnings: string[];
@@ -304,9 +325,13 @@ export interface Clipboard {
 }
 
 export type StructuralAction =
-  | { kind: "remove"; target: EditTarget; label: string }
+  | { kind: "remove"; target: EditTarget; label: string; gesture?: string }
   | {
       kind: "insert";
+      /** One user gesture staged as several actions (a drag between
+       *  artboards is a paste *and* a removal) shares an id, so undo and
+       *  redo take it as one step — see lib/undo. */
+      gesture?: string;
       /** Provisional id for the element being inserted (`pending:…`). It has
        * no source node yet, so it cannot have a real one — but the canvas
        * still needs to address it, or a new element can't be selected, styled
@@ -571,7 +596,16 @@ export interface ChatMessage {
   target?: { label: string; file: string };
   /** Short commit hash when this reply's edit was accepted and committed. */
   commit?: string;
+  /** Accepted in a project with no git: written into the files in place, so
+   *  there is no commit — the transcript says that rather than show none. */
+  writtenInPlace?: boolean;
   error?: boolean;
+  /** Which backend wrote this reply (assistant messages). Both agents can be
+   *  connected and a message can name either (`@claude`, `@codex`), so one
+   *  conversation can hold both — the label is how the reader tells them
+   *  apart, and how the next turn's transcript does. Absent on messages saved
+   *  before there was more than one voice. */
+  agent?: CliAgent | "api";
   /** The context lookups dedup ran for this turn, shown as a trace the way an
    *  agent's tool calls are — the user should be able to see what the model
    *  was allowed to look at. */
@@ -604,7 +638,7 @@ export interface PendingEdit {
    * no `after` string to carry. They are new files by construction, so
    * discarding the proposal removes them the same way it removes a created
    * one. */
-  assets: { file: string; source: string }[];
+  assets: { file: string; source: string; agent: CliAgent }[];
   /** Whether `after` is currently on disk so the canvas renders it.
    *
    * A diff says what changed; it does not say how it looks, and looking is the
@@ -850,6 +884,14 @@ export const VIEWPORTS: Viewport[] = [
   { id: "tablet", label: "Tablet", width: 768, height: 1024 },
   { id: "desktop", label: "Desktop", width: 1440, height: null },
 ];
+
+/** How tall an artboard is: at least the device height, grown to the page's
+ *  reported natural height, sanity-capped for runaway layouts. One rule for
+ *  the canvas and the export — an export a different height from the
+ *  artboard would be a different picture of the same page. */
+export function artboardHeight(viewport: Viewport, measured: number | undefined): number {
+  return Math.min(Math.max(viewport.height ?? 800, measured ?? 0), 12000);
+}
 
 // --- Guarded merge (FR-5.4 → FR-5.7) ----------------------------------------
 

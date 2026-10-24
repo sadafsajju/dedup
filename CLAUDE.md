@@ -25,8 +25,12 @@ pnpm test:proposal      # merge proposal parse + review diff + gate rules
 pnpm test:highlight     # code-panel syntax colouring (round-trip invariant)
 pnpm test:html          # static sites: HTML walk/stamp/write-back + the server
 pnpm test:prompts       # chat composer: ↑/↓ prompt history state machine
+pnpm test:mentions      # chat composer: which agent `@claude`/`@codex` routes to
+pnpm test:parking       # parked canvas pieces + one-gesture undo (lib/parking, lib/undo)
 pnpm test:openprefs     # when the compatibility card is shown on open
 pnpm test:canvas        # the canvas a project reopens with (routes + choices)
+pnpm test:annotate      # canvas markup: rough.js geometry + what a mark stores
+pnpm test:frame         # frame-blocking response headers the canvas must relax
 cargo test              # from src-tauri/ — all Rust tests
 ```
 
@@ -56,7 +60,8 @@ cargo test              # from src-tauri/ — all Rust tests
   rollback), `asset.rs` (the gated copy of an agent-generated image into the
   project), `scaffold.rs` (the two starters written into an empty folder),
   `visual.rs` (PNG diff for the regression gate, perceptual hash
-  for the visual similarity signal).
+  for the visual similarity signal), `export.rs` (an artboard as PNG or
+  vector PDF, rendered off-screen at its real size).
 - **Two kinds of project.** A *node* project (Vite/Next) runs the user's own
   dev server with dedup's tagger injected into the build. A *static* project (a
   folder of `.html` files, `Framework::Static`) has no build to inject into, so
@@ -98,10 +103,11 @@ cargo test              # from src-tauri/ — all Rust tests
   `lib/chat.ts` + `lib/chatEdits.ts` (the chat agent's boundary: prompt, tool
   protocol, and the strict parse of what comes back),
   `lib/promptHistory.ts` (the composer's ↑/↓ walk, pure so it can be tested),
+  `lib/annotate.ts` (canvas markup: rough.js geometry, seeds, storage),
   `lib/mergeFlow.ts` (the gate runner), `lib/diff.ts` (the review diff),
   `lib/visualPass.ts` (perceptual-hash similarity over the rendered gallery),
-  `components/` (LaunchScreen/Editor/Canvas/Inspector/StylePanel/ReviewPanel/
-  MergeReview/History/NextSetup).
+  `components/` (LaunchScreen/Editor/Canvas/AnnotationLayer/Inspector/
+  StylePanel/ReviewPanel/MergeReview/History/NextSetup).
 
 ## Gotchas (hard-won)
 
@@ -244,6 +250,34 @@ cargo test              # from src-tauri/ — all Rust tests
   taken back cleanly and a landed text write cannot; and they ride the same
   proposal lifecycle as everything else (previewed uncommitted, committed on
   accept, removed on discard — `revertSources` with a null content).
+- **Who answers is a property of the message, not a mode.** Both agents can be
+  connected at once; `@claude`/`@codex` (`lib/mentions.ts`) sends one message to
+  that agent and no mention means the top-bar default. Only the first mention
+  routes and only it leaves the prompt — a later one is part of the sentence. A
+  mention of an unconnected agent errors rather than falling back: a silent
+  substitute is what the AI menu exists to rule out. The composer's `@` popup
+  must take its keys *before* prompt history and Enter-to-send. So the AI menu
+  is per-backend **switches**, not one choice (`agentOn` in `lib/types.ts` is
+  the single rule for "may be sent to"); with no mention the first one on, in
+  CLI_AGENTS order, answers — and so do the non-chat AI features, which have
+  no `@`. A Codex model list comes from the installed CLI (`codex debug
+  models`, `ai::models`), never a list in dedup: two copies of Codex on one
+  machine can know different models, and a name the running copy doesn't know
+  is a refused run.
+- **An IMAGE block is how a model that cannot generate asks one that can.** It
+  is offered only to a non-generating backend while a generating agent is
+  connected, and it names no source path — dedup asks Codex itself
+  (`imageRequestPrompt`), takes exactly one ASSET block from the answer
+  (`pickGeneratedImage` refuses prose, two images, or any edit alongside), and
+  imports it through `asset.rs` as **Codex's** output. So imports carry their
+  agent: the gate is chosen per file, never per turn. Cheap refusals run on
+  destinations before Codex is asked, because generating is the slow part.
+  The requester names the destination before the image exists and cannot pick
+  its format, so for a *delegated* import only, `asset::import` corrects a
+  disagreeing extension (`hero.jpg` → `hero.png`) instead of refusing — the
+  name still always agrees with the bytes — and `retargetReferences` renames
+  the references that edit added. A name the user's file already used before
+  the edit is refused, never renamed: it is theirs, about something else.
 - Keep the proposal's file *contents* out of the persisted transcript (chat
   sessions are saved per project; source snapshots don't belong there), and
   keep it to one unresolved proposal: a second is computed against the contents
@@ -323,6 +357,21 @@ cargo test              # from src-tauri/ — all Rust tests
   verdict with a reason attached (no typecheck script, no build script, no
   artboard on screen), and it must survive into the summary line. Rounding it
   up to a pass is the failure mode the whole phase exists to prevent.
+- **A save must never land on disk and then report failure.** `saveAll` and
+  `saveCode` write first and commit second, so in a folder with no git the
+  write succeeded, the commit threw, and the edit stayed staged under a save
+  error — a second save could apply it twice. The no-git check therefore
+  comes *before* the write (`needsDirectWriteWarning`), never after it.
+- **"Set up git" (`git::init_baseline`) commits the user's files, not a
+  preview.** A live chat proposal is set aside first (`revertPreview`) and put
+  back after (`reapplyPreview`, images re-imported from the agent's own
+  directory, hence `agent` on `PendingEdit.assets`), so the first commit in
+  their new history never contains an AI edit they did not accept. If the
+  baseline commit fails, the `.git` it just made is removed again.
+- **A pending preview lives only in memory**, and a tauri-dev hot restart
+  (any `src-tauri/` edit) kills the app hard — the preview stays on disk and
+  its `before` snapshots are gone. Resolve a pending proposal before touching
+  Rust while the user has one open.
 - **`git commit -- <path>` takes a pathspec, and a pathspec only matches files
   git already knows.** Any dedup path that can be a *new* file — a chat agent
   creating a component or a page, a merge writing into a new file — must be
@@ -402,6 +451,18 @@ cargo test              # from src-tauri/ — all Rust tests
   stay legible however far the canvas is zoomed out. The busy grid is the
   exception that proves it: it is sized *from* the element's rect, because it
   is meant to cover the thing it is about.
+- **A re-parent drag says three things, and none of them touch the page.** The
+  grab/grabbing cursor is a stylesheet the overlay owns, keyed by dedup id
+  (`setCursor`) — the user's app names a cursor on nearly everything, so it
+  takes `!important` to outrank, and `grabbing` is scoped to the *document*
+  because mid-drag the pointer is over whatever it passes. The drop **ghost**
+  is the element's own footprint drawn in the slot it would land in, which the
+  2px line cannot say: it clamps the cross axis to the container, places
+  `inside` as the **last** child (where the write-back puts it) and, in a flex
+  row, draws `before` to the *left* — a ghost stacked above a row is a
+  confident lie. Grid is deliberately not guessed at. The dragged element's
+  fade is inline and restored to what was found, and every way a drag can end
+  (pointerup, Escape, blur) must clear all three — `test:overlay` walks them.
 - **Clicks inside an artboard never reach the canvas root** — they happen in
   another document and arrive as overlay messages instead. So the canvas root's
   own click handler only ever sees empty canvas or its floating chrome, which
@@ -409,12 +470,101 @@ cargo test              # from src-tauri/ — all Rust tests
   container or the pannable surface (`data-canvas-surface`), and *both ends* of
   the click must be there, or a pan finishing over the background reads as a
   click on it.
+- **Artboards sit where the user puts them** — dragged by their name label,
+  Figma's gesture (the page under the label stays the page; dragging there
+  edits it). `artboardLayout` (store) over `layoutArtboards` (canvasMemory) is
+  the *only* answer to "where is this page on the canvas": stored positions,
+  per viewport id (a layout of 390px boards overlaps at 1440), and anything
+  unstored joins to the right of the rightmost — which with nothing stored is
+  the old row. The canvas, the markup layer (marks are artboard-local, so they
+  follow), focus-a-route and the pinch-zoom anchor all read it; never
+  recompute `index × step`. The first move stores the *whole* current layout,
+  not one board, or every unstored board would jump with it.
+- **An element can leave its artboard, and "outside" has to mean something in
+  source.** A codebase has no off-frame layer, so dropping on the empty canvas
+  *parks* the element: a staged removal from its page plus a `ParkedPiece`
+  (`lib/parking.ts`) holding the clip a paste writes and a picture for the
+  card. Dropping into another artboard is a cut + paste; dragging a card into
+  one is a paste. All three go through `captureClip` / `stagePaste` /
+  `stageRemoval` — the same rules as ⌘X/⌘V (language, missing names, anchors on
+  their way out) — never a second implementation. The lifecycle rides the
+  staged program: `reconcileParked` runs on every program change (undo the
+  removal → piece gone, it's back in its page; undo a placement → card back),
+  and `saveAll` must apply `settleParked` **in the same `set` that empties the
+  program** — after it, reconcile sees no removals and drops the pieces, which
+  by then are the only copy. Saved pieces live in the app *data* dir
+  (`parking.rs`), not `node_modules/.dedup` (a reinstall wipes it) and not a
+  cache; nothing is written until the project's pieces have been read back, or
+  an early save would overwrite them with `[]`.
+- **The overlay hears a drag past its own edge only because it captures the
+  pointer** (`setPointerCapture` on activation). Out there it reports
+  `drag-outside`/`drop-outside` in its own CSS px and draws nothing; the
+  editor converts with the frame's measured box (`frameToScreen`, zoom
+  measured, not assumed). Another page is *probed* (`probe-drop` → that
+  overlay's own `dropTargetAt` → `probe-result`), so a drop from outside lands
+  exactly where an in-page drag would. A release outside is never also a
+  `drop` — `test:overlay` pins it.
+- **One gesture, one undo.** Structural actions may carry a `gesture` id;
+  `lib/undo.ts` takes a run sharing one as a single step. A cross-artboard move
+  is a paste *and* a removal — undoing half leaves the element in both pages
+  or neither. Anything new that stages several actions for one gesture should
+  share an id the same way.
+- **Canvas markup is dedup's ink on the user's page, and it lives above the
+  frames, never inside one.** `AnnotationLayer` is one layer over the
+  artboards: inert (`pointer-events: none`) in every tool but `annotate`, and
+  while armed it covers the frames completely — which is why entering the tool
+  clears the selection, since grips drawn on an element no gesture can reach
+  are a lie about what is interactive. Two rules in `lib/annotate.ts` are the
+  ones that only show up on screen. **Every mark stores its rough.js seed**:
+  rough re-randomises per call, so a shape regenerated on a pan or any
+  re-render is a different shape, and the sketch visibly crawls. And
+  **geometry is generated once at artboard scale**, with the nib held to a
+  constant screen width by `vector-effect: non-scaling-stroke` — regenerating
+  per zoom step is slower *and* makes the wobble breathe as you pinch. That is
+  the opposite of the overlay-chrome rule above, on purpose: a mark belongs to
+  the page it was drawn on, so it scales with it. Note chips are the exception
+  that proves it (chrome, so screen-positioned at a fixed size). Coordinates
+  are **artboard-local** and a mark belongs to a *route*, because pages get
+  closed and reordered. Nothing in this path can reach the user's source, and
+  the gesture hint says so.
 - The chrome floats over a full-bleed canvas. Anything that positions content
   on the canvas (initial pan, focus-a-route, the Components gallery) must inset
   by the live panel widths, or it lands under a panel. `.panel` in `styles.css`
   is the single definition of that elevation — new floating surfaces use it
   rather than re-deriving a shadow.
 
+- **A security header can render the whole canvas blank, silently.** dedup
+  frames the user's app, so `X-Frame-Options: DENY` (or a CSP with
+  `frame-ancestors`) makes the browser refuse the frame — with no console
+  error, no failed request and no clue anywhere the user can see. That header
+  is boilerplate in production-minded projects, so this is what a *well*
+  configured app looks like, not an exotic one. `frameable.mjs` is the single
+  rule: both dev pipelines strip it on the way out (the Vite tagger patches
+  `setHeader` *and* `writeHead` first in the middleware chain; `withDedup`
+  rewrites the project's declared `headers()`), only in the dev server dedup
+  starts, and only the framing directive — a CSP keeps everything else,
+  because the rest changes how the app behaves and the canvas exists to show
+  the app as it really is. Each pipeline announces the relaxation on the
+  dev-server stream, which the console drawer shows: a silent fix for a silent
+  failure is still silent. Known gap: a header set by a Next `middleware.ts`
+  is out of a config wrapper's reach.
+
+- **An artboard export is a render, not a crop.** `thumbs::snapshot_png`
+  rasterises a region of the app window — right for before/after diffs,
+  wrong for a deliverable (canvas zoom, the window edge, a floating panel over
+  the artboard all end up in it). `export.rs` loads the artboard's URL into a
+  throwaway `WKWebView` the artboard's exact size, in a borderless window at
+  alpha 0 placed 40,000pt off-screen — it must be *on* the window list
+  (`orderFrontRegardless`), because WebKit does not paint a view that is
+  ordered out, and borderless, because a titled window is clamped to the
+  screen and pages are taller than screens. It shares the canvas's
+  `WKWebsiteDataStore` (one session) and loads the page **inside an iframe**,
+  because the boot script — seed, offline, hold — only runs framed. URL and
+  size come from `artboardUrl` / `artboardHeight`, the same helpers the canvas
+  uses, so an export cannot show a different session or height than the
+  artboard. `takeSnapshot`'s width is in *points* and returns at the screen's
+  backing scale (`snapshot_width_pt`). Staged edits are not in an export —
+  the overlay previews them, the files don't have them — and the notice says so.
 - tauri-dev hot-restarts kill the app hard → the user-project dev server can
   be orphaned. Check `lsof -nP -iTCP:5173 -sTCP:LISTEN` after restarts; kill
   leftovers.
@@ -441,6 +591,14 @@ cargo test              # from src-tauri/ — all Rust tests
 - Safety model is non-negotiable (PRD §6): writes only on `dedup/session-*`
   branches, commit per save touching only dedup's files, output re-parsed
   before any file write. One corrupted user codebase kills the product.
+  **The one exception is a project with no git at all**, by the owner's
+  decision (2026-10-24): saving there writes the files in place, but only
+  after `DirectWritePrompt` has said so in as many words — which files, and
+  that there is no branch or commit to undo it — once per session, with "Set
+  up git" offered beside "Replace files". Every save path goes through
+  `needsDirectWriteWarning` + `commitOrDirect`; a new save path must too.
+  **Merges never write in place**: their gates undo a failure by restoring the
+  commit, so without git a failed merge would stay applied.
 - User's source/config are never mutated for tooling — everything injected
   lives in `sidecar::support_dir` (see the gotcha) or is served virtually.
   Scaffolding a starter into an **empty** folder is not an exception to that

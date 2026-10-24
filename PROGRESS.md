@@ -7,9 +7,10 @@ known limitations accepted knowingly.
 
 **Current state: Phases 0–5 complete.**
 (Plus a 2026-08-22 inspector/chrome UI pass, a 2026-08-23 structural-editing
-+ element-identity rework, a 2026-08-28 floating-canvas redesign, and a
++ element-identity rework, a 2026-08-28 floating-canvas redesign, a
 2026-08-29 pass widening what dedup can open — static HTML sites, and empty
-folders that become a project — see the interludes below.)
+folders that become a project — and a 2026-09-02 canvas-markup tool; see the
+interludes below.)
 
 ---
 
@@ -106,8 +107,20 @@ Figma-style panel + live editing + AST write-back + git safety model.
   full-width scrollers (`100dvh` + `overflow-y-auto` shells, e.g. Lenis
   wrappers) so the document, not an inner scrollbar, carries the true height.
   Width filter (≥60%) leaves sidebars/chat panels scrolling on their own.
-  Caveat: `fixed`/`sticky` and non-class vh usages still shift (Figma-model
-  tradeoff); per-project "device viewport" toggle is the known follow-up.
+  **Fixed (was: non-class vh usages still shift):** a raw-CSS/Bootstrap/
+  CSS-in-JS `vh`/`dvh`/`svh`/`lvh` height, uncaught by the classname freeze,
+  wasn't just a proportion mismatch — since height reporting is mutation-
+  driven, its already-grown size got measured again on the next unrelated
+  mutation and grew the frame further, ratcheting a plain full-height header
+  toward the 12000px cap on nothing but ordinary re-renders. `findViewportRules`
+  (same-origin stylesheets, incl. `@media`/`@supports`/`@layer`) and
+  `pinInlineVh` (inline styles, reasserted every measurement pass — a
+  re-render replaces the whole `style` attribute and would otherwise put the
+  raw vh value straight back) generalize the pin beyond Tailwind's own
+  classnames. `calc()`/`clamp()` vh expressions are left alone rather than
+  pinned wrong — still shift, and still the case for the "device viewport"
+  toggle if that turns out to matter in practice.
+  Caveat: `fixed`/`sticky` positioning still shifts (Figma-model tradeoff).
 - **Pages as artboards, spawned by navigation** — the canvas starts with just
   the root frame; navigating (browse mode) pins the destination as a new
   full-height page artboard at the end of the row and snaps the originating
@@ -2296,3 +2309,365 @@ to infer it.
   scan (`svg(path,path)` twice is a 1.0 match with no classes to separate
   them). Harbor's icons were deliberately given distinct child shapes so the
   demo doesn't show it. On a real codebase it will.
+
+---
+
+## Interlude — canvas markup (2026-09-02)
+
+The annotate tool: hand-drawn marks over the page artboards, drawn with
+[rough.js](https://roughjs.com), each with an optional note. `A` arms it, or
+the pencil in the toolbar; circle / box / arrow / freehand, four ink colours.
+
+**Why a sketch library rather than four `<path>`s.** A machine-perfect
+rectangle drawn over a machine-perfect UI reads as part of the UI. A wobbly one
+reads as somebody's pen. The whole job of this layer is to be visibly *not*
+the app, on top of the app — which is the same reason dedup renders the app at
+all rather than printing file:line.
+
+**Where it is not.** Not in `overlay.js`. The overlay is a single IIFE injected
+into the user's project, where anything that throws while it evaluates kills
+every listener after it — and marks are dedup's chrome, not the user's page, so
+nothing about them needs to be inside the frame. `AnnotationLayer` is one
+layer *above* the iframes instead. It is inert (`pointer-events: none`) in
+every tool but its own, and while armed it covers the frames completely, which
+is also why entering the tool clears the selection: resize grips drawn over an
+element no gesture can reach are a lie about what is interactive.
+
+**Two rules that only show up on screen**, both in `lib/annotate.ts`:
+
+- **Every mark stores its rough seed.** rough re-randomises per call, so a
+  shape regenerated on a pan or any React re-render is a *different* shape —
+  ink that crawls while you scroll. With the seed stored, geometry is a pure
+  function of the annotation, generated once and memoised. `test:annotate`
+  pins both directions (same seed → same path data, different seed → not).
+- **Geometry is generated once at artboard scale; the nib is held to a
+  constant screen width by `vector-effect: non-scaling-stroke`.** Regenerating
+  per zoom step would be slower *and* worse — the wobble would breathe while
+  you pinch. This is deliberately the opposite of the rule overlay chrome
+  follows (screen pixels, because it is chrome): a mark belongs to the page it
+  was drawn on. Note chips are the exception that proves it — they are chrome,
+  so they are positioned in screen space at a fixed size.
+
+**Marks belong to a route, not to a spot on the canvas.** Coordinates are
+artboard-local and stored per project (`dedup:marks:<root>`), re-validated on
+load exactly as the remembered canvas is: a NaN in a point is a path attribute
+that silently draws nothing, and a route that isn't a path is a stale choice.
+
+**Notes are chat context, in the same sense a selection is.** `annotationNotes`
+sends the words the user wrote, on pages that are currently open, and says in
+the prompt that dedup does *not* know which element each mark covers —
+resolving that lives inside the frame, and the overlay is not asked. A mark
+with no note sends nothing: a pointer with no words is not context.
+
+Nothing here touches the user's source. The gesture hint says so, because that
+is the question a tool that draws on your running app raises.
+
+## Both agents in one chat: `@claude`, `@codex`, and an image on request (2026-10-24)
+
+Both agents could already be connected at once — each Connect is its own
+consent — but one global `aiPref` decided every message, and connecting one
+made it the default. Using both meant flipping the top-bar switch back and
+forth. Two changes, at the two places that decision was actually being made.
+
+**Who answers is a property of the message.** `@claude` / `@codex` anywhere in
+a prompt sends *that* message to that agent; with no mention the top-bar
+default answers, as before. `lib/mentions.ts` is the rule, pure and pinned by
+`pnpm test:mentions` (17):
+
+- A mention is `@alias` at the start or after whitespace, ending at
+  whitespace, the end or sentence punctuation. `@radix-ui/react-icons` and
+  `me@codex.dev` are not mentions — a chat about code names both, and
+  mis-routing on them would be a real failure. Aliases come from `CLI_AGENTS`
+  (id + command), so a third agent is mentionable by being a row there.
+- Only the **first** mention routes, and only it is taken out of the prompt.
+  "@claude, ask @codex for a hero image" is a sentence, and the second mention
+  is part of it. The transcript keeps what the user typed.
+- A mention of an agent that isn't connected is answered by an error naming
+  it, never handed quietly to the default — that would be the silent backend
+  the AI switch exists to rule out.
+- The composer's `@` popup takes ↑/↓/Enter/Tab/Escape *before* prompt history
+  and Send do, and only while it is open: otherwise Enter would send a
+  half-typed `@co`. It opens upward, because the composer is at the bottom.
+
+Every assistant message now records `agent`. The bubble shows it, and the next
+turn's transcript labels a reply some *other* agent wrote as such rather than
+handing it over as "You:" — a model defending a choice it never made is worse
+at the follow-up than one that knows a colleague made it.
+
+**Claude can ask Codex for an image.** A fifth marker, offered only to a
+backend that cannot generate images itself, and only while a connected agent
+can (`generatesAssets` — the same honesty rule the ASSET directive follows):
+
+    <<<<<<< IMAGE public/hero.png
+    a description of the picture
+    >>>>>>> END
+
+**It names no source path, so it widens nothing.** dedup sends the description
+to Codex with a strict prompt (`imageRequestPrompt`) and reads the answer with
+`pickGeneratedImage`, which takes exactly one ASSET block and refuses prose,
+two images, or any edit riding along — a second agent writing source the user
+asked a different agent about is not something anyone reviewed. The path Codex
+returns then goes through `asset.rs` as **Codex's** output (its own
+`asset_dir`), exactly as if the user had asked Codex directly; the destination
+is the requester's, because that is where its markup already points. Imports
+now carry their agent, so the gate is chosen per file rather than per turn.
+
+Ordering, because generating is the slow part: every cheap refusal (write and
+import of the same path, nothing to change, staged style edits in the way) runs
+on destinations *before* Codex is asked. After that a delegated image rides the
+proposal lifecycle unchanged — imported before the text write, previewed
+uncommitted, committed by Keep, removed by Discard. `chatActivity` puts
+"Codex is generating public/hero.png…" in the working bubble, because a minute
+of bare "Working…" reads as a hang.
+
+**Tests:** `pnpm test:mentions` (17, new). `pnpm test:chat` (28, +7): an IMAGE
+block beside the markup using it, one on its own, three malformed shapes
+throwing, the picker taking one path and refusing four other answers, the
+request prompt being answerable by its own picker, and the prompt offering
+IMAGE only to a non-generator with a generator connected — and never ASSET
+alongside it.
+
+**Not verified end to end:** a real Claude → Codex image round trip in the
+running app. The parsing, the picker and the gate are each tested; the live
+hand-off between two signed-in CLIs is the part a test here cannot reach.
+
+## The AI menu becomes switches, and Codex gets a model picker (2026-10-24)
+
+With `@` routing, "Use this" was asking the wrong question — nothing needs to
+be *the* backend when a message can name one. Each backend now has an on/off
+switch (`AgentState.enabled`, persisted; the API key has `apiEnabled`).
+Switching an agent on for the first time is Connect — the live test prompt —
+and lands on only if it passes; switching off keeps consent, so on again is
+instant. A message with no mention, and everything outside the chat (scan
+organizing, merges, the session seed), goes to the first one on in CLI_AGENTS
+order, then the API key; the menu marks it "default". Fixed order rather than
+last-used, so that label is stable. The old single `dedup:ai-pref` carries
+over: the backend it named is the one that starts on, and nothing else is
+switched on behind the user's back. `agentOn` (`lib/types.ts`) is the one
+rule for "may this be sent to", shared by the store and the composer.
+
+**Codex's models come from Codex.** `ai::models` runs `codex debug models` and
+keeps the entries its own picker lists (`visibility: "list"`), in its
+`priority` order. Not a list in dedup, because of the failure that prompted
+it: the ChatGPT app updated its bundled Codex and wrote a new default model
+into the shared `~/.codex/config.toml`, and the older standalone CLI dedup
+runs refused it. The catalog is per-binary, so the picker only offers names
+the copy dedup actually runs knows. A saved model neither list contains stays
+visible as "(saved)" instead of the select silently showing the default.
+
+`cargo test` (102, +1): the catalog parse — hidden entries dropped, priority
+order, a blank display name falling back to the slug, one row per slug.
+
+## Fix — a delegated image refused for being a PNG (2026-10-24)
+
+The first real Claude → Codex hand-off got all the way to the import gate:
+Claude asked for `images/hero-container-lift.jpg`, Codex generated it, and the
+gate refused it — "that image is a PNG, but the AI asked to save it as …jpg".
+The gate was right that a name must agree with its bytes, and wrong about whose
+mistake it was: an IMAGE request names its destination *before* the image
+exists, and the generating agent decides the format (every one of the 152 files
+in `~/.codex/generated_images` is a PNG).
+
+Two layers. The IMAGE directive now says generated images arrive as PNG and to
+name the destination `.png`. And for a delegated import only, `asset::import`
+takes `adapt_extension`: a disagreeing extension is corrected (`.jpg` → `.png`)
+rather than refused, and the result says where the file landed. Every other
+gate is untouched — a non-image is still refused, and the *corrected* name is
+the one checked for already existing. A direct ASSET import, where the agent
+that made the file also named it, stays strict.
+
+The requester's markup still says `.jpg`, so `retargetReferences` renames the
+references the edit added — matched on the file name with path-character
+boundaries, so `big-hero.jpg` and `hero.jpg.bak` are left alone. A file whose
+*before* contents already mentioned the name is refused rather than renamed:
+the image didn't exist until now, so that reference is the user's, about
+something else. The renamed text is what the preview writes and what Discard
+reverts, and the proposal's file list shows the real name.
+
+Also fixed: that refusal message had a run of spaces in the middle of it — a
+line break inside a Rust string literal, written without its `\`.
+
+`cargo test` (103, +1): a delegated PNG named `.jpg` lands as `.png`, a
+non-image is still refused, the corrected name is the one checked for
+collisions. `pnpm test:chat` (32, +4): references renamed in the edit's markup,
+every spelling of the path (`./`, `/`, `url()`, `srcset`) caught and a longer
+name not, a pre-existing mention refused, untouched and new files handled.
+
+## No git: set one up, or save in place after a warning (2026-10-24)
+
+Opened a static site with no repository, a chat edit previewed fine and Keep
+failed: "This project is not a git repository — dedup requires git to save."
+Two things were wrong. The preview path never asked about git, so an AI edit
+went onto disk that Keep could never commit. And worse, found while tracing
+it: `saveAll` and `saveCode` write first and commit second, so in a folder
+with no git a style or code save *landed*, then reported a save error, and
+left the edit staged — a second ⌘S could apply it twice.
+
+**"Set up git"** (top bar, chat panel, and the warning below):
+`git::init_baseline` runs `git init -b main` and commits the folder's files as
+"Baseline before dedup edits". It refuses a folder already inside a repository
+(a parent's included — that history is the user's), and if the commit fails —
+usually no git identity, which it names with the two commands to fix — it
+removes the `.git` it just created, so the folder is left exactly as found.
+With a chat preview on disk, the preview is set aside for the baseline and put
+back after, images re-imported from the agent's directory through the same
+gates: the first commit in a new history never contains an AI edit nobody
+accepted. The proposal is then Keep-able as normal.
+
+**Or save in place, after being told.** The owner's call: a folder with no git
+is still theirs to edit. Every save path — chat Keep, ⌘S, the code panel —
+goes through `needsDirectWriteWarning` *before* writing anything: the first
+time in a session it raises `DirectWritePrompt`, which lists the files and
+says there is no branch to put the change on and no commit to undo it, with
+"Replace files", "Set up git" and Cancel. Confirmed, `commitOrDirect` skips
+the commit; the top bar says "Saved in place" and the transcript "kept ·
+written into the files (no git)" instead of showing a hash that doesn't exist.
+**Merges are the exception** and still require git: their gates undo a failed
+merge by restoring the commit, so in place a failed merge would stay applied.
+
+Also learnt the hard way: a pending preview's `before` snapshots live only in
+memory, and a tauri-dev hot restart (an `src-tauri/` edit) kills the app hard.
+Editing Rust mid-session left the user's hero-image preview on disk with dedup
+no longer knowing it was one. Recovered by un-stamping a copy of the page the
+static server had served earlier — `data-dedup-*` attributes and the injected
+scripts removed — which came back byte-identical to the original (36,742
+bytes), making the AI's three-line change exactly visible.
+
+`cargo test` (105, +2): a plain folder becomes a repo whose one commit is its
+files, clean, on `main`, and can then make a session branch; a second call and
+a folder inside another repository are both refused.
+
+Not covered by an automated test: the prompt flow itself (store + modal), and
+setting git up with a live preview, which needs a running app.
+
+## Export an artboard as PNG or PDF (2026-10-24)
+
+Each artboard label has a hover export button (beside close): PNG at 1x, PNG
+@2x, or PDF, then a save dialog, then a notice with the size and "Show in
+Finder". The PDF is vector — one page as tall as the artboard, real selectable
+text (Arabic included, on the page it was tried on).
+
+**A render, not a crop.** The existing capture (`thumbs::snapshot_png`)
+rasterises a region of the app window: whatever zoom the canvas is at, cut off
+at the window edge, with any floating panel in the picture. `export.rs` instead
+loads the artboard's URL into a throwaway `WKWebView` exactly the artboard's
+size, in a borderless window at alpha 0 placed 40,000pt off-screen, and asks
+WebKit for `takeSnapshot` or `createPDF`. Three details, each found by a
+throwaway Swift probe before any app code was written:
+
+- The window must be on the window list (`orderFrontRegardless`) — WebKit does
+  not paint an ordered-out view — and borderless, because a titled window is
+  clamped to the screen and a 1440×6400 page is taller than any screen.
+- `takeSnapshot`'s width is in points and comes back at the backing scale:
+  asking for "2x" on a retina screen produced 4x (5760×25600).
+  `snapshot_width_pt` divides it back out.
+- The page is loaded inside an iframe, because the boot script (seed,
+  offline, hold) only runs framed. The view shares the canvas's
+  `WKWebsiteDataStore`, so a real sign-in applies too.
+
+URL and size come from two helpers the canvas now uses as well — `artboardUrl`
+(lib/origins) and `artboardHeight` (lib/types) — so an export cannot render a
+different session or a different height than the artboard on screen. One
+export at a time; the window is torn down on every path out. Staged edits are
+not included (they are an overlay preview, not file contents) and the notice
+says so. PNG refuses past 32,000px a side with a message pointing at 1x or PDF,
+which has no limit.
+
+`cargo test` (108, +3): the wrapper frames the URL at the artboard's size with
+the URL escaped for its attribute, the points-vs-pixels arithmetic, and the
+up-front refusals. `pnpm test:origins` (10, +2): `artboardUrl` equals what the
+canvas built inline for every session and flag combination, and the height rule.
+
+**Not verified in the running app:** the export path itself — the native code
+mirrors the probe (which produced a correct full-page PNG and a vector PDF of
+shipnsecure) but has not been clicked through.
+
+## Drag an element off its artboard — park it, or move it to another page (2026-10-25)
+
+Figma lets a layer leave its frame. A codebase has no "outside" — every element
+lives in a file, and only pages render — so the question was what an element
+dropped on the empty canvas *is*. The owner's answer: it is **parked**. It
+leaves its page (a staged removal, saved like any other) and dedup keeps it as a
+card where it was dropped, until it is dragged into an artboard or deleted.
+
+Three gestures, one set of rules:
+- **Off the page onto the canvas → parked.** A staged removal plus a
+  `ParkedPiece` holding what a paste writes (`captureClip`, the same capture ⌘C
+  makes — source from the file, markup from the page) and a picture for the
+  card (`snapshot_region`, taken while the element is still on screen).
+- **Off one page into another → moved.** A paste at the probed slot, then the
+  removal, as one gesture with one undo step. Paste first, because it is the
+  half with refusals of its own (another language, an anchor on its way out);
+  if the removal is then refused, the paste is taken back.
+- **A card into a page → placed.** A paste of what the card holds.
+All three go through `stagePaste` / `stageRemoval`, split out of ⌘V and ⌫, so a
+parked or moved element obeys exactly what a paste does: same-language only,
+missing names said out loud, an anchor being deleted refused.
+
+**Lifecycle rides the staged program, not a parallel one** (`lib/parking.ts`):
+undo the removal and the piece is gone (it is back in its page); undo a
+placement and the card comes back; a save turns pending removals into settled
+pieces and finishes placed ones. Save settles in the *same* state update that
+empties the program — afterwards, the reconcile would see no removals and throw
+away what is now the only copy. `test:parking` pins that ordering explicitly.
+
+**Kept where nothing routine can lose it.** Settled pieces are written to the
+app's data directory (`parking.rs`, atomic rename), not `node_modules/.dedup`
+(a reinstall wipes it) and not a cache dir (the OS may purge it). Writes wait
+until the project's pieces have been read back, or an early save would write
+`[]` over them.
+
+**The overlay.** It now captures the pointer when a drag starts, so it keeps
+hearing it past the frame's edge; out there it posts `drag-outside` (with the
+element's id and label, for the editor's ghost) and finishes with
+`drop-outside` — never also an in-page `drop`. Other pages are *probed*: the
+editor sends the point in that page's own coordinates (`probe-drop`), that
+overlay answers with the slot its own `dropTargetAt` picks and draws it, so a
+drop from outside lands exactly where a drag inside would.
+
+**One gesture, one undo.** Structural actions can carry a `gesture` id, and
+`lib/undo.ts` treats a run sharing one as one step — undoing half a move would
+leave the element in both pages, or neither.
+
+Tests: `pnpm test:overlay` (38, +3 — capture past the edge, the drop-outside
+that is not a drop, probing and clearing); `pnpm test:parking` (13, new — every
+lifecycle transition, the save ordering, what persists, loading untrusted data,
+coordinate round-trips, one-gesture undo); `cargo test` (110, +2 — the stored
+list's shape, atomic writes).
+
+**Not verified in the running app:** none of the gestures have been clicked
+through. Known gaps: the card's picture is a crop of the app window, so a panel
+floating over the element at the moment of the drop is in it; a pending (never
+saved) element can't be parked or moved between pages yet; and the overlay
+change only reaches a project when it is reopened.
+
+## Artboards move, like Figma frames (2026-10-25)
+
+Artboards were a row: `index × (width + gap)`, recomputed everywhere that
+needed one. They now sit where the user puts them, dragged by their name label
+— Figma's gesture, and the only one that leaves the page itself to editing. A
+click on the label still selects the artboard for Scan; four pixels of travel
+makes it a move.
+
+**One layout rule** (`layoutArtboards`, read through the store's
+`artboardLayout`): stored positions win; an artboard without one goes to the
+right of the rightmost so far, which with nothing stored is exactly the old
+row. The canvas (labels, frames, the off-screen culling, now in two
+dimensions), the markup layer, "focus this page" and the cursor-anchored pinch
+zoom all read it. Canvas markup is artboard-local, so marks follow their page;
+the layer's nearest-artboard rule is now a 2D distance to the box rather than
+the nearest column.
+
+Positions are stored with the remembered canvas **per viewport id** — boards
+are sized by the viewport, so a layout made for 390px boards would overlap at
+1440 — validated on load like the rest of it (finite numbers, open artboards
+only). The first move stores the whole current layout rather than one board:
+unstored boards are placed relative to the rightmost, so storing only the
+moved one would make the rest jump with it. Closing an artboard drops its
+position in every viewport, the same way every other per-route choice goes
+with it.
+
+`pnpm test:canvas` (17, +4): the row with nothing moved, a moved board staying
+put while a new one joins past the rightmost, a board moved far left not
+dragging arrivals with it, positions round-tripping per viewport and dirty
+ones dropped. Not clicked through in the running app.

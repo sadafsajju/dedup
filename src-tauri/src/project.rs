@@ -5,6 +5,21 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Every spelling of a Vite config file. Shared with `instrument::find_vite_config`
+/// so detection and instrumentation can't disagree about what a Vite project
+/// looks like: a project detected as Vite whose config this list misses is
+/// classified `Static` instead and served as raw HTML, and one instrumented
+/// against a config detection never saw is tagged for a project the card said
+/// wasn't Vite. Same rule as jsxwalk — one list, never forked.
+pub const VITE_CONFIG_NAMES: [&str; 6] = [
+    "vite.config.ts",
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.mts",
+    "vite.config.cjs",
+    "vite.config.cts",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectInfo {
@@ -23,8 +38,16 @@ pub struct ProjectInfo {
     /// Element ids stay relative to `root` regardless, so one project has one
     /// path vocabulary.
     pub static_dir: Option<String>,
-    /// The script we'll run to start the dev server, if we found one.
+    /// The *body* of the script we'll run to start the dev server, if we found
+    /// one — what `instrument::setup` inspects to decide whether it can rewrite
+    /// the launch.
     pub dev_script: Option<String>,
+    /// The script's *name* (`dev` or `start`). Carried separately because the
+    /// two are not interchangeable: detection accepts either name, so a project
+    /// with only `start` must be launched as `start`. Running a hardcoded `dev`
+    /// against it reports the project as supported and then fails on a script
+    /// that isn't there.
+    pub dev_script_name: Option<String>,
     /// Overall verdict + the one-line summary rendered on the compat card.
     pub support: SupportLevel,
     pub summary: String,
@@ -110,10 +133,25 @@ const STATIC_DIRS: [&str; 6] = ["", "public", "site", "www", "docs", "src"];
 
 /// Where this project's static pages are, relative to the root — `Some("")`
 /// for the root itself — or None when there is no HTML site here.
+///
+/// An `index.html` anywhere in `STATIC_DIRS` wins; failing that, the first of
+/// them holding any `.html` page. A site need not have an index — a page
+/// exported from a design tool is one `Main.dc.html` — and static route
+/// discovery already makes every page its own route, so requiring the index
+/// only turned such a folder away.
 fn find_static_dir(root: &Path) -> Option<String> {
+    let has_page = |dir: &Path| {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                e.path().extension().is_some_and(|x| x == "html")
+                    && e.file_type().is_ok_and(|t| t.is_file())
+            })
+        })
+    };
     STATIC_DIRS
         .iter()
         .find(|d| root.join(d).join("index.html").exists())
+        .or_else(|| STATIC_DIRS.iter().find(|d| has_page(&root.join(d))))
         .map(|d| d.to_string())
 }
 
@@ -170,6 +208,7 @@ pub fn detect(root: &str) -> ProjectInfo {
             is_empty: true,
             static_dir: None,
             dev_script: None,
+            dev_script_name: None,
             support: SupportLevel::Unsupported,
             summary: "Empty folder — pick something to start here.".to_string(),
             warnings: Vec::new(),
@@ -215,7 +254,7 @@ pub fn detect(root: &str) -> ProjectInfo {
         );
         if !has_git {
             warnings.push(
-                "No git repository. dedup's safety model requires git for write operations."
+                "No git repository. dedup's safety model requires git to save — the editor can set one up (top bar → Set up git)."
                     .into(),
             );
         }
@@ -244,6 +283,7 @@ pub fn detect(root: &str) -> ProjectInfo {
             is_empty: false,
             static_dir: (!dir.is_empty()).then_some(dir),
             dev_script: None,
+            dev_script_name: None,
             support,
             summary,
             warnings,
@@ -253,10 +293,27 @@ pub fn detect(root: &str) -> ProjectInfo {
     let has_tailwind = detect_tailwind(&root_path, pkg.as_ref());
     let has_typescript = root_path.join("tsconfig.json").exists()
         || dep_present(pkg.as_ref(), "typescript");
-    let dev_script = pkg
+    // Name and body together: `start` is accepted as a dev script, so the name
+    // has to travel with it or the launch runs a `dev` that doesn't exist.
+    let (dev_script_name, dev_script) = pkg
         .as_ref()
-        .and_then(|p| p.scripts.get("dev").cloned())
-        .or_else(|| pkg.as_ref().and_then(|p| p.scripts.get("start").cloned()));
+        .and_then(|p| {
+            ["dev", "start"]
+                .iter()
+                .find_map(|n| p.scripts.get(*n).map(|s| (n.to_string(), s.clone())))
+        })
+        .map(|(n, s)| (Some(n), Some(s)))
+        .unwrap_or((None, None));
+
+    // A Vite project with no script at all is still drivable when its own vite
+    // binary is present: `instrument::setup` defaults the script to a bare
+    // `vite` and spawns that binary directly, with no package manager in the
+    // loop. Calling it unsupported forces the user into a custom command, and
+    // a custom command is the one launch path that skips instrumentation — so
+    // the verdict would cost them the tagging it was wrong about.
+    let vite_direct = framework == Framework::Vite
+        && dev_script.is_none()
+        && root_path.join("node_modules/.bin/vite").exists();
 
     let mut warnings = Vec::new();
     if pkg.is_none() {
@@ -310,13 +367,22 @@ pub fn detect(root: &str) -> ProjectInfo {
         warnings.push("TypeScript not detected. The safety gate relies on `tsc` typechecking.".into());
     }
     if dev_script.is_none() && pkg.is_some() {
-        warnings.push("No `dev` or `start` script found. You'll need to set a custom command.".into());
+        warnings.push(if vite_direct {
+            "No `dev` or `start` script found. dedup runs this project's own \
+             `node_modules/.bin/vite` directly, so inspection still works."
+                .into()
+        } else {
+            "No `dev` or `start` script found. You'll need to set a custom command.".to_string()
+        });
     }
     if !has_git {
-        warnings.push("No git repository. dedup's safety model requires git for write operations.".into());
+        warnings.push("No git repository. dedup's safety model requires git to save — the editor can set one up (top bar → Set up git).".into());
     }
 
-    let support = if pkg.is_none() || framework == Framework::Unknown || dev_script.is_none() {
+    let support = if pkg.is_none()
+        || framework == Framework::Unknown
+        || (dev_script.is_none() && !vite_direct)
+    {
         SupportLevel::Unsupported
     } else if !has_tailwind || !has_typescript || !has_git || !next_ready {
         SupportLevel::Partial
@@ -343,6 +409,7 @@ pub fn detect(root: &str) -> ProjectInfo {
         is_empty: false,
         static_dir: None,
         dev_script,
+        dev_script_name,
         support,
         summary,
         warnings,
@@ -426,9 +493,7 @@ fn detect_framework(root: &Path, pkg: Option<&PackageJson>) -> Framework {
         return Framework::Next;
     }
     if dep_present(pkg, "vite")
-        || root.join("vite.config.ts").exists()
-        || root.join("vite.config.js").exists()
-        || root.join("vite.config.mjs").exists()
+        || VITE_CONFIG_NAMES.iter().any(|c| root.join(c).exists())
     {
         return Framework::Vite;
     }
@@ -617,6 +682,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A page exported from a design tool has no index.html — one named page
+    /// plus its runtime. It is still a site; turning it away as "no
+    /// package.json" was the verdict for a JS project it never claimed to be.
+    #[test]
+    fn a_site_without_an_index_is_still_a_site() {
+        let dir = temp_dir("noindex");
+        write(&dir, "Main.dc.html", "<x-dc><h1>hi</h1></x-dc>");
+        write(&dir, "support.js", "");
+        std::fs::create_dir_all(dir.join("vendor")).unwrap();
+        std::fs::write(dir.join("vendor/react.js"), "").unwrap();
+
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Static);
+        assert_ne!(info.support, SupportLevel::Unsupported);
+        assert_eq!(info.static_dir, None, "the page is at the root");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The fallback never outranks an index: a stray page at the root does not
+    /// move the site root away from the folder that has one.
+    #[test]
+    fn an_index_still_decides_where_the_site_is() {
+        let dir = temp_dir("strayroot");
+        write(&dir, "draft.html", "<h1>old</h1>");
+        std::fs::create_dir_all(dir.join("site")).unwrap();
+        std::fs::write(dir.join("site/index.html"), "<h1>hi</h1>").unwrap();
+
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.static_dir.as_deref(), Some("site"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The Play CDN is how a hand-written page gets Tailwind, and it is the
     /// difference between the Style panel doing something and doing nothing.
     #[test]
@@ -671,8 +768,82 @@ mod tests {
             r#"{"dependencies":{"vite":"^5"}}"#,
         );
         let info = detect(dir.to_str().unwrap());
-        // Vite present but no runnable dev script -> we can't drive it.
+        // Vite in the dependency list but nothing to run it with: no script,
+        // and no installed binary to spawn directly either.
         assert_eq!(info.support, SupportLevel::Unsupported);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `.mts` is how a Vite config is spelled in an ESM-strict monorepo
+    /// (excalidraw, among others). Detection used to miss it, and since a Vite
+    /// project also has an index.html, the folder fell through to the static
+    /// branch and would have been served as flat files — with the raw template
+    /// tags of an unbuilt index.html rendered as text.
+    #[test]
+    fn a_vite_config_dot_mts_is_a_vite_project_not_a_static_site() {
+        let dir = temp_dir("mtsconfig");
+        write(&dir, "index.html", "<div id=\"root\"></div>");
+        write(&dir, "package.json", r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir, "vite.config.mts", "export default {}");
+        assert_eq!(detect(dir.to_str().unwrap()).framework, Framework::Vite);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Detection accepts `start` when there is no `dev`, so the name has to
+    /// travel with the body — launching a hardcoded `dev` against a project
+    /// that only has `start` fails *after* the card called it supported.
+    #[test]
+    fn a_start_only_project_reports_the_script_it_is_launched_by() {
+        let dir = temp_dir("startonly");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"start":"vite --port 3001"},"devDependencies":{"vite":"^5"}}"#,
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.dev_script_name.as_deref(), Some("start"));
+        assert_eq!(info.dev_script.as_deref(), Some("vite --port 3001"));
+        assert_ne!(info.support, SupportLevel::Unsupported);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dev_script_wins_over_start() {
+        let dir = temp_dir("bothscripts");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"start":"serve build","dev":"vite"},"devDependencies":{"vite":"^5"}}"#,
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.dev_script_name.as_deref(), Some("dev"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The trap this pairs with: calling a script-less Vite project
+    /// unsupported forces the user into a custom dev command, and a custom
+    /// command is the one launch path that skips instrumentation. The verdict
+    /// would have cost them the tagging it was wrong about.
+    #[test]
+    fn no_script_is_still_openable_when_the_vite_binary_is_installed() {
+        let dir = temp_dir("vitedirect");
+        write(&dir, "package.json", r#"{"devDependencies":{"vite":"^5"}}"#);
+        std::fs::create_dir_all(dir.join("node_modules/.bin")).unwrap();
+        write(&dir, "node_modules/.bin/vite", "#!/bin/sh\n");
+
+        let info = detect(dir.to_str().unwrap());
+        assert!(info.dev_script.is_none());
+        assert_ne!(
+            info.support,
+            SupportLevel::Unsupported,
+            "{:?}",
+            info.warnings
+        );
+        assert!(
+            info.warnings.iter().any(|w| w.contains("node_modules/.bin/vite")),
+            "the card must say what it will run instead: {:?}",
+            info.warnings
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

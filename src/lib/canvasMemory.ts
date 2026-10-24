@@ -31,6 +31,40 @@ export interface SavedCanvas {
   sessionModes: Record<string, SessionMode>;
   heldRoutes: string[];
   offlineRoutes: string[];
+  /** Where the user put each artboard, per viewport (artboards are sized by
+   *  the viewport, so a layout made for 390px boards would overlap at 1440).
+   *  Surface coordinates, the units the canvas lays pages out in. Absent for
+   *  a viewport nobody has rearranged: the row then applies. */
+  positions?: Record<string, Record<string, { x: number; y: number }>>;
+}
+
+/**
+ * Where every open artboard goes. Stored positions win; an artboard without
+ * one goes to the right of the rightmost so far — which, with nothing stored,
+ * is exactly the old row (0, step, 2·step, …). Pure, so the canvas, the
+ * markup layer and "focus this page" all lay out the same way.
+ */
+export function layoutArtboards(
+  routes: string[],
+  stored: Record<string, { x: number; y: number }> | undefined,
+  width: number,
+  gap: number,
+): Record<string, { x: number; y: number }> {
+  const out: Record<string, { x: number; y: number }> = {};
+  let right = -gap; // the right edge so far, minus the gap the next one needs
+  for (const route of routes) {
+    const p = stored?.[route];
+    if (p) {
+      out[route] = { x: p.x, y: p.y };
+      right = Math.max(right, p.x + width);
+    }
+  }
+  for (const route of routes) {
+    if (out[route]) continue;
+    out[route] = { x: right + gap, y: 0 };
+    right += gap + width;
+  }
+  return out;
 }
 
 /**
@@ -76,7 +110,28 @@ export function loadCanvas(root: string): SavedCanvas | null {
       }
     }
 
+    // Positions: finite numbers, for open artboards, per viewport id.
+    const positions: Record<string, Record<string, { x: number; y: number }>> = {};
+    for (const [viewport, byRoute] of Object.entries(saved.positions ?? {})) {
+      if (!byRoute || typeof byRoute !== "object") continue;
+      const kept: Record<string, { x: number; y: number }> = {};
+      for (const [route, p] of Object.entries(byRoute)) {
+        const pt = p as { x?: unknown; y?: unknown } | null;
+        if (
+          open(route) &&
+          typeof pt?.x === "number" &&
+          typeof pt?.y === "number" &&
+          Number.isFinite(pt.x) &&
+          Number.isFinite(pt.y)
+        ) {
+          kept[route] = { x: pt.x, y: pt.y };
+        }
+      }
+      if (Object.keys(kept).length > 0) positions[viewport] = kept;
+    }
+
     return {
+      positions,
       routes,
       selectedRoute:
         typeof saved.selectedRoute === "string" && open(saved.selectedRoute)

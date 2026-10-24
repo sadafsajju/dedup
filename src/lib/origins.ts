@@ -59,6 +59,21 @@ export function frameUrl(
   return url.toString();
 }
 
+/**
+ * The URL an artboard's frame loads: its route, on the origin `resolveOrigin`
+ * picks, with its frame flags. The canvas and the artboard export both build
+ * it here, so an export can never render a different session than the
+ * artboard shows. null before the dev server is up.
+ */
+export function artboardUrl(
+  route: string,
+  inputs: OriginInputs,
+  flags: FrameFlags = {},
+): string | null {
+  const origin = resolveOrigin(route, inputs) ?? inputs.devUrl;
+  return origin ? frameUrl(route, origin, flags) : null;
+}
+
 /** The user's choice for one artboard. "auto" defers to the fallback. */
 export type SessionMode = "auto" | "in" | "out";
 

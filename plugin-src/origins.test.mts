@@ -11,9 +11,11 @@ import {
   FLAG_PREFIX,
   HOLD_FLAG,
   OFFLINE_FLAG,
+  artboardUrl,
   frameUrl,
   resolveOrigin,
 } from "../src/lib/origins.ts";
+import { VIEWPORTS, artboardHeight } from "../src/lib/types.ts";
 import type { OriginInputs } from "../src/lib/origins.ts";
 import {
   // @ts-expect-error — the built plugin bundle ships no type declarations.
@@ -130,6 +132,36 @@ test("frame flags ride on the frame URL, and only when asked", () => {
     frameUrl("/p?tab=two", at, { held: true }),
     `${at}/p?tab=two&${HOLD_FLAG}=1`,
   );
+});
+
+test("an export loads exactly the frame the artboard loads", () => {
+  const inputs: OriginInputs = {
+    sessionModes: { "/welcome": "out" },
+    frameOrigins: {},
+    devUrl: "http://localhost:5173",
+    devAltUrl: "http://127.0.0.1:5173",
+  };
+  for (const route of ["/", "/welcome", "/pricing"]) {
+    for (const flags of [{}, { held: true }, { offline: true }, { held: true, offline: true }]) {
+      assert.equal(
+        artboardUrl(route, inputs, flags),
+        frameUrl(route, resolveOrigin(route, inputs) ?? (inputs.devUrl as string), flags),
+        `${route} ${JSON.stringify(flags)}`,
+      );
+    }
+  }
+  // A signed-out artboard exports signed out, offline exports offline.
+  assert.match(artboardUrl("/welcome", inputs) as string, /^http:\/\/127\.0\.0\.1:5173\/welcome/);
+  assert.match(artboardUrl("/pricing", inputs, { offline: true }) as string, new RegExp(`${OFFLINE_FLAG}=1`));
+  assert.equal(artboardUrl("/", { ...inputs, devUrl: null, devAltUrl: null }), null, "no server, no URL");
+});
+
+test("an artboard's height: device height at least, the page's own if taller, capped", () => {
+  const [mobile, , desktop] = VIEWPORTS;
+  assert.equal(artboardHeight(mobile, undefined), 844);
+  assert.equal(artboardHeight(mobile, 3000), 3000);
+  assert.equal(artboardHeight(desktop, undefined), 800, "desktop has no device height");
+  assert.equal(artboardHeight(desktop, 50_000), 12000, "a runaway page is capped");
 });
 
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

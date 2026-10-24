@@ -14,11 +14,43 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CheckIcon, Cross2Icon, FileIcon } from "@radix-ui/react-icons";
 import { useStore } from "../lib/store";
 import { diffLines, diffStat, toHunks } from "../lib/diff";
-import { parseDedupId } from "../lib/types";
-import type { PendingEdit } from "../lib/types";
+import { CLI_AGENTS, agentOn, parseDedupId } from "../lib/types";
+import type { CliAgent, PendingEdit } from "../lib/types";
 import { CopyButton } from "./ui";
+import { SetUpGit } from "./SetUpGit";
 import { promptsFrom, stepHistory } from "../lib/promptHistory";
 import type { HistoryState } from "../lib/promptHistory";
+import {
+  insertMention,
+  mentionAlias,
+  mentionAt,
+  mentionCandidates,
+  routeMention,
+  splitMentions,
+} from "../lib/mentions";
+
+const labelOf = (agent: CliAgent | "api") =>
+  agent === "api"
+    ? "Claude (API key)"
+    : (CLI_AGENTS.find((a) => a.id === agent)?.label ?? agent);
+
+/** A sent prompt with its `@agent` mentions marked, so it is visible at a
+ *  glance which messages went to whom. */
+function PromptText({ text }: { text: string }) {
+  return (
+    <>
+      {splitMentions(text).map((run, i) =>
+        run.agent ? (
+          <span key={i} className="font-medium text-accent">
+            {run.text}
+          </span>
+        ) : (
+          <span key={i}>{run.text}</span>
+        ),
+      )}
+    </>
+  );
+}
 
 /** One file's before/after, narrow enough for the inspector column: no line
  *  gutters, just the sign and the text, scrolling sideways rather than
@@ -156,9 +188,18 @@ export function ChatPanel() {
   const selectChatSession = useStore((s) => s.selectChatSession);
   const deleteChatSession = useStore((s) => s.deleteChatSession);
   const backend = useStore((s) => s.activeAiBackend());
+  const agents = useStore((s) => s.agents);
+  const chatActivity = useStore((s) => s.chatActivity);
+  const noGit = useStore((s) => s.git?.isRepo === false);
   const chat = sessions.find((x) => x.id === activeChatId)?.messages ?? [];
 
   const [draft, setDraft] = useState("");
+  // The `@` autocomplete: where the caret is, which row is highlighted, and
+  // which mention the user waved away with Escape (by its start offset, so a
+  // new `@` elsewhere opens it again).
+  const [caret, setCaret] = useState(0);
+  const [pick, setPick] = useState(0);
+  const [dismissedAt, setDismissedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -191,12 +232,67 @@ export function ChatPanel() {
   }, [chat.length, chatBusy, activeChatId, pendingEdit]);
 
   const src = selected ? parseDedupId(selected.dedupId) : null;
-  const canSend = !!backend && !chatBusy && draft.trim() !== "";
+  const connected = (a: CliAgent) => agentOn(agents[a]);
+  const anyConnected = !!backend || CLI_AGENTS.some((a) => connected(a.id));
+  // A mention routes the message, so it can be sent with no default chosen —
+  // and a bare "@codex" asks nothing, so it can't be sent at all. (A mention
+  // of an agent that is off *is* sendable: the reply says so, which is
+  // clearer than a Send button that is grey for no visible reason.)
+  const routed = routeMention(draft);
+  const canSend =
+    !chatBusy && routed.instruction !== "" && (!!backend || routed.agent !== null);
+
+  const query = mentionAt(draft, caret);
+  const candidates = query ? mentionCandidates(query.query) : [];
+  const popupOpen =
+    !!query && candidates.length > 0 && dismissedAt !== query.start && !chatBusy;
+  const highlighted = Math.min(pick, Math.max(0, candidates.length - 1));
+
+  const choose = (agent: CliAgent) => {
+    if (!query) return;
+    const next = insertMention(draft, query, agent);
+    setDraft(next.text);
+    setCaret(next.caret);
+    setPick(0);
+    walk.current = { at: null, stash: "", draft: next.text };
+    requestAnimationFrame(() => {
+      const box = inputRef.current;
+      if (!box) return;
+      box.focus();
+      box.selectionStart = box.selectionEnd = next.caret;
+    });
+  };
+
+  /** The popup's keys, taken before the composer's own: while it is open,
+   *  ↑/↓ move the highlight and Enter/Tab choose, rather than walking prompt
+   *  history and sending a half-typed `@co`. Returns whether it took the key. */
+  const onMentionKey = (e: React.KeyboardEvent<HTMLTextAreaElement>): boolean => {
+    if (!popupOpen || !query) return false;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = candidates.length;
+      setPick((highlighted + (e.key === "ArrowDown" ? 1 : n - 1)) % n);
+      return true;
+    }
+    if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+      e.preventDefault();
+      choose(candidates[highlighted]);
+      return true;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      setDismissedAt(query.start);
+      return true;
+    }
+    return false;
+  };
 
   const send = () => {
     if (!canSend) return;
     void sendChat(draft);
     setDraft("");
+    setCaret(0);
+    setDismissedAt(null);
     walk.current = { at: null, stash: "", draft: "" };
   };
 
@@ -296,12 +392,16 @@ export function ChatPanel() {
                   className="mt-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
                 />
                 <div className="min-w-0 flex-1 rounded-lg bg-accent/15 px-2.5 py-1.5 text-xs text-ink whitespace-pre-wrap break-words">
-                  {m.text}
+                  <PromptText text={m.text} />
                 </div>
               </div>
             </div>
           ) : (
             <div key={m.id} className="mr-4">
+              {/* Who answered — one conversation can hold both agents. */}
+              {m.agent && (
+                <div className="mb-0.5 text-2xs text-ink-faint">{labelOf(m.agent)}</div>
+              )}
               {/* What the model was allowed to look at, and did. */}
               {m.tools && m.tools.length > 0 && (
                 <div className="mb-1 space-y-0.5">
@@ -329,7 +429,13 @@ export function ChatPanel() {
                   <div className="mt-0.5 text-2xs text-ink-faint">
                     {m.outcome === "accepted" ? (
                       <span className="text-positive">
-                        kept · <span className="font-mono">{m.commit}</span>
+                        {m.writtenInPlace ? (
+                          "kept · written into the files (no git)"
+                        ) : (
+                          <>
+                            kept · <span className="font-mono">{m.commit}</span>
+                          </>
+                        )}
                       </span>
                     ) : m.outcome === "rejected" ? (
                       "discarded — the files were put back"
@@ -347,15 +453,29 @@ export function ChatPanel() {
         )}
         {chatBusy && (
           <div className="mr-4 rounded-lg bg-surface-2 px-2.5 py-1.5 text-xs text-ink-dim animate-pulse">
-            Working…{elapsed >= 5 ? ` ${elapsed}s` : ""}
+            {chatActivity ?? "Working…"}
+            {elapsed >= 5 ? ` ${elapsed}s` : ""}
           </div>
         )}
       </div>
 
       <div className="shrink-0 border-t border-line px-3 py-2.5">
-        {!backend ? (
+        {noGit && (
+          // Questions still work without git; changes can't be kept, so the
+          // agent won't propose one — said before the user asks, not after.
+          <div className="mb-2 rounded bg-warn/10 px-2 py-1.5 text-2xs text-warn leading-relaxed">
+            This folder isn&rsquo;t a git repository, so keeping a change
+            writes it straight into your files — there&rsquo;s no branch or
+            commit to undo it. Set up git to keep a history instead
+            {pendingEdit?.previewing ? " (the preview above is kept)." : "."}
+            <div className="mt-1.5">
+              <SetUpGit />
+            </div>
+          </div>
+        )}
+        {!anyConnected ? (
           <div className="text-2xs text-warn leading-relaxed mb-1.5">
-            Connect an AI backend (top-bar AI switch) to chat.
+            Switch on an AI backend (top-bar AI menu) to chat.
           </div>
         ) : selected && src ? (
           // The selection *is* the attached context, so removing the chip
@@ -381,29 +501,67 @@ export function ChatPanel() {
             Whole project — select an element to point at one.
           </div>
         )}
-        <textarea
-          ref={inputRef}
-          value={draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            // Typing makes it theirs again: the next ↑ stashes what they have
-            // now and starts from the newest, so an edit is never overwritten
-            // by a recall without being recoverable.
-            walk.current = { at: null, stash: "", draft: e.target.value };
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-              return;
-            }
-            onHistoryKey(e);
-          }}
-          placeholder="What should change? (Enter to send, ↑ for earlier prompts)"
-          disabled={!backend || chatBusy}
-          rows={3}
-          className="w-full resize-none rounded-md bg-surface-2 px-2 py-1.5 text-xs text-ink placeholder:text-ink-faint outline-none focus:ring-1 focus:ring-accent disabled:opacity-50"
-        />
+        <div className="relative">
+          {popupOpen && (
+            // Above the box, not below: the composer sits at the bottom of the
+            // panel, and a list opening downward would open off-screen.
+            <div
+              role="listbox"
+              className="panel absolute bottom-full left-0 right-0 mb-1 z-10 rounded-md py-1"
+            >
+              {candidates.map((a, i) => (
+                <button
+                  key={a}
+                  role="option"
+                  aria-selected={i === highlighted}
+                  // mousedown, not click: a click would blur the textarea first
+                  // and the caret position the insert depends on would be lost.
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    choose(a);
+                  }}
+                  onMouseEnter={() => setPick(i)}
+                  className={`w-full flex items-center gap-2 px-2 py-1 text-left text-2xs ${
+                    i === highlighted ? "bg-surface-2 text-ink" : "text-ink-dim"
+                  }`}
+                >
+                  <span className="font-mono text-accent">@{mentionAlias(a)}</span>
+                  <span className="flex-1 truncate">{labelOf(a)}</span>
+                  <span className={connected(a) ? "text-positive" : "text-ink-faint"}>
+                    {connected(a) ? "on" : "off"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+          <textarea
+            ref={inputRef}
+            value={draft}
+            onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setCaret(e.target.selectionStart);
+              setPick(0);
+              // Typing makes it theirs again: the next ↑ stashes what they have
+              // now and starts from the newest, so an edit is never overwritten
+              // by a recall without being recoverable.
+              walk.current = { at: null, stash: "", draft: e.target.value };
+            }}
+            onKeyDown={(e) => {
+              if (onMentionKey(e)) return;
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+                return;
+              }
+              onHistoryKey(e);
+            }}
+            placeholder="What should change? (Enter to send, ↑ for earlier prompts, @ to pick an agent)"
+            disabled={!anyConnected || chatBusy}
+            rows={3}
+            className="w-full resize-none rounded-md bg-surface-2 px-2 py-1.5 text-xs text-ink placeholder:text-ink-faint outline-none focus:ring-1 focus:ring-accent disabled:opacity-50"
+          />
+        </div>
         <div className="mt-1 flex items-center gap-2">
           <span className="text-2xs text-ink-faint leading-tight flex-1">
             Sends the files it reads to your AI backend.

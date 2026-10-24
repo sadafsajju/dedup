@@ -19,7 +19,14 @@
 //     in the shared jsxwalk, and two taggers that disagreed by one element
 //     would be two different identity schemes for one write-back;
 //   * prepends dedup's client entry (boot script + overlay), which is where
-//     Next lets you put something that runs before the app.
+//     Next lets you put something that runs before the app;
+//   * relaxes the frame-blocking headers the project's own `headers()`
+//     declares. The canvas is an iframe, so `X-Frame-Options: DENY` — which
+//     is boilerplate in any security-minded project — renders as a blank
+//     white artboard with no error anywhere the user can see. `frameable.mjs`
+//     holds the rule and the reasoning. This covers the config-declared path
+//     only: a header set by a `middleware.ts` is served by Next itself, out of
+//     a config wrapper's reach, and would still blank the canvas.
 //
 // It does not serve the component harness: rendering one component in
 // isolation needs an arbitrary module URL from the dev server, which Vite
@@ -29,6 +36,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripFrameGuards, NOTICE } from "./frameable.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -55,8 +63,26 @@ export function withDedup(nextConfig = {}, options = {}) {
   const loader = options.loader ?? path.join(HERE, LOADER_FILE);
   const clientEntry = options.clientEntry ?? path.join(HERE, CLIENT_ENTRY_FILE);
 
+  let announced = false;
+  const announce = () => {
+    if (announced) return;
+    announced = true;
+    // eslint-disable-next-line no-console
+    console.warn(NOTICE);
+  };
+
   return {
     ...nextConfig,
+    async headers() {
+      const declared =
+        typeof nextConfig.headers === "function"
+          ? ((await nextConfig.headers()) ?? [])
+          : [];
+      return declared.map((rule) => ({
+        ...rule,
+        headers: stripFrameGuards(rule?.headers, announce),
+      }));
+    },
     webpack(config, context) {
       try {
         if (fs.existsSync(loader)) {

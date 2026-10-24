@@ -23,9 +23,13 @@
     "test:proposal": "node plugin-src/run-ts.mjs plugin-src/merge.proposal.test.mts",
     "test:highlight": "node plugin-src/run-ts.mjs plugin-src/highlight.test.mts",
     "test:html": "node plugin-src/html.test.mjs",
+    "test:frame": "node plugin-src/frameable.test.mjs",
     "test:openprefs": "node plugin-src/run-ts.mjs plugin-src/openprefs.test.mts",
     "test:canvas": "node plugin-src/run-ts.mjs plugin-src/canvasmemory.test.mts",
-    "test:prompts": "node plugin-src/run-ts.mjs plugin-src/prompthistory.test.mts"
+    "test:annotate": "node plugin-src/run-ts.mjs plugin-src/annotate.test.mts",
+    "test:prompts": "node plugin-src/run-ts.mjs plugin-src/prompthistory.test.mts",
+    "test:mentions": "node plugin-src/run-ts.mjs plugin-src/mentions.test.mts",
+    "test:parking": "node plugin-src/run-ts.mjs plugin-src/parking.test.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
@@ -35,6 +39,7 @@
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "roughjs": "^4.6.6",
     "tailwind-merge": "^3.6.0",
     "zustand": "^5.0.2"
   },

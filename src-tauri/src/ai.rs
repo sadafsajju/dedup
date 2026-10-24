@@ -173,6 +173,122 @@ pub fn available(agent: Agent) -> bool {
     find(agent).is_some()
 }
 
+/// One model an agent's CLI offers, as its own picker would list it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelChoice {
+    /// What the CLI's `--model` takes.
+    pub value: String,
+    pub label: String,
+}
+
+impl Agent {
+    /// The arguments that make this CLI print its model catalog, for one that
+    /// can. Asked of the CLI rather than written into dedup, because the
+    /// catalog belongs to the *installed binary*: two copies of an agent on
+    /// one machine can know different models, and offering a name the copy
+    /// dedup runs has never heard of is exactly how a run gets refused.
+    fn catalog_args(self) -> Option<&'static [&'static str]> {
+        match self {
+            // Claude Code's names are stable aliases (haiku/sonnet/opus) that
+            // CLI_AGENTS already lists.
+            Agent::ClaudeCode => None,
+            Agent::Codex => Some(&["debug", "models"]),
+        }
+    }
+}
+
+/// Printing a catalog is local work; anything slower than this is a CLI that
+/// is wedged, and the picker should fall back rather than wait.
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The models this agent's CLI offers, in the order it offers them. Empty for
+/// an agent with no catalog to ask — the caller keeps its static list.
+pub fn models(agent: Agent) -> Result<Vec<ModelChoice>, String> {
+    let Some(args) = agent.catalog_args() else {
+        return Ok(Vec::new());
+    };
+    let binary = find(agent).ok_or_else(|| format!("{} CLI not found", agent.label()))?;
+    let mut cmd = Command::new(&binary);
+    crate::toolpath::apply(&mut cmd);
+    let mut child = cmd
+        .args(args)
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start {}: {e}", agent.binary()))?;
+    // The catalog is hundreds of KB — far past a pipe buffer — so it is
+    // drained while the child runs, or the child blocks writing it.
+    let mut out = child.stdout.take().ok_or("catalog stdout unavailable")?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = out.read_to_string(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + CATALOG_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                child.kill().ok();
+                child.wait().ok();
+                return Err(format!("{} took too long to list its models", agent.binary()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(format!("{} wait: {e}", agent.binary())),
+        }
+    };
+    let stdout = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("{} could not list its models", agent.binary()));
+    }
+    parse_codex_catalog(&stdout)
+}
+
+/// `codex debug models`: `{"models":[{slug, display_name, visibility,
+/// priority, …}]}`. Only `visibility: "list"` entries — the ones Codex's own
+/// picker shows; hidden ones are internal (review bots, reserved models) —
+/// ordered by `priority` the way Codex orders them.
+fn parse_codex_catalog(json: &str) -> Result<Vec<ModelChoice>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("unexpected model catalog: {e}"))?;
+    let models = value
+        .get("models")
+        .and_then(|m| m.as_array())
+        .ok_or("unexpected model catalog: no models list")?;
+    let mut listed: Vec<(i64, ModelChoice)> = models
+        .iter()
+        .filter(|m| m.get("visibility").and_then(|v| v.as_str()) == Some("list"))
+        .filter_map(|m| {
+            let slug = m.get("slug")?.as_str()?.trim();
+            if slug.is_empty() {
+                return None;
+            }
+            let label = m
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(slug);
+            let priority = m.get("priority").and_then(|p| p.as_i64()).unwrap_or(i64::MAX);
+            Some((
+                priority,
+                ModelChoice {
+                    value: slug.to_string(),
+                    label: label.to_string(),
+                },
+            ))
+        })
+        .collect();
+    listed.sort_by_key(|(p, _)| *p);
+    let mut seen = std::collections::HashSet::new();
+    Ok(listed
+        .into_iter()
+        .map(|(_, m)| m)
+        .filter(|m| seen.insert(m.value.clone()))
+        .collect())
+}
+
 /// Run one headless prompt through `agent` and return the answer text.
 /// `model` is whatever that CLI calls a model ("sonnet", "gpt-5.6-sol", …);
 /// None keeps the user's own default. A hard timeout kills the child, so the
@@ -190,7 +306,7 @@ pub fn prompt(agent: Agent, text: &str, model: Option<&str>) -> Result<String, S
         ))
     });
 
-    let mut cmd = Command::new(binary);
+    let mut cmd = Command::new(&binary);
     crate::toolpath::apply(&mut cmd);
     cmd.args(agent.args(model, answer_file.as_deref()));
     let mut child = cmd
@@ -200,7 +316,7 @@ pub fn prompt(agent: Agent, text: &str, model: Option<&str>) -> Result<String, S
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to start claude: {e}"))?;
+        .map_err(|e| format!("failed to start {}: {e}", agent.binary()))?;
 
     // Feed stdin and drain stdout/stderr on their own threads: a prompt
     // larger than the pipe buffer would otherwise deadlock against a child
@@ -231,7 +347,8 @@ pub fn prompt(agent: Agent, text: &str, model: Option<&str>) -> Result<String, S
                 child.kill().ok();
                 child.wait().ok();
                 return Err(format!(
-                    "claude took longer than {}s and was stopped — try again, or pick a faster model in the AI switch",
+                    "{} took longer than {}s and was stopped — try again, or pick a faster model in the AI switch",
+                    agent.binary(),
                     PROMPT_TIMEOUT.as_secs()
                 ));
             }
@@ -257,14 +374,23 @@ pub fn prompt(agent: Agent, text: &str, model: Option<&str>) -> Result<String, S
     });
 
     if !status.success() {
-        let binary = agent.binary();
+        let name = agent.binary();
+        // Codex prints its whole session banner and the echoed prompt to
+        // stderr before failing, so the raw stream is a page of noise with the
+        // reason at the bottom. It marks the reason itself — `ERROR: {json}` —
+        // and that line is the message.
+        if agent == Agent::Codex {
+            if let Some(reason) = codex_error(&stderr) {
+                return Err(with_hint(agent, &binary, format!("{name}: {reason}")));
+            }
+        }
         return Err(match parse_answer(agent, &stdout, file_answer.as_deref()) {
-            Err(reason) if !stdout.trim().is_empty() => with_hint(reason),
+            Err(reason) if !stdout.trim().is_empty() => with_hint(agent, &binary, reason),
             _ if !stderr.trim().is_empty() => {
-                with_hint(format!("{binary}: {}", stderr.trim()))
+                with_hint(agent, &binary, format!("{name}: {}", stderr.trim()))
             }
             _ => format!(
-                "{binary} exited with {:?} and reported nothing — run `{binary}` in a terminal to check it starts and is signed in",
+                "{name} exited with {:?} and reported nothing — run `{name}` in a terminal to check it starts and is signed in",
                 status.code()
             ),
         });
@@ -303,7 +429,35 @@ fn parse_answer(
 /// Point at the fix when the message is one dedup can recognise. An expired
 /// login is by far the most common failure here and is not self-evidently
 /// solvable from inside the app — dedup cannot re-authenticate the user's CLI.
-fn with_hint(reason: String) -> String {
+/// The reason a failed Codex run gave, from its `ERROR: {json}` lines — the
+/// API error's own `message` when the line is JSON, the line's text when it
+/// isn't. The last one wins: Codex repeats the error, and a later line is
+/// never less specific than an earlier one.
+fn codex_error(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("ERROR:").map(str::trim))
+        .filter(|rest| !rest.is_empty())
+        .map(|rest| {
+            serde_json::from_str::<serde_json::Value>(rest)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/error/message")
+                        .or_else(|| v.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| rest.to_string())
+        })
+        .last()
+}
+
+/// What to do about a failure, when the failure says. `binary` is the CLI that
+/// actually ran — worth naming, because a machine can hold more than one copy
+/// of an agent (a standalone install and one bundled in a desktop app) that
+/// share one config file and disagree about what is in it.
+fn with_hint(agent: Agent, binary: &Path, reason: String) -> String {
+    let name = agent.binary();
     let lower = reason.to_lowercase();
     if lower.contains("authenticate")
         || lower.contains("oauth")
@@ -311,7 +465,16 @@ fn with_hint(reason: String) -> String {
         || lower.contains("log in")
         || lower.contains("login")
     {
-        return format!("{reason} — run `claude` in a terminal and sign in, then try again");
+        return format!("{reason} — run `{name}` in a terminal and sign in, then try again");
+    }
+    // A model the CLI's account or version can't use. dedup passes no model
+    // unless one is picked in the AI switch, so this is the CLI's own default
+    // — usually written into the shared config by a newer copy of the agent.
+    if agent == Agent::Codex && lower.contains("model") && lower.contains("not supported") {
+        return format!(
+            "{reason} — dedup ran {}, which uses the `model` set in ~/.codex/config.toml. Update that CLI, or set a model it supports there.",
+            binary.display()
+        );
     }
     reason
 }
@@ -337,6 +500,81 @@ fn parse_result_envelope(stdout: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shape taken from a real `codex debug models`, trimmed.
+    #[test]
+    fn the_codex_catalog_is_what_its_own_picker_lists_in_its_order() {
+        let json = r#"{"models":[
+            {"slug":"gpt-5.6-terra","display_name":"GPT-5.6-Terra","visibility":"list","priority":8},
+            {"slug":"gpt-reserve","display_name":"GPT-Reserve","visibility":"hide","priority":4},
+            {"slug":"gpt-6-astra","display_name":"GPT-6-Astra","visibility":"list","priority":2},
+            {"slug":"gpt-5.6-sol","display_name":"","visibility":"list","priority":6},
+            {"slug":"gpt-6-astra","display_name":"dupe","visibility":"list","priority":9},
+            {"slug":"codex-auto-review","visibility":"hide","priority":43}
+        ]}"#;
+        let got = parse_codex_catalog(json).unwrap();
+        let pairs: Vec<(&str, &str)> =
+            got.iter().map(|m| (m.value.as_str(), m.label.as_str())).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("gpt-6-astra", "GPT-6-Astra"),
+                // A blank display name falls back to the slug, not to "".
+                ("gpt-5.6-sol", "gpt-5.6-sol"),
+                ("gpt-5.6-terra", "GPT-5.6-Terra"),
+            ],
+            "hidden entries dropped, priority order, one row per slug"
+        );
+        assert!(parse_codex_catalog("not json").is_err());
+        assert!(parse_codex_catalog(r#"{"other":[]}"#).is_err());
+    }
+
+    /// A real failure, trimmed: Codex echoes its banner and the whole prompt
+    /// to stderr, then the reason as `ERROR: {json}` — twice.
+    const CODEX_MODEL_REFUSED: &str = r#"OpenAI Codex v0.153.4
+--------
+model: gpt-6-sol
+sandbox: read-only
+--------
+user
+Generate one image for a web project and do nothing else.
+<<<<<<< ASSET images/hero-port.webp
+<absolute path of the generated image>
+>>>>>>> END
+warning: Model metadata for `gpt-6-sol` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.
+ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account."}}
+ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account."}}
+"#;
+
+    #[test]
+    fn a_codex_failure_is_its_error_line_not_its_transcript() {
+        assert_eq!(
+            codex_error(CODEX_MODEL_REFUSED).as_deref(),
+            Some("The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account."),
+        );
+        // A plain-text error line is still the reason.
+        assert_eq!(codex_error("banner\nERROR: stream disconnected").as_deref(), Some("stream disconnected"));
+        // No marked reason: nothing to extract, so the caller falls back.
+        assert_eq!(codex_error("banner\nwarning: something"), None);
+    }
+
+    #[test]
+    fn a_refused_model_names_the_binary_and_where_the_model_is_set() {
+        let reason = format!("codex: {}", codex_error(CODEX_MODEL_REFUSED).unwrap());
+        let msg = with_hint(Agent::Codex, Path::new("/usr/local/bin/codex"), reason);
+        assert!(msg.contains("/usr/local/bin/codex"), "{msg}");
+        assert!(msg.contains("~/.codex/config.toml"), "{msg}");
+        assert!(!msg.contains("OpenAI Codex v"), "the transcript stays out: {msg}");
+    }
+
+    /// The sign-in hint used to say `claude` whatever had failed.
+    #[test]
+    fn the_sign_in_hint_names_the_agent_that_failed() {
+        let msg = with_hint(Agent::Codex, Path::new("codex"), "codex: unauthorized".into());
+        assert!(msg.contains("run `codex`"), "{msg}");
+        let msg = with_hint(Agent::ClaudeCode, Path::new("claude"), "please log in".into());
+        assert!(msg.contains("run `claude`"), "{msg}");
+    }
 
     #[test]
     fn parses_the_result_envelope() {
@@ -421,15 +659,15 @@ mod tests {
     #[test]
     fn an_expired_login_reports_its_real_reason() {
         let envelope = r#"{"type":"result","is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#;
-        let reason = with_hint(parse_result_envelope(envelope).unwrap_err());
+        let reason = with_hint(Agent::ClaudeCode, Path::new("claude"), parse_result_envelope(envelope).unwrap_err());
         assert!(reason.contains("OAuth session expired"), "{reason}");
         assert!(reason.contains("sign in"), "must point at the fix: {reason}");
     }
 
     #[test]
     fn hints_are_only_added_where_they_apply() {
-        let rate = with_hint("claude reported an error: rate limited".to_string());
+        let rate = with_hint(Agent::ClaudeCode, Path::new("claude"), "claude reported an error: rate limited".to_string());
         assert_eq!(rate, "claude reported an error: rate limited");
-        assert!(with_hint("Unauthorized".to_string()).contains("sign in"));
+        assert!(with_hint(Agent::ClaudeCode, Path::new("claude"), "Unauthorized".to_string()).contains("sign in"));
     }
 }

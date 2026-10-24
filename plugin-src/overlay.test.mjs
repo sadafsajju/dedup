@@ -234,6 +234,10 @@ function loadOverlay() {
     querySelector: (sel) => html.querySelector(sel),
     querySelectorAll: (sel) => html.querySelectorAll(sel),
     createRange: () => ({ selectNodeContents() {} }),
+    // Hit testing: the drag gestures ask what is under the pointer, and the
+    // stub has no layout to answer from. A test says so directly.
+    elementFromPoint: () => documentStub.hitEl ?? null,
+    hitEl: null,
     title: "Test page",
   };
 
@@ -276,7 +280,13 @@ function loadOverlay() {
     // The overlay wraps these; the stub records what the page's own console
     // still received, so a test can prove forwarding doesn't swallow it.
     consoleCalls: [],
-    getComputedStyle: () => ({ overflowY: "visible", overflowX: "visible" }),
+    // Layout the stub cannot compute, declared per node by whichever test
+    // cares (`node.computed = { display: "flex" }`).
+    getComputedStyle: (el) => ({
+      overflowY: "visible",
+      overflowX: "visible",
+      ...(el?.computed ?? {}),
+    }),
   };
   sandbox.console = {
     error: (...a) => sandbox.consoleCalls.push(["error", ...a]),
@@ -310,7 +320,17 @@ function loadOverlay() {
   };
   const send = (msg) => fire("message", { data: { __dedup: true, ...msg } });
 
-  return { sandbox, posted, fire, send, nodes: { html, body, root, title, item } };
+  /** What `document.elementFromPoint` should answer for the next gesture. */
+  const hit = (el) => void (documentStub.hitEl = el);
+
+  return {
+    sandbox,
+    posted,
+    fire,
+    send,
+    hit,
+    nodes: { html, body, root, title, item },
+  };
 }
 
 // --- tests ------------------------------------------------------------------
@@ -999,6 +1019,383 @@ test("a grip cannot drag an element smaller than nothing", () => {
 
   const last = posted.filter((m) => m.type === "resize").pop();
   assert.ok(last.width > 0 && last.height > 0, `got ${last.width}x${last.height}`);
+});
+
+
+// --- drag to re-parent: the grab cursor and the drop ghost -------------------
+//
+// The gesture used to be drawn as a 2px line, which says where the insertion
+// point is but not what lands there — and nothing at all said the element
+// could be picked up in the first place. Both answers are drawn now, and both
+// are easy to lose: the cursor is a stylesheet that has to be cleared on every
+// way a drag can end, and the ghost is geometry with a direction to get wrong.
+
+/** Give a stub node a rect, since the stub has no layout of its own. */
+const rect = (el, x, y, width, height) => {
+  el.getBoundingClientRect = () => ({ x, y, top: y, left: x, width, height });
+};
+
+const chrome = (nodes, pred) => nodes.html.children.filter(pred);
+const ghostOf = (nodes) =>
+  chrome(nodes, (c) => c.style.boxShadow && c.style.position === "fixed")[0];
+const cursorSheetOf = (nodes) =>
+  chrome(nodes, (c) => c.tagName === "STYLE").map((c) => c.textContent);
+const cursorRule = (nodes) =>
+  cursorSheetOf(nodes).find((t) => t.includes("cursor")) ?? "";
+
+const ev = (x, y) => ({
+  button: 0,
+  clientX: x,
+  clientY: y,
+  target: null,
+  preventDefault() {},
+  stopPropagation() {},
+  stopImmediatePropagation() {},
+});
+
+/** Arm dragging, pick `from` up and move the pointer to (x, y) over `over`. */
+function beginDrag({ send, fire, hit }, from, over, x, y) {
+  send({ type: "set-edit-mode", drag: true });
+  hit(over);
+  fire("pointerdown", { ...ev(0, 0), target: from });
+  fire("pointermove", { ...ev(x, y), target: over });
+}
+
+test("hovering something draggable offers a grab cursor — and only there", () => {
+  const { send, fire, nodes } = loadOverlay();
+  fire("mousemove", { target: nodes.title });
+  assert.equal(cursorRule(nodes), "", "no cursor until dragging is armed");
+
+  send({ type: "set-edit-mode", drag: true });
+  fire("mousemove", { target: nodes.title });
+  assert.match(cursorRule(nodes), /cursor:grab/);
+  assert.match(
+    cursorRule(nodes),
+    /src\/App\.tsx@1/,
+    "the rule is keyed by dedup id, so nothing is written into the page",
+  );
+
+  // The tagger's own verdict decides: the list item is dynamic, so a drag
+  // would be refused — promising one with a cursor is worse than saying no.
+  fire("mousemove", { target: nodes.item });
+  assert.equal(cursorRule(nodes), "");
+
+  fire("mousemove", { target: nodes.title });
+  assert.match(cursorRule(nodes), /cursor:grab/);
+  send({ type: "set-edit-mode", drag: false });
+  assert.equal(
+    cursorRule(nodes),
+    "",
+    "disarming the gesture must take its cursor with it",
+  );
+});
+
+test("a drag draws the element's footprint where the release would put it", () => {
+  const h = loadOverlay();
+  const { nodes } = h;
+  rect(nodes.title, 0, 0, 100, 40); // what is being dragged
+  rect(nodes.item, 0, 100, 300, 60); // what it is being dropped near
+
+  // Low in the target: after it, so the ghost sits below.
+  beginDrag(h, nodes.title, nodes.item, 10, 155);
+  const ghost = ghostOf(nodes);
+  assert.equal(ghost.style.display, "block", "no ghost drawn");
+  assert.equal(ghost.style.top, "160px", "after → below the target");
+  assert.equal(ghost.style.left, "0px");
+  assert.equal(ghost.style.height, "40px", "the element's own height");
+  assert.equal(ghost.style.width, "100px");
+  assert.match(cursorRule(nodes), /cursor:grabbing/);
+  assert.equal(
+    nodes.title.style.opacity,
+    "0.4",
+    "the element in flight fades, so the ghost is the one going somewhere",
+  );
+
+  // High in the target: before it, so the ghost sits above.
+  h.fire("pointermove", { ...ev(10, 105), target: nodes.item });
+  assert.equal(ghost.style.top, "60px", "before → above the target");
+
+  // A ghost wider than the column it is landing in would be a lie about the
+  // layout: the cross axis belongs to the container.
+  rect(nodes.title, 0, 0, 900, 40);
+  h.fire("pointermove", { ...ev(10, 155), target: nodes.item });
+  assert.equal(ghost.style.width, "300px");
+});
+
+test("in a row, the ghost lands beside the target rather than under it", () => {
+  const h = loadOverlay();
+  const { nodes } = h;
+  nodes.root.computed = { display: "flex", flexDirection: "row" };
+  rect(nodes.title, 0, 0, 100, 40);
+  rect(nodes.item, 200, 0, 60, 40);
+
+  beginDrag(h, nodes.title, nodes.item, 255, 30);
+  const ghost = ghostOf(nodes);
+  assert.equal(ghost.style.left, "260px", "after → to the right of the target");
+  assert.equal(ghost.style.top, "0px");
+
+  // row-reverse renders the DOM's `after` to the *left*.
+  nodes.root.computed = { display: "flex", flexDirection: "row-reverse" };
+  h.fire("pointermove", { ...ev(255, 30), target: nodes.item });
+  assert.equal(ghost.style.left, "100px");
+});
+
+test("dropping inside a container previews the element as its last child", () => {
+  const h = loadOverlay();
+  const { nodes } = h;
+  rect(nodes.title, 0, 0, 100, 40);
+  rect(nodes.item, 0, 100, 300, 200);
+
+  // The middle of the target is "inside" — where the write-back appends.
+  beginDrag(h, nodes.title, nodes.item, 10, 200);
+  const ghost = ghostOf(nodes);
+  assert.equal(ghost.style.display, "block");
+  assert.equal(ghost.style.top, "260px", "inside → last child, at the bottom");
+});
+
+// --- dragging off the page ---------------------------------------------------
+//
+// An element can leave its artboard: onto the empty canvas (parked) or into
+// another artboard. Only this frame hears the pointer, so it must keep hearing
+// it past its own edge (pointer capture) and say where it is — and a release
+// out there must never also be read as an in-page drop.
+
+test("a drag keeps the pointer past the frame's edge and says where it went", () => {
+  const h = loadOverlay();
+  const { nodes, posted } = h;
+  rect(nodes.title, 0, 0, 100, 40);
+  rect(nodes.item, 0, 100, 300, 60);
+  let captured = null;
+  nodes.html.setPointerCapture = (id) => void (captured = id);
+
+  h.send({ type: "set-edit-mode", drag: true });
+  h.hit(nodes.item);
+  h.fire("pointerdown", { ...ev(0, 0), pointerId: 7, target: nodes.title });
+  h.fire("pointermove", { ...ev(10, 155), pointerId: 7, target: nodes.item });
+  assert.equal(captured, 7, "the drag captures its pointer once it starts");
+
+  // Off the right edge of a 1200px-wide page.
+  h.fire("pointermove", { ...ev(1350, 155), pointerId: 7, target: nodes.item });
+  const out = posted.filter((m) => m.type === "drag-outside").pop();
+  assert.deepEqual([out.x, out.y], [1350, 155], "frame-local coordinates");
+  assert.equal(out.id, "src/App.tsx@1");
+  assert.equal(out.label, "App · h1", "named, so the editor's ghost can say what is moving");
+  assert.equal(ghostOf(nodes).style.display, "none", "no in-page slot while outside");
+
+  // Back over the page: the editor is told the pointer is home again.
+  h.fire("pointermove", { ...ev(10, 155), pointerId: 7, target: nodes.item });
+  const back = posted.filter((m) => m.type === "drag-outside").pop();
+  assert.equal(back.x, null);
+  assert.equal(ghostOf(nodes).style.display, "block");
+});
+
+test("released off the page, it is a drop-outside and never an in-page drop", () => {
+  const h = loadOverlay();
+  const { nodes, posted } = h;
+  rect(nodes.title, 0, 0, 100, 40);
+  rect(nodes.item, 0, 100, 300, 60);
+  beginDrag(h, nodes.title, nodes.item, 10, 155);
+  h.fire("pointermove", { ...ev(-40, 300), target: nodes.item });
+  h.fire("pointerup", { ...ev(-40, 300), target: nodes.item });
+
+  const drop = posted.find((m) => m.type === "drop-outside");
+  assert.ok(drop, "a drop-outside was posted");
+  assert.equal(drop.id, "src/App.tsx@1");
+  assert.deepEqual([drop.x, drop.y], [-40, 300]);
+  assert.equal(drop.element.dedupId, "src/App.tsx@1", "the element travels with it");
+  assert.equal(posted.filter((m) => m.type === "drop").length, 0, "not also a move");
+  assert.ok(posted.some((m) => m.type === "drag-end"), "the drag still ends");
+  assert.notEqual(nodes.title.style.opacity, "0.4", "the faded element is restored");
+});
+
+test("the editor can ask where a drag from elsewhere would land, and take it back", () => {
+  const h = loadOverlay();
+  const { nodes, posted } = h;
+  rect(nodes.title, 0, 0, 300, 60);
+  const shown = () => chrome(nodes, (c) => c.style.display === "block").length;
+  const before = shown();
+
+  h.hit(nodes.title);
+  h.send({ type: "probe-drop", x: 10, y: 55, seq: 3 });
+  const answer = posted.filter((m) => m.type === "probe-result").pop();
+  assert.equal(answer.seq, 3, "the answer names the question it answers");
+  assert.equal(answer.id, "src/App.tsx@1");
+  assert.equal(answer.position, "after");
+  assert.ok(shown() > before, "the slot is drawn on this page, like an in-page drag");
+
+  h.send({ type: "probe-clear" });
+  assert.equal(shown(), before, "and taken back off it");
+
+  // Nothing under the point: an honest null, not a guess.
+  h.hit(null);
+  h.send({ type: "probe-drop", x: 5000, y: 5000, seq: 4 });
+  const none = posted.filter((m) => m.type === "probe-result").pop();
+  assert.equal(none.seq, 4);
+  assert.equal(none.id, null);
+  assert.equal(none.position, null);
+});
+
+test("every way a drag can end puts the cursor and the ghost away", () => {
+  const ends = {
+    "the pointer coming up": (h, over) =>
+      h.fire("pointerup", { ...ev(10, 155), target: over }),
+    Escape: (h) => h.fire("keydown", { key: "Escape", ...ev(0, 0) }),
+    "the frame losing focus": (h) => h.fire("blur", {}),
+  };
+  for (const [how, end] of Object.entries(ends)) {
+    const h = loadOverlay();
+    const { nodes } = h;
+    rect(nodes.title, 0, 0, 100, 40);
+    rect(nodes.item, 0, 100, 300, 60);
+    beginDrag(h, nodes.title, nodes.item, 10, 155);
+    assert.equal(ghostOf(nodes).style.display, "block", how);
+
+    end(h, nodes.item);
+    assert.equal(ghostOf(nodes).style.display, "none", how);
+    assert.equal(cursorRule(nodes), "", how);
+    assert.equal(
+      nodes.title.style.opacity,
+      "",
+      `${how}: the element must be handed back exactly as it was found`,
+    );
+    assert.equal(h.sandbox.consoleCalls.length, 0, how);
+  }
+});
+
+test("a drop still reports the move it previewed", () => {
+  const h = loadOverlay();
+  const { nodes, posted } = h;
+  rect(nodes.title, 0, 0, 100, 40);
+  rect(nodes.item, 0, 100, 300, 60);
+  beginDrag(h, nodes.title, nodes.item, 10, 155);
+  h.fire("pointerup", { ...ev(10, 155), target: nodes.item });
+
+  const drop = posted.find((m) => m.type === "drop");
+  assert.ok(drop, "no drop reported");
+  assert.equal(drop.id, "src/App.tsx@1");
+  assert.equal(drop.to, "src/App.tsx@2");
+  assert.equal(drop.position, "after");
+});
+
+// --- viewport-height freeze --------------------------------------------------
+// The base loadOverlay() harness stubs setTimeout as a no-op, since most
+// tests don't care whether the debounced height report ever fires. This one
+// does: it drives the freeze that runs inside that debounce.
+
+test("a raw-vh full-height header (no Tailwind classname to hardcode) is pinned to the device viewport, and stays pinned across a re-render", () => {
+  const html = makeEl("html");
+  const body = makeEl("body");
+  html.appendChild(body);
+  const header = makeEl("header");
+  header.style.setProperty("min-height", "100vh");
+  header.setAttribute("style", "min-height: 100vh"); // reflects onto the attribute, like a real browser does
+
+  const posted = [];
+  const listeners = new Map();
+  const addListener = (type, fn) => {
+    if (!listeners.has(type)) listeners.set(type, []);
+    listeners.get(type).push(fn);
+  };
+  const fire = (type, event) => {
+    for (const fn of listeners.get(type) ?? []) fn(event);
+  };
+  let timerFn = null;
+  const documentStub = {
+    documentElement: html,
+    body,
+    readyState: "interactive",
+    createElement: (tag) => makeEl(tag),
+    addEventListener: addListener,
+    querySelector: (sel) => html.querySelector(sel),
+    querySelectorAll: (sel) => html.querySelectorAll(sel),
+    createRange: () => ({ selectNodeContents() {} }),
+    elementFromPoint: () => null,
+    title: "Test page",
+  };
+  const windowStub = {
+    innerHeight: 800,
+    innerWidth: 1200,
+    addEventListener: addListener,
+    getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
+    parent: { postMessage: (msg) => posted.push(msg) },
+  };
+  const sandbox = {
+    window: windowStub,
+    document: documentStub,
+    location: {
+      pathname: "/",
+      search: "",
+      get href() {
+        return "http://localhost:5173/";
+      },
+      reload() {},
+      replace() {},
+    },
+    CSS: { escape: (v) => v },
+    MutationObserver: class {
+      observe() {}
+    },
+    setInterval: () => 0,
+    // Height reporting is debounced through setTimeout; run it synchronously
+    // so the test can drive it tick by tick instead of racing a real clock.
+    setTimeout: (fn) => {
+      timerFn = fn;
+      return 1;
+    },
+    clearTimeout: () => {
+      timerFn = null;
+    },
+    consoleCalls: [],
+    getComputedStyle: (el) => ({
+      overflowY: "visible",
+      overflowX: "visible",
+      ...(el?.computed ?? {}),
+    }),
+  };
+  sandbox.console = { error() {}, warn() {}, log() {} };
+  sandbox.globalThis = sandbox;
+  Object.assign(sandbox, {
+    URL,
+    URLSearchParams,
+    PopStateEvent: class {},
+    HTMLInputElement: class {},
+    HTMLTextAreaElement: class {},
+    HTMLElement: class {},
+  });
+  body.appendChild(header);
+
+  vm.runInNewContext(fs.readFileSync(OVERLAY, "utf8"), sandbox, {
+    filename: "dedup-overlay.js",
+  });
+  const runTimer = () => {
+    const fn = timerFn;
+    timerFn = null;
+    assert.ok(fn, "reportHeight never scheduled its debounced tick");
+    fn();
+  };
+
+  // observeBody() ran a first tick already during evaluation (readyState is
+  // "interactive"). Run it, then assert the header's raw vh was overridden
+  // rather than left to re-resolve against whatever height the editor next
+  // grows the frame to.
+  runTimer();
+  assert.equal(
+    header.style.getPropertyValue("min-height"),
+    "800px",
+    "a min-height in vh units must be pinned to the device viewport even without a recognized Tailwind classname",
+  );
+
+  // A React re-render replaces the whole style attribute, putting the raw vh
+  // value straight back — exactly what would otherwise let this header
+  // re-resolve against a grown frame on the very next measurement.
+  header.style.setProperty("min-height", "100vh");
+  fire("load", {});
+  runTimer();
+  assert.equal(
+    header.style.getPropertyValue("min-height"),
+    "800px",
+    "the pin must be reasserted every pass, or one re-render undoes it",
+  );
 });
 
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

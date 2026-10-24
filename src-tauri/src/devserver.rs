@@ -90,11 +90,16 @@ impl From<ExecSpec> for Launch {
 /// How to launch the dev server.
 #[derive(Clone)]
 pub enum ExecSpec {
-    /// `<pm> run dev` in the project root, plus any extra args forwarded to
-    /// the script itself (how dedup adds `--webpack` to a Next dev server
+    /// `<pm> run <script>` in the project root, plus any extra args forwarded
+    /// to the script itself (how dedup adds `--webpack` to a Next dev server
     /// without replacing the user's script and losing its env, e.g. the
     /// `NODE_OPTIONS=--max-old-space-size` a big app needs).
-    Script(PackageManager, Vec<String>),
+    ///
+    /// The script name is carried rather than assumed: detection accepts
+    /// `start` as well as `dev` (`project::detect`), so hardcoding `dev` here
+    /// launches a script the project may not have — after the card has already
+    /// called it supported.
+    Script(PackageManager, String, Vec<String>),
     /// User-supplied command through a shell (FR-1.3 escape hatch).
     Shell(String),
     /// Direct binary invocation — used for the instrumented Vite launch
@@ -107,7 +112,7 @@ pub enum ExecSpec {
 
 impl Default for ExecSpec {
     fn default() -> Self {
-        ExecSpec::Script(PackageManager::Unknown, Vec::new())
+        ExecSpec::Script(PackageManager::Unknown, "dev".to_string(), Vec::new())
     }
 }
 
@@ -422,24 +427,24 @@ fn build_command(root: &str, exec: &ExecSpec) -> Command {
             c.args(args).current_dir(root);
             c
         }
-        ExecSpec::Script(pm, extra) => {
+        ExecSpec::Script(pm, script, extra) => {
             let bin = match pm {
                 PackageManager::Pnpm => "pnpm",
                 PackageManager::Yarn => "yarn",
                 PackageManager::Bun => "bun",
                 PackageManager::Npm | PackageManager::Unknown => "npm",
             };
-            // `run dev` works uniformly across pnpm/npm/bun; yarn allows `yarn dev`.
-            // Resolve the binary ourselves — Command's own lookup uses the
-            // *parent's* PATH, which is the useless one in a bundle.
+            // `run <script>` works uniformly across pnpm/npm/bun; yarn 1 wants
+            // the bare form. Resolve the binary ourselves — Command's own lookup
+            // uses the *parent's* PATH, which is the useless one in a bundle.
             let bin = toolpath::which(bin).unwrap_or_else(|| bin.into());
             let mut c = Command::new(bin);
             match pm {
                 PackageManager::Yarn => {
-                    c.arg("dev");
+                    c.arg(&script);
                 }
                 _ => {
-                    c.arg("run").arg("dev");
+                    c.arg("run").arg(&script);
                 }
             }
             if !extra.is_empty() {
@@ -606,6 +611,45 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(exec: &ExecSpec) -> Vec<String> {
+        build_command("/tmp", exec)
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// The script name is data, not a constant: a project detected on the
+    /// strength of its `start` script must be launched by `start`.
+    #[test]
+    fn launches_the_script_it_was_given_not_a_hardcoded_dev() {
+        assert_eq!(
+            argv(&ExecSpec::Script(
+                PackageManager::Yarn,
+                "start".into(),
+                Vec::new()
+            )),
+            vec!["start"],
+            "yarn 1 takes the bare script name"
+        );
+        assert_eq!(
+            argv(&ExecSpec::Script(
+                PackageManager::Pnpm,
+                "start".into(),
+                Vec::new()
+            )),
+            vec!["run", "start"]
+        );
+        assert_eq!(
+            argv(&ExecSpec::Script(
+                PackageManager::Npm,
+                "dev".into(),
+                vec!["--webpack".into()]
+            )),
+            vec!["run", "dev", "--", "--webpack"],
+            "npm still needs -- before args meant for the script"
+        );
+    }
 
     #[test]
     fn strips_ansi_color_codes() {

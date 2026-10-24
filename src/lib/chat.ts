@@ -81,6 +81,47 @@ the absolute path of the image file you generated
 - Reference the image from your markup in the same reply, at the path the site
   will serve it from, and give it real alt text.`;
 
+/**
+ * The same capability for a backend that cannot generate images, borrowed from
+ * a connected agent that can. Offered only when such an agent is connected —
+ * the rule ASSET_PROTOCOL follows, for the same reason.
+ *
+ * The model describes the picture and names where it goes. It never names a
+ * source path, so this widens nothing: the file still arrives as the other
+ * agent's own ASSET import, through the same gates.
+ */
+const delegateProtocol = (agent: string) => `
+- You cannot generate images yourself, but dedup can ask ${agent} to. To put a
+  newly generated image into the project:
+<<<<<<< IMAGE <project-relative destination path>
+a precise description of the image: subject, style, palette, composition,
+aspect ratio, and that it is for this page
+>>>>>>> END
+  Use a destination that does not exist yet, ending in .png — that is the
+  format generated images arrive in. (If one arrives in another format, dedup
+  renames the file and your references to it to match.) Use this only for an
+  image that does not exist yet — never for one already in the project.
+- Reference the image from your markup in the same reply, at the path the site
+  will serve it from, and give it real alt text.`;
+
+/**
+ * What dedup asks the generating agent when another model wanted an image.
+ * Strict on purpose: the answer goes through `pickGeneratedImage`, which takes
+ * exactly one ASSET block and refuses anything else.
+ */
+export function imageRequestPrompt(file: string, description: string): string {
+  return `Generate one image for a web project and do nothing else — do not read, write or change any other file.
+
+The image will be saved in the project as: ${file}
+What it should show:
+${description}
+
+When the image is generated, reply with ONLY this block, holding the absolute path of the file you generated, and nothing before or after it:
+<<<<<<< ASSET ${file}
+<absolute path of the generated image>
+>>>>>>> END`;
+}
+
 const REACT_PROMPT = `You are an expert React + Tailwind engineer working inside "dedup", a visual code editor. The user is looking at their running app and has typed an instruction. They may or may not have an element selected on the canvas — when they have, it is named below; when they have not, work it out from the project.
 
 Rules:
@@ -113,6 +154,10 @@ export function systemPromptFor(
   staticSite = false,
   /** Whether this backend generates files dedup can import (see ai.rs). */
   assets = false,
+  /** When it doesn't: the label of a connected agent that does, which dedup
+   *  will ask on its behalf. Ignored when `assets` is true — a backend that
+   *  makes its own images has no reason to send for someone else's. */
+  delegate: string | null = null,
 ): string {
   const base = file
     ? isHtmlFile(file)
@@ -121,7 +166,8 @@ export function systemPromptFor(
     : staticSite
       ? HTML_PROMPT
       : REACT_PROMPT;
-  return assets ? base + ASSET_PROTOCOL : base;
+  if (assets) return base + ASSET_PROTOCOL;
+  return delegate ? base + delegateProtocol(delegate) : base;
 }
 
 /** One file dedup has put in front of the model, and why. */
@@ -180,6 +226,10 @@ export function buildTurnPrompt(opts: {
   attachments: ChatAttachment[];
   inventory?: string[] | null;
   framework?: string | null;
+  /** Notes the user wrote on the canvas next to marks they drew (lib/annotate).
+   *  Context in exactly the same sense a selection is: it says what the user
+   *  is looking at and what they think of it, and it is never a gate. */
+  notes?: string[] | null;
 }): string {
   const parts: string[] = [];
   if (opts.framework) parts.push(`Project type: ${opts.framework}.`);
@@ -194,6 +244,13 @@ export function buildTurnPrompt(opts: {
     );
   }
   for (const a of opts.attachments) parts.push(attachmentBlock(a));
+  if (opts.notes && opts.notes.length > 0) {
+    parts.push(
+      `Marked up on the canvas (the user drew on the running app and wrote these; dedup does not know which element each mark covers, so treat them as the user's own words about that page):\n${opts.notes
+        .map((n) => `- ${n}`)
+        .join("\n")}`,
+    );
+  }
   parts.push(`Instruction: ${opts.instruction}`);
   return parts.join("\n\n");
 }

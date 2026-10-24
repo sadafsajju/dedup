@@ -78,7 +78,7 @@ function MergeButton({ clusterId }: { clusterId: string }) {
       }`}
       title={
         !backend
-          ? "A merge proposal needs an AI backend — connect one via the AI switch in the top bar"
+          ? "A merge proposal needs an AI backend — switch one on in the AI menu (top bar)"
           : busy
             ? "Finish the merge already in progress first"
             : "Propose a canonical component, review the diff, then merge behind the safety gates"

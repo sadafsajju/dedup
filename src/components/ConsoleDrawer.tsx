@@ -98,7 +98,7 @@ export function ConsoleDrawer() {
                   title={
                     canAsk
                       ? "Send this error to the chat"
-                      : "Connect an AI backend first (top-bar AI switch)"
+                      : "Switch on an AI backend first (top-bar AI menu)"
                   }
                   className="shrink-0 rounded border border-line px-1.5 py-0.5 text-2xs text-ink-dim hover:text-ink disabled:opacity-40"
                 >

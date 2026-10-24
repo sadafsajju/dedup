@@ -4,9 +4,11 @@
 mod ai;
 mod asset;
 mod devserver;
+mod export;
 mod git;
 mod instrument;
 mod merge;
+mod parking;
 mod project;
 mod proxy;
 mod recents;
@@ -64,9 +66,13 @@ fn start_dev_server(
     package_manager: PackageManager,
     framework: Framework,
     dev_script: Option<String>,
+    dev_script_name: Option<String>,
     static_dir: Option<String>,
     custom_command: Option<String>,
 ) -> Result<(), String> {
+    // The script detection actually found, not an assumed `dev` — a project
+    // with only a `start` script is reported supported on the strength of it.
+    let script = dev_script_name.clone().unwrap_or_else(|| "dev".to_string());
     let (launch, instr_info): (devserver::Launch, InstrumentationEvent) =
         if let Some(cmd) = custom_command {
         // The user's explicit command wins; no rewriting on top of it.
@@ -85,7 +91,7 @@ fn start_dev_server(
                 InstrumentationEvent { active: true, mode: "tagged", detail: None },
             ),
             Ok(None) => (
-                ExecSpec::Script(package_manager, Vec::new()).into(),
+                ExecSpec::Script(package_manager, script.clone(), Vec::new()).into(),
                 InstrumentationEvent { active: false, mode: "script", detail: None },
             ),
             Err(e) => {
@@ -99,7 +105,7 @@ fn start_dev_server(
                     }),
                 );
                 (
-                    ExecSpec::Script(package_manager, Vec::new()).into(),
+                    ExecSpec::Script(package_manager, script.clone(), Vec::new()).into(),
                     InstrumentationEvent { active: false, mode: "error", detail: Some(e) },
                 )
             }
@@ -142,7 +148,7 @@ fn start_dev_server(
                     // rewrite: run it as written and say inspection is off,
                     // rather than start a server that tags nothing.
                     None if needs_webpack => (
-                        ExecSpec::Script(package_manager, Vec::new()).into(),
+                        ExecSpec::Script(package_manager, script.clone(), Vec::new()).into(),
                         InstrumentationEvent {
                             active: false,
                             mode: "framework",
@@ -153,7 +159,7 @@ fn start_dev_server(
                     ),
                     None => (
                         devserver::Launch {
-                            exec: ExecSpec::Script(package_manager, Vec::new()),
+                            exec: ExecSpec::Script(package_manager, script.clone(), Vec::new()),
                             env: vec![("DEDUP_TAGGING".into(), "1".into())],
                         },
                         InstrumentationEvent { active: true, mode: "tagged", detail: None },
@@ -161,7 +167,7 @@ fn start_dev_server(
                 }
             }
             instrument::NextStatus::Offered { config, .. } => (
-                ExecSpec::Script(package_manager, Vec::new()).into(),
+                ExecSpec::Script(package_manager, script.clone(), Vec::new()).into(),
                 InstrumentationEvent {
                     active: false,
                     mode: "next-optin",
@@ -169,7 +175,7 @@ fn start_dev_server(
                 },
             ),
             instrument::NextStatus::Unavailable { reason } => (
-                ExecSpec::Script(package_manager, Vec::new()).into(),
+                ExecSpec::Script(package_manager, script.clone(), Vec::new()).into(),
                 InstrumentationEvent {
                     active: false,
                     mode: "framework",
@@ -196,7 +202,7 @@ fn start_dev_server(
         )
     } else {
         (
-            ExecSpec::Script(package_manager, Vec::new()).into(),
+            ExecSpec::Script(package_manager, script.clone(), Vec::new()).into(),
             InstrumentationEvent {
                 active: false,
                 mode: "framework",
@@ -242,9 +248,12 @@ fn import_agent_asset(
     agent: String,
     source: String,
     dest: String,
+    // For a destination named before the image existed (an IMAGE request):
+    // correct an extension that disagrees with the bytes instead of refusing.
+    adapt_extension: Option<bool>,
 ) -> Result<asset::ImportedAsset, String> {
     let agent = ai::Agent::parse(&agent).ok_or_else(|| format!("unknown agent: {agent}"))?;
-    asset::import(&root, agent, &source, &dest)
+    asset::import(&root, agent, &source, &dest, adapt_extension.unwrap_or(false))
 }
 
 /// The source of the element at ordinal `index` in `file`, as a snippet that
@@ -394,6 +403,67 @@ async fn agent_prompt(
 ) -> Result<String, String> {
     let agent = ai::Agent::parse(&agent).ok_or_else(|| format!("unknown agent: {agent}"))?;
     tauri::async_runtime::spawn_blocking(move || ai::prompt(agent, &prompt, model.as_deref()))
+        .await
+        .map_err(|e| format!("agent task failed: {e}"))?
+}
+
+/// A region of the app window as a PNG `data:` URL at `width` points — the
+/// picture on a parked element's card, taken while it is still on the page.
+#[tauri::command]
+async fn snapshot_region(app: AppHandle, rect: thumbs::Rect, width: f64) -> Result<String, String> {
+    let png = tauri::async_runtime::spawn_blocking(move || {
+        thumbs::snapshot_png_at(&app, Some(rect), width.clamp(16.0, 2400.0))
+    })
+    .await
+    .map_err(|e| format!("capture task failed: {e}"))??;
+    use base64::Engine as _;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    ))
+}
+
+/// The project's parked canvas pieces (see `parking.rs`).
+#[tauri::command]
+fn load_parked(app: AppHandle, root: String) -> serde_json::Value {
+    parking::load(&app, &root)
+}
+
+#[tauri::command]
+fn save_parked(app: AppHandle, root: String, items: serde_json::Value) -> Result<(), String> {
+    parking::save(&app, &root, &items)
+}
+
+/// Export one artboard as a PNG or a vector PDF, rendered at its real size in
+/// a throwaway off-screen view (see `export.rs`), written where the user chose.
+#[tauri::command]
+async fn export_artboard(
+    app: AppHandle,
+    request: export::Request,
+) -> Result<export::Exported, String> {
+    tauri::async_runtime::spawn_blocking(move || export::export(&app, &request))
+        .await
+        .map_err(|e| format!("export task failed: {e}"))?
+}
+
+/// Make the project a git repository with its current files as the first
+/// commit — what lets a folder with no git use dedup's save path at all.
+#[tauri::command]
+async fn git_init_baseline(root: String) -> Result<git::GitStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git::init_baseline(&root)?;
+        Ok(git::status(&root))
+    })
+    .await
+    .map_err(|e| format!("git task failed: {e}"))?
+}
+
+/// The models an agent's CLI offers, read from the CLI itself (empty for one
+/// with no catalog — the editor keeps its own list for those).
+#[tauri::command]
+async fn agent_models(agent: String) -> Result<Vec<ai::ModelChoice>, String> {
+    let agent = ai::Agent::parse(&agent).ok_or_else(|| format!("unknown agent: {agent}"))?;
+    tauri::async_runtime::spawn_blocking(move || ai::models(agent))
         .await
         .map_err(|e| format!("agent task failed: {e}"))?
 }
@@ -682,6 +752,12 @@ pub fn run() {
             collect_auth_context,
             agent_available,
             agent_prompt,
+            agent_models,
+            git_init_baseline,
+            export_artboard,
+            snapshot_region,
+            load_parked,
+            save_parked,
             commit_session,
             get_recent_projects,
             add_recent_project,

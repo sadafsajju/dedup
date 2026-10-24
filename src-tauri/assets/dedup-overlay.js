@@ -100,6 +100,43 @@
   dropBox.style.borderStyle = "dashed";
   dropBox.style.zIndex = String(Z + 2);
 
+  // The ghost: the dragged element's own footprint, drawn in the slot the
+  // release would put it in. The line answers "where is the insertion point",
+  // which is not the question being asked — a page-wide section dropped into
+  // a sidebar column looks nothing like the line implies, and until the
+  // pointer came up there was no way to find that out.
+  const dropGhost = makeBox("rgba(76,127,255,0.14)");
+  dropGhost.style.borderRadius = "3px";
+  dropGhost.style.boxShadow = "0 8px 24px rgba(23,42,89,0.22)";
+  dropGhost.style.zIndex = String(Z + 1);
+
+  // Cursor. Every element under the pointer belongs to the user's app and
+  // most of them name a cursor of their own, so "this can be picked up" has
+  // to be said in a rule that outranks theirs — said in a stylesheet keyed by
+  // dedup id rather than by writing anything into their DOM. The two states
+  // are scoped differently on purpose: `grab` belongs to the one element the
+  // pointer is over, while `grabbing` covers the document, because mid-drag
+  // the pointer is over whatever it happens to pass and the answer must not
+  // change from element to element.
+  const cursorStyle = document.createElement("style");
+  cursorStyle.setAttribute("data-dedup-ui", "");
+  /** What that sheet currently says: `repaint` runs on every mousemove, and
+   *  assigning textContent re-parses the sheet whether it changed or not. */
+  let cursorRule = "";
+
+  function setCursor(kind, id) {
+    const sel = id ? `[data-dedup-id="${cssEscapeAttr(id)}"]` : "";
+    const rule =
+      kind === "grabbing"
+        ? "*{cursor:grabbing !important}"
+        : kind === "grab" && sel
+          ? `${sel},${sel} *{cursor:grab !important}`
+          : "";
+    if (rule === cursorRule) return;
+    cursorRule = rule;
+    cursorStyle.textContent = rule;
+  }
+
   // --- "the AI is working on this" ------------------------------------------
   // A chat turn can take a minute, and the only sign of it was a spinner in a
   // side panel the user may have scrolled away from — while the thing being
@@ -189,19 +226,83 @@
   // --- viewport-height freeze ----------------------------------------------
   // The editor grows the canvas frame to the page's full height. Without help,
   // vh/dvh-based layouts (h-screen sections, 100dvh app shells) re-resolve
-  // against the grown frame — sections balloon and the layout diverges. Pin
-  // the common Tailwind viewport-height classes to the DEVICE viewport height
-  // (sent by the editor; falls back to the height at overlay load) so the page
-  // keeps its designed proportions no matter how tall the frame gets.
+  // against the grown frame — sections balloon, and because height reporting
+  // is mutation-driven (any later DOM change re-measures the page), a section
+  // that already grew with the last resize gets counted again on the next
+  // mutation and grows the frame further still. Left unpinned, a plain
+  // full-height header can ratchet the frame toward the height cap on nothing
+  // but its own re-renders. Pin viewport-height sizing to the DEVICE viewport
+  // height (sent by the editor; falls back to the height at overlay load) so
+  // the page keeps its designed proportions no matter how tall the frame
+  // gets. The common Tailwind classnames are pinned unconditionally;
+  // findViewportRules/pinInlineVh generalize the same fix to raw CSS, other
+  // frameworks' equivalents (Bootstrap's .vh-100), and CSS-in-JS output —
+  // none of which share a classname dedup could hardcode.
   let deviceH = window.innerHeight;
   const freezeStyle = document.createElement("style");
   freezeStyle.setAttribute("data-dedup-ui", "");
+  // The whole property value, just `<number>(vh|dvh|svh|lvh)` — calc()/clamp()
+  // expressions are left alone rather than risk pinning them wrong.
+  const VH_VALUE_RE = /^\s*(-?\d*\.?\d+)(dvh|svh|lvh|vh)\s*$/i;
+  const VH_PROPS = ["height", "min-height", "max-height"];
+  function pinnedPx(rawValue) {
+    const m = rawValue ? VH_VALUE_RE.exec(rawValue) : null;
+    return m ? (parseFloat(m[1]) / 100) * deviceH + "px" : null;
+  }
+  // Same-origin stylesheets only — a cross-origin one throws on .cssRules,
+  // and a rule dedup needs to override always lands in an accessible one
+  // (the app's own bundled/JIT-generated CSS, same origin as the page).
+  function collectViewportRules(rules, out) {
+    for (const rule of rules) {
+      if (rule.cssRules) { collectViewportRules(rule.cssRules, out); continue; }
+      if (!rule.style || !rule.selectorText) continue;
+      for (const prop of VH_PROPS) {
+        const px = pinnedPx(rule.style.getPropertyValue(prop));
+        if (px) out.push({ selector: rule.selectorText, prop, px });
+      }
+    }
+  }
+  function findViewportRules() {
+    const out = [];
+    for (const sheet of document.styleSheets || []) {
+      try {
+        if (sheet.cssRules) collectViewportRules(sheet.cssRules, out);
+      } catch {}
+    }
+    return out;
+  }
+  // Elements sized by an inline vh style, reasserted every pass the way
+  // unpinnedEls is below — a React re-render replaces the whole style
+  // attribute and would otherwise put the live vh value straight back.
+  const inlineVh = new Map();
+  function pinInlineVh() {
+    for (const el of document.querySelectorAll("[style]")) {
+      if (inlineVh.has(el)) continue;
+      const coeffs = [];
+      for (const prop of VH_PROPS) {
+        const m = VH_VALUE_RE.exec(el.style.getPropertyValue(prop));
+        if (m) coeffs.push({ prop, num: parseFloat(m[1]) });
+      }
+      if (coeffs.length) inlineVh.set(el, coeffs);
+    }
+    for (const [el, coeffs] of inlineVh) {
+      if (!el.isConnected) { inlineVh.delete(el); continue; }
+      for (const { prop, num } of coeffs) {
+        el.style.setProperty(prop, (num / 100) * deviceH + "px", "important");
+      }
+    }
+  }
   function refreshFreeze() {
     const h = deviceH + "px";
-    freezeStyle.textContent =
+    let css =
       ".h-screen,.h-dvh,.h-svh,.h-lvh{height:" + h + " !important}" +
       ".min-h-screen,.min-h-dvh,.min-h-svh,.min-h-lvh{min-height:" + h + " !important}" +
       ".max-h-screen,.max-h-dvh,.max-h-svh,.max-h-lvh{max-height:" + h + " !important}";
+    for (const { selector, prop, px } of findViewportRules()) {
+      css += selector + "{" + prop + ":" + px + " !important}";
+    }
+    freezeStyle.textContent = css;
+    pinInlineVh();
   }
   refreshFreeze();
 
@@ -213,6 +314,8 @@
     document.documentElement.appendChild(previewStyle);
     document.documentElement.appendChild(dropLine);
     document.documentElement.appendChild(dropBox);
+    document.documentElement.appendChild(dropGhost);
+    document.documentElement.appendChild(cursorStyle);
     document.documentElement.appendChild(busyStyle);
     document.documentElement.appendChild(busyBox);
     for (const el of handleEls) document.documentElement.appendChild(el);
@@ -859,6 +962,25 @@
       hoverBox.style.display = "none";
       badge.style.display = "none";
     }
+    // While a drag is in flight the grabbing cursor covers the document;
+    // before one, grab is offered only where a drag could actually start —
+    // so the cursor also answers "can I move this?" before the user tries.
+    if (drag && drag.active) setCursor("grabbing");
+    else if (
+      mode === "inspect" &&
+      dragEnabled &&
+      !insertArmed &&
+      !resizing &&
+      // A caret on the canvas outranks it: the double-click way into the text
+      // tool leaves the select tool's drag armed, and a grab cursor over the
+      // words you are typing is the wrong answer to "what happens if I click".
+      !editingEl &&
+      hoverEl &&
+      hoverEl.isConnected &&
+      structurallyEditable(hoverEl)
+    ) {
+      setCursor("grab", hoverEl.getAttribute("data-dedup-id"));
+    } else setCursor(null);
     if (selectedEl && selectedEl.isConnected) {
       const r = position(selectBox, selectedEl);
       positionHandles(r);
@@ -992,6 +1114,24 @@
         structural: Array.isArray(m.structural) ? m.structural : [],
       };
       applyProgram();
+    } else if (m.type === "probe-drop") {
+      // Something is being dragged over this page from outside it — an
+      // element from another artboard, or a piece parked on the canvas. The
+      // pointer is captured elsewhere, so this page hears nothing directly:
+      // the editor relays the point, and the answer is the same slot an
+      // in-page drag would land in, drawn the same way.
+      const target =
+        typeof m.x === "number" && typeof m.y === "number"
+          ? dropTargetAt(m.x, m.y, null)
+          : null;
+      showDropIndicator(target);
+      post("probe-result", {
+        seq: m.seq,
+        id: target ? target.el.getAttribute("data-dedup-id") : null,
+        position: target ? target.position : null,
+      });
+    } else if (m.type === "probe-clear") {
+      hideDropIndicator();
     } else if (m.type === "text-edit-begin") {
       beginTextEdit(m.id);
     } else if (m.type === "text-edit-end") {
@@ -1000,6 +1140,7 @@
       dragEnabled = !!m.drag;
       insertArmed = !!m.insert;
       if (!insertArmed) hideDropIndicator();
+      repaint();
     } else if (m.type === "set-resizable") {
       // The editor answers "may this element's size be edited?" from the
       // write-back's own report, so the grips appear on exactly the elements
@@ -1165,11 +1306,89 @@
     return { el, position, rect: r };
   }
 
-  function showDropIndicator(target) {
+  /**
+   * Does this container lay its children out along the x axis? A drop
+   * `before` a sibling in a row renders to its *left*; a ghost stacked above
+   * it would be a confident lie about where the element is going. Only flex
+   * is read — a grid's direction depends on the tracks, and guessing there
+   * would be the same lie with more steps.
+   */
+  function rowLayout(el) {
+    if (!el) return null;
+    const cs = getComputedStyle(el) || {};
+    const display = cs.display || "";
+    if (display !== "flex" && display !== "inline-flex") return null;
+    const dir = cs.flexDirection || "row";
+    if (!dir.startsWith("row")) return null;
+    return { reverse: dir.endsWith("reverse") };
+  }
+
+  /**
+   * The dragged element's footprint, drawn where releasing would put it:
+   * beside the target in a row, above or below it in a column, and *last*
+   * inside a container — which is where the write-back's `inside` puts it.
+   */
+  function showGhost(target, dragged) {
+    const g =
+      dragged && dragged.isConnected ? dragged.getBoundingClientRect() : null;
+    if (!g || g.width < 1 || g.height < 1) {
+      dropGhost.style.display = "none";
+      return;
+    }
+    const { rect: r, position } = target;
+    const row = rowLayout(
+      position === "inside" ? target.el : target.el.parentElement,
+    );
+    // The cross axis belongs to the container — a sibling in a column is as
+    // wide as the column — so clamp it; the main axis is the element's own.
+    const w = Math.max(2, row ? g.width : Math.min(g.width, r.width));
+    const h = Math.max(2, row ? Math.min(g.height, r.height) : g.height);
+    let x = r.x;
+    let y = r.y;
+    // Which end of the target it lands at, once row-reverse has had its say.
+    const after = position === "inside" || position === "after";
+    const end = row && row.reverse ? !after : after;
+    if (position === "inside") {
+      if (row) x = end ? r.x + Math.max(0, r.width - w) : r.x;
+      else y = end ? r.y + Math.max(0, r.height - h) : r.y;
+    } else if (row) {
+      x = end ? r.x + r.width : r.x - w;
+    } else {
+      y = end ? r.y + r.height : r.y - h;
+    }
+    Object.assign(dropGhost.style, {
+      display: "block",
+      left: x + "px",
+      top: y + "px",
+      width: w + "px",
+      height: h + "px",
+    });
+  }
+
+  /** The element in flight fades, so the ghost is the one that reads as
+   * going somewhere. Inline, and put back exactly as found — an element is
+   * entitled to an inline opacity of its own. */
+  function liftDragged(g) {
+    g.opacity = g.el.style.opacity;
+    g.el.style.opacity = "0.4";
+  }
+
+  function dropLifted(g) {
+    if (!g || g.opacity === undefined) return;
+    if (g.opacity) g.el.style.opacity = g.opacity;
+    else g.el.style.removeProperty("opacity");
+    g.opacity = undefined;
+  }
+
+  /** `dragged` is the element being re-parented, and only a drag has one:
+   * the insert palette places something that does not exist yet, so it gets
+   * the line alone. */
+  function showDropIndicator(target, dragged) {
     if (!target) {
       hideDropIndicator();
       return;
     }
+    showGhost(target, dragged);
     const { rect, position } = target;
     if (position === "inside") {
       dropLine.style.display = "none";
@@ -1194,6 +1413,7 @@
   function hideDropIndicator() {
     dropLine.style.display = "none";
     dropBox.style.display = "none";
+    dropGhost.style.display = "none";
   }
 
   // --- resize ---------------------------------------------------------------
@@ -1319,6 +1539,11 @@
   // an element still selects it.
   const DRAG_THRESHOLD = 4;
 
+  /** Whether a point (this frame's CSS px) is off the page entirely. */
+  function outsideFrame(x, y) {
+    return x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight;
+  }
+
   document.addEventListener(
     "pointerdown",
     (e) => {
@@ -1326,7 +1551,15 @@
       if (e.button !== 0 || isEditing(e.target)) return;
       const el = tagged(e.target);
       if (!structurallyEditable(el)) return;
-      drag = { el, x: e.clientX, y: e.clientY, active: false, target: null };
+      drag = {
+        el,
+        x: e.clientX,
+        y: e.clientY,
+        active: false,
+        target: null,
+        pointerId: e.pointerId,
+        outside: false,
+      };
     },
     true,
   );
@@ -1352,12 +1585,43 @@
         if (moved < DRAG_THRESHOLD) return;
         drag.active = true;
         hoverEl = null;
+        liftDragged(drag);
         repaint();
+        // Keep receiving the pointer after it leaves this frame. Without
+        // capture the iframe goes deaf at its own edge, and an element could
+        // never be dragged out onto the canvas or into another artboard.
+        try {
+          document.documentElement.setPointerCapture(drag.pointerId);
+        } catch {
+          // No capture (an old engine, a synthetic event): the drag still
+          // works inside the frame, which is all it ever did.
+        }
         post("drag-start", { id: drag.el.getAttribute("data-dedup-id") });
       }
       e.preventDefault();
+      // Off this page: the editor owns what happens out there — empty canvas
+      // (park it) or another artboard (which it probes). Coordinates stay in
+      // this frame's CSS px; only the editor knows where the frame is.
+      if (outsideFrame(e.clientX, e.clientY)) {
+        drag.target = null;
+        hideDropIndicator();
+        drag.outside = true;
+        const component = drag.el.getAttribute("data-dedup-component");
+        const tag = drag.el.tagName.toLowerCase();
+        post("drag-outside", {
+          x: e.clientX,
+          y: e.clientY,
+          id: drag.el.getAttribute("data-dedup-id"),
+          label: component ? `${component} · ${tag}` : tag,
+        });
+        return;
+      }
+      if (drag.outside) {
+        drag.outside = false;
+        post("drag-outside", { x: null, y: null });
+      }
       drag.target = dropTargetAt(e.clientX, e.clientY, drag.el);
-      showDropIndicator(drag.target);
+      showDropIndicator(drag.target, drag.el);
     },
     true,
   );
@@ -1388,10 +1652,23 @@
       const finished = drag;
       drag = null;
       hideDropIndicator();
+      dropLifted(finished);
+      repaint();
       if (!finished.active) return;
       e.preventDefault();
       e.stopImmediatePropagation();
       post("drag-end", {});
+      if (finished.outside && outsideFrame(e.clientX, e.clientY)) {
+        // Released off the page. The element itself is described so the
+        // editor can name it without waiting on a selection round-trip.
+        post("drop-outside", {
+          id: finished.el.getAttribute("data-dedup-id"),
+          x: e.clientX,
+          y: e.clientY,
+          element: payload(finished.el),
+        });
+        return;
+      }
       if (!finished.target) return;
       post("drop", {
         id: finished.el.getAttribute("data-dedup-id"),
@@ -1404,8 +1681,11 @@
 
   window.addEventListener("blur", () => {
     if (drag?.active) post("drag-end", {});
+    if (drag?.outside) post("drag-outside", { x: null, y: null });
+    dropLifted(drag);
     drag = null;
     hideDropIndicator();
+    repaint();
   });
 
   // --- keyboard forwarding --------------------------------------------------
@@ -1457,8 +1737,10 @@
             e.key === "t"));
       if (!forwarded) return;
       if (drag?.active && e.key === "Escape") {
+        dropLifted(drag);
         drag = null;
         hideDropIndicator();
+        repaint();
         post("drag-end", {});
         return;
       }
@@ -1618,6 +1900,7 @@
     }
   }
   function measureHeight() {
+    refreshFreeze();
     unpinPageScrollers();
     const doc = document.documentElement;
     const body = document.body;

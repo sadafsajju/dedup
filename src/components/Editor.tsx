@@ -21,6 +21,7 @@ import { DriftView } from "./DriftView";
 import { Inspector } from "./Inspector";
 import { ConsoleDrawer } from "./ConsoleDrawer";
 import { SessionModal } from "./SessionModal";
+import { DirectWritePrompt } from "./DirectWritePrompt";
 import { ClusterReview } from "./Duplicates";
 import { MergeReview } from "./MergeReview";
 import { HistoryPanel } from "./History";
@@ -180,6 +181,10 @@ export function Editor() {
         // original text back), so reaching here means the caret is already
         // gone and only the tool is left to leave.
         else if (s.tool === "text") s.setTool("select");
+        // The markup layer takes Escape first while a stroke is in flight
+        // (it cancels the stroke); reaching here means there is none, and
+        // only the tool is left to leave.
+        else if (s.tool === "annotate") s.setTool("select");
         else if (s.selected) s.clearSelection();
         else s.toggleConsole(false);
       } else if ((e.key === "Delete" || e.key === "Backspace") && !inField) {
@@ -189,13 +194,15 @@ export function Editor() {
         e.preventDefault();
       } else if (!inField) {
         // Tool shortcuts (FR-6.4), Figma-style: V select, H hand, B browse,
-        // T text. (The overlay forwards these from inside the canvas, but
-        // never while a caret is in an element — see its keydown handler.)
+        // T text, A annotate. (The overlay forwards these from inside the
+        // canvas, but never while a caret is in an element — see its keydown
+        // handler.)
         const s = useStore.getState();
         if (e.key === "v") s.setTool("select");
         else if (e.key === "h") s.setTool("hand");
         else if (e.key === "b") s.setTool("browse");
         else if (e.key === "t") s.setTool("text");
+        else if (e.key === "a") s.setTool("annotate");
         else return;
         e.preventDefault();
       }
@@ -228,6 +235,7 @@ export function Editor() {
       <MergeReview />
       <HistoryPanel />
       <SessionModal />
+      <DirectWritePrompt />
     </div>
   );
 }

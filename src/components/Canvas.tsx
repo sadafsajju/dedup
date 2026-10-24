@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { startDevServer, stopDevServer } from "../lib/api";
 import {
   registerCanvasIframe,
@@ -7,7 +7,8 @@ import {
   sendToOverlay,
 } from "../lib/bridge";
 import { Toolbar } from "./Toolbar";
-import { PAGE_GAP, useStore } from "../lib/store";
+import { AnnotationLayer } from "./AnnotationLayer";
+import { artboardLayout, useStore } from "../lib/store";
 import { zoomToward } from "../lib/panZoom";
 
 /** Inset from a floating panel's outer edge to the artboards: the panel's own
@@ -15,11 +16,13 @@ import { zoomToward } from "../lib/panZoom";
 const CHROME_GUTTER = 24;
 /** Clears the floating top bar *and* the artboard's label above the frame. */
 const CHROME_TOP = 120;
-import { frameUrl, resolveOrigin } from "../lib/origins";
+import { artboardUrl } from "../lib/origins";
 import { PALETTE } from "../lib/palette";
-import { VIEWPORTS } from "../lib/types";
+import { VIEWPORTS, artboardHeight } from "../lib/types";
 import type { DropPosition, LayerNode, SelectedElement } from "../lib/types";
 import { Cross2Icon, FileTextIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { ArtboardExportButton, ExportNotice } from "./ArtboardExport";
+import { DragOutGhost, ParkedPieces, useDragOffArtboard } from "./Parking";
 
 /** Zoom about a point given in canvas-container coordinates, keeping the
  * point visually fixed (Figma semantics). */
@@ -40,14 +43,21 @@ function zoomAt(cx: number, cy: number, factor: number) {
 function GestureHint() {
   const draggingId = useStore((s) => s.draggingId);
   const insertKind = useStore((s) => s.insertKind);
-  if (!draggingId && !insertKind) return null;
+  const annotating = useStore((s) => s.tool === "annotate");
+  if (!draggingId && !insertKind && !annotating) return null;
+  // Annotate says what it does *not* do, because that is the question a tool
+  // that draws on your running app raises: nothing here reaches the source.
   const label = draggingId
     ? "Drop to move — release inside an element to re-parent it"
-    : `Click where the ${PALETTE[insertKind!].label.toLowerCase()} should go`;
+    : insertKind
+      ? `Click where the ${PALETTE[insertKind].label.toLowerCase()} should go`
+      : "Drag to mark up the page — marks stay in dedup, never in your code";
   return (
     <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-30 rounded-full border border-line bg-surface-1/95 backdrop-blur px-3 py-1 text-2xs text-ink-dim shadow-lg select-none">
       {label}
-      <span className="text-ink-faint"> · Esc to cancel</span>
+      <span className="text-ink-faint">
+        {annotating && !draggingId && !insertKind ? " · Esc to leave the tool" : " · Esc to cancel"}
+      </span>
     </div>
   );
 }
@@ -79,10 +89,22 @@ export function Canvas() {
   // Every discovered route is its own page artboard, Figma-style, in a row.
   // Each frame shows its full page: at least the device height, grown to the
   // page's reported natural height, sanity-capped for runaway layouts.
-  const minHeight = viewport.height ?? 800;
-  const heightFor = (route: string) =>
-    Math.min(Math.max(minHeight, pageHeights[route] ?? 0), 12000);
-  const pageStep = viewport.width + PAGE_GAP;
+  const heightFor = (route: string) => artboardHeight(viewport, pageHeights[route]);
+  // Where each artboard sits — stored where the user put it, otherwise the
+  // row (lib/canvasMemory's one rule). `moving` overrides one board while it
+  // is being dragged by its label; it is committed on release.
+  const artboardPos = useStore((s) => s.artboardPos);
+  const moveArtboard = useStore((s) => s.moveArtboard);
+  const [moving, setMoving] = useState<{ route: string; x: number; y: number } | null>(null);
+  const layout = useMemo(() => {
+    const l = artboardLayout({ routes, artboardPos, viewportId });
+    if (moving) l[moving.route] = { x: moving.x, y: moving.y };
+    return l;
+  }, [routes, artboardPos, viewportId, moving]);
+  const posOf = (route: string) => layout[route] ?? { x: 0, y: 0 };
+  // The label drag: where it started, and whether it has become a move (a
+  // click on the label still selects the artboard).
+  const labelDrag = useRef<{ route: string; sx: number; sy: number; ox: number; oy: number; moved: boolean } | null>(null);
   // De-dupe cross-frame selection sync: broadcast each dedupId once.
   const lastSelectRef = useRef<string | null>(null);
 
@@ -98,6 +120,9 @@ export function Canvas() {
   // artboards re-centre for it the same way they do for a viewport change.
   const codePanelOpen = useStore((s) => s.codePanel !== null);
   const containerRef = useRef<HTMLDivElement>(null);
+  // Drags that leave their artboard: parked on the canvas or moved into
+  // another page (components/Parking).
+  useDragOffArtboard(containerRef);
   // Space-held hand tool + active drag (space-drag or middle-drag).
   const [spaceHeld, setSpaceHeld] = useState(false);
   const hand = tool === "hand" || spaceHeld;
@@ -264,14 +289,12 @@ export function Canvas() {
       } else if (m.type === "wheel") {
         const s = useStore.getState();
         if (m.zoomMod) {
-          // Iframe-local coords → container coords: offset by the sending
-          // frame's slot in the pages row, then by pan.
-          const vp = VIEWPORTS.find((v) => v.id === s.viewportId)!;
-          const idx = Math.max(0, s.routes.indexOf(routeOfWindow(e.source) ?? "/"));
-          const frameX = idx * (vp.width + PAGE_GAP);
+          // Iframe-local coords → container coords: offset by where the
+          // sending frame sits on the canvas, then by pan.
+          const at = artboardLayout(s)[routeOfWindow(e.source) ?? "/"] ?? { x: 0, y: 0 };
           zoomAt(
-            s.pan.x + (frameX + (m.x as number)) * s.zoom,
-            s.pan.y + (m.y as number) * s.zoom,
+            s.pan.x + (at.x + (m.x as number)) * s.zoom,
+            s.pan.y + (at.y + (m.y as number)) * s.zoom,
             Math.exp(-(m.dy as number) * 0.01),
           );
           zoomRef.current = useStore.getState().zoom; // cursor-anchored, skip recenter
@@ -632,19 +655,53 @@ export function Canvas() {
           {routes.map((route, i) => (
             <div
               key={route}
-              className="group absolute flex items-baseline gap-1.5 text-2xs select-none cursor-pointer"
+              className={`group absolute flex items-baseline gap-1.5 text-2xs select-none ${
+                moving?.route === route ? "cursor-grabbing" : "cursor-grab"
+              }`}
               style={{
-                left: pan.x + i * pageStep * zoom,
-                top: pan.y - 22,
+                left: pan.x + posOf(route).x * zoom,
+                top: pan.y + posOf(route).y * zoom - 22,
                 maxWidth: Math.max(viewport.width * zoom, 160),
               }}
-              onClick={() =>
-                setSelectedRoute(selectedRoute === route ? null : route)
-              }
+              // Figma's gesture: a frame is moved by its name. The page below
+              // the label stays the page — dragging there edits it.
+              onPointerDown={(e) => {
+                if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                const at = posOf(route);
+                labelDrag.current = { route, sx: e.clientX, sy: e.clientY, ox: at.x, oy: at.y, moved: false };
+              }}
+              onPointerMove={(e) => {
+                const d = labelDrag.current;
+                if (!d || d.route !== route) return;
+                const dx = e.clientX - d.sx;
+                const dy = e.clientY - d.sy;
+                if (!d.moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+                d.moved = true;
+                setMoving({ route, x: d.ox + dx / zoom, y: d.oy + dy / zoom });
+              }}
+              onPointerUp={() => {
+                const d = labelDrag.current;
+                if (d?.moved && moving?.route === route) moveArtboard(route, moving);
+                setMoving(null);
+                // Leave `moved` readable for the click that follows a drag,
+                // so releasing a move doesn't also toggle the selection.
+                setTimeout(() => {
+                  if (labelDrag.current === d) labelDrag.current = null;
+                }, 0);
+              }}
+              onPointerCancel={() => {
+                labelDrag.current = null;
+                setMoving(null);
+              }}
+              onClick={() => {
+                if (labelDrag.current?.moved) return;
+                setSelectedRoute(selectedRoute === route ? null : route);
+              }}
               title={
                 selectedRoute === route
-                  ? "Selected — Scan targets this artboard"
-                  : "Select this artboard to scan it"
+                  ? "Selected — Scan targets this artboard. Drag the name to move it."
+                  : "Click to select this artboard for Scan; drag the name to move it"
               }
             >
               <span
@@ -715,6 +772,7 @@ export function Canvas() {
                   Hover-revealed: the label is read far more often than it is
                   dismissed, and a permanent × next to every page name would
                   compete with the name itself. */}
+              <ArtboardExportButton route={route} />
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -739,8 +797,8 @@ export function Canvas() {
               transformOrigin: "0 0",
             }}
           >
-            {routes.map((route, i) => {
-              const x = i * pageStep;
+            {routes.map((route) => {
+              const { x, y } = posOf(route);
               const h = heightFor(route);
               const view = {
                 left: -pan.x / zoom - 400,
@@ -750,7 +808,7 @@ export function Canvas() {
               };
               const near =
                 x < view.right && x + viewport.width > view.left &&
-                0 < view.bottom && h > view.top;
+                y < view.bottom && y + h > view.top;
               return (
                 <div
                   key={route}
@@ -761,7 +819,7 @@ export function Canvas() {
                   className={`absolute shadow-2xl bg-white rounded-md overflow-hidden ${
                     selectedRoute === route ? "ring-2 ring-accent" : ""
                   }`}
-                  style={{ left: x, top: 0, width: viewport.width, height: h }}
+                  style={{ left: x, top: y, width: viewport.width, height: h }}
                 >
                   {route === "/" || near ? (
                     <iframe
@@ -770,19 +828,13 @@ export function Canvas() {
                       // artboard's session or holding it re-points the frame
                       // immediately — and for a hold, that reload is exactly
                       // what arms it (the flag must be there before boot).
-                      src={frameUrl(
-                        route,
-                        resolveOrigin(route, {
-                          sessionModes,
-                          frameOrigins,
-                          devUrl,
-                          devAltUrl,
-                        }) ?? devUrl,
-                        {
-                          held: !!heldRoutes[route],
-                          offline: !!offlineRoutes[route],
-                        },
-                      )}
+                      src={
+                        artboardUrl(
+                          route,
+                          { sessionModes, frameOrigins, devUrl, devAltUrl },
+                          { held: !!heldRoutes[route], offline: !!offlineRoutes[route] },
+                        ) ?? undefined
+                      }
                       title={`page ${route}`}
                       className="w-full h-full border-0 bg-white"
                     />
@@ -792,7 +844,18 @@ export function Canvas() {
                 </div>
               );
             })}
+            <ParkedPieces zoom={zoom} />
           </div>
+          {/* Markup over the artboards. Always mounted so notes stay readable
+              in every tool, and inert until the annotate tool arms it. It
+              sits before the hand layer on purpose: holding Space has to pan
+              a canvas you are drawing on, so that layer wins the gesture. */}
+          <AnnotationLayer
+            routes={routes}
+            boxes={Object.fromEntries(
+              routes.map((r) => [r, { ...posOf(r), width: viewport.width, height: heightFor(r) }]),
+            )}
+          />
           {/* Space-held hand tool: catches drags everywhere, including over
               the iframe (which would otherwise swallow pointer events). */}
           {hand && (
@@ -808,6 +871,8 @@ export function Canvas() {
             />
           )}
           <GestureHint />
+          <ExportNotice />
+          <DragOutGhost />
           <Toolbar />
         </>
       )}

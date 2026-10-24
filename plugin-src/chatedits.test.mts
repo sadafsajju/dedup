@@ -5,8 +5,11 @@ import {
   applyEditBlocks,
   applyProgram,
   parseChatReply,
+  pickGeneratedImage,
+  retargetReferences,
   undecoratePath,
 } from "../src/lib/chatEdits.ts";
+import { imageRequestPrompt, systemPromptFor } from "../src/lib/chat.ts";
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -379,6 +382,166 @@ test("a path wearing the prompt's own placeholder brackets is still a path", () 
   assert.equal(bare.kind, "blocks");
   if (bare.kind !== "blocks") return;
   assert.equal(bare.blocks[0].file, null);
+});
+
+// ── IMAGE: an image asked of another agent ──────────────────────────────
+
+test("IMAGE names a destination and describes the picture, beside the markup", () => {
+  const r = parseChatReply(
+    [
+      "<<<<<<< IMAGE public/hero.png",
+      "A wide isometric illustration of a shipping container,",
+      "warm orange palette, 16:9.",
+      ">>>>>>> END",
+      "<<<<<<< SEARCH src/Hero.tsx",
+      "<div />",
+      "=======",
+      '<img src="/hero.png" alt="Container" />',
+      ">>>>>>> REPLACE",
+      "SUMMARY: add a hero illustration",
+    ].join("\n"),
+  );
+  assert.equal(r.kind, "blocks");
+  if (r.kind !== "blocks") return;
+  assert.deepEqual(r.images, [
+    {
+      file: "public/hero.png",
+      prompt: "A wide isometric illustration of a shipping container,\nwarm orange palette, 16:9.",
+    },
+  ]);
+  assert.equal(r.assets.length, 0, "a request is not an import");
+  assert.equal(r.blocks.length, 1);
+});
+
+test("an IMAGE block on its own is still an edit, and its path is undecorated", () => {
+  const r = parseChatReply(
+    "<<<<<<< IMAGE <img/logo.webp>\na flat monogram\n>>>>>>> END\nSUMMARY: add a logo",
+  );
+  assert.equal(r.kind, "blocks");
+  if (r.kind !== "blocks") return;
+  assert.equal(r.images[0].file, "img/logo.webp");
+});
+
+test("a malformed IMAGE block throws rather than generating a guess", () => {
+  assert.throws(
+    () => parseChatReply("<<<<<<< IMAGE a.png\n\n>>>>>>> END"),
+    /describe the image/,
+  );
+  assert.throws(() => parseChatReply("<<<<<<< IMAGE\nsomething\n>>>>>>> END"), /destination/);
+  assert.throws(() => parseChatReply("<<<<<<< IMAGE a.png\na cat"), /unterminated/);
+});
+
+test("pickGeneratedImage takes the one generated path from the answer", () => {
+  assert.equal(
+    pickGeneratedImage(
+      "<<<<<<< ASSET public/hero.png\n/Users/me/.codex/generated_images/a1.png\n>>>>>>> END",
+    ),
+    "/Users/me/.codex/generated_images/a1.png",
+  );
+});
+
+test("pickGeneratedImage refuses anything but exactly one image", () => {
+  // Prose: the agent couldn't, and says why — that is the message to show.
+  assert.throws(() => pickGeneratedImage("I can't generate images here."), /didn't produce an image: I can't/);
+  // Two images where one was asked for.
+  assert.throws(
+    () =>
+      pickGeneratedImage(
+        "<<<<<<< ASSET a.png\n/x/1.png\n>>>>>>> END\n<<<<<<< ASSET b.png\n/x/2.png\n>>>>>>> END",
+      ),
+    /2 images/,
+  );
+  // An edit riding along: a second agent writing source nobody asked it to.
+  assert.throws(
+    () =>
+      pickGeneratedImage(
+        "<<<<<<< ASSET a.png\n/x/1.png\n>>>>>>> END\n<<<<<<< CREATE src/x.ts\nexport {};\n>>>>>>> END",
+      ),
+    /code changes/,
+  );
+  // Malformed markers fail loudly, attributed to the answer.
+  assert.throws(() => pickGeneratedImage("<<<<<<< ASSET a.png\n/x/1.png"), /malformed/);
+});
+
+test("the image request is answerable by the picker it will be read with", () => {
+  const prompt = imageRequestPrompt("public/hero.png", "a container ship");
+  assert.match(prompt, /public\/hero\.png/);
+  assert.match(prompt, /a container ship/);
+  assert.match(prompt, /<<<<<<< ASSET public\/hero\.png/);
+});
+
+test("delegation is offered only to a backend that can't generate, and only when someone can", () => {
+  const plain = systemPromptFor("src/App.tsx");
+  assert.doesNotMatch(plain, /IMAGE|ASSET/, "no generator connected: neither directive");
+
+  const delegating = systemPromptFor("src/App.tsx", false, false, "Codex");
+  assert.match(delegating, /<<<<<<< IMAGE/);
+  assert.match(delegating, /ask Codex/);
+  assert.doesNotMatch(delegating, /<<<<<<< ASSET/, "it never names a source path");
+
+  const generating = systemPromptFor("src/App.tsx", false, true, "Codex");
+  assert.match(generating, /<<<<<<< ASSET/);
+  assert.doesNotMatch(generating, /<<<<<<< IMAGE/, "a generator has no reason to send for one");
+});
+
+test("a renamed image takes the references this edit added with it", () => {
+  const before = '<section class="hero">\n  <div class="ph">image</div>\n</section>\n';
+  const after =
+    '<section class="hero">\n  <img src="images/hero-container-lift.jpg" alt="Container">\n</section>\n';
+  const [out] = retargetReferences(
+    [{ file: "Main.dc.html", before, after }],
+    "images/hero-container-lift.jpg",
+    "images/hero-container-lift.png",
+  );
+  assert.equal(
+    out.after,
+    '<section class="hero">\n  <img src="images/hero-container-lift.png" alt="Container">\n</section>\n',
+  );
+});
+
+test("every spelling of the path is a reference, but a longer name is not", () => {
+  const after = [
+    'src="./images/hero.jpg"',
+    "url(/images/hero.jpg)",
+    "srcset='hero.jpg 2x'",
+    'src="images/big-hero.jpg"',
+    'src="images/hero.jpg.bak"',
+  ].join("\n");
+  const [out] = retargetReferences(
+    [{ file: "a.html", before: "", after }],
+    "images/hero.jpg",
+    "images/hero.png",
+  );
+  assert.deepEqual(out.after.split("\n"), [
+    'src="./images/hero.png"',
+    "url(/images/hero.png)",
+    "srcset='hero.png 2x'",
+    'src="images/big-hero.jpg"',
+    'src="images/hero.jpg.bak"',
+  ]);
+});
+
+test("a name the user's file already used is refused, not renamed", () => {
+  assert.throws(
+    () =>
+      retargetReferences(
+        [{ file: "a.html", before: '<img src="hero.jpg">', after: '<img src="hero.jpg"><img src="hero.jpg">' }],
+        "hero.jpg",
+        "hero.png",
+      ),
+    /already mentioned hero\.jpg/,
+  );
+});
+
+test("files that don't mention the image, and a new file, are handled as such", () => {
+  const files = [
+    { file: "a.css", before: "body{}", after: "body{margin:0}" },
+    { file: "new.html", before: null, after: '<img src="x.jpg">' },
+  ];
+  const out = retargetReferences(files, "x.jpg", "x.png");
+  assert.equal(out[0], files[0], "an untouched file is the same object");
+  assert.equal(out[1].after, '<img src="x.png">');
+  assert.equal(retargetReferences(files, "x.png", "x.png"), files, "same name: nothing to do");
 });
 
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

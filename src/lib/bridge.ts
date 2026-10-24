@@ -26,6 +26,10 @@ export type OverlayStructuralOp =
 type OverlayCommand =
   | { type: "select-id"; id: string }
   | { type: "clear" }
+  /** Something dragged from outside this page is over (x, y) in its CSS px:
+   *  draw the slot it would land in and answer with it (`probe-result`). */
+  | { type: "probe-drop"; x: number; y: number; seq: number }
+  | { type: "probe-clear" }
   /** The whole staged program as state — see syncCanvas in lib/store. */
   | {
       type: "stage";
@@ -74,6 +78,12 @@ export function registerCanvasIframe(
 ) {
   if (el) frames.set(route, el);
   else frames.delete(route);
+}
+
+/** Where an artboard's frame is on screen right now, or null when it is not
+ *  mounted (off-screen frames unmount). */
+export function frameBox(route: string): DOMRect | null {
+  return frames.get(route)?.getBoundingClientRect() ?? null;
 }
 
 /** Which page artboard a window belongs to — keys incoming overlay messages

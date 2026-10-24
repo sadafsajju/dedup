@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   MAX_ARTBOARDS,
   forgetCanvas,
+  layoutArtboards,
   loadCanvas,
   saveCanvas,
   type SavedCanvas,
@@ -42,6 +43,7 @@ const canvas = (over: Partial<SavedCanvas> = {}): SavedCanvas => ({
   sessionModes: { "/pricing": "out" },
   heldRoutes: [],
   offlineRoutes: [],
+  positions: {},
   ...over,
 });
 
@@ -119,6 +121,7 @@ test("a canvas missing every optional field still loads", () => {
     sessionModes: {},
     heldRoutes: [],
     offlineRoutes: [],
+    positions: {}, // saved before artboards could move: the row applies
   });
 });
 
@@ -146,6 +149,57 @@ test("an unknown session mode is dropped rather than restored", () => {
 test("a selection whose artboard is gone is no selection", () => {
   stored({ ...canvas(), routes: ["/"], selectedRoute: "/pricing" });
   assert.equal(loadCanvas(ROOT)!.selectedRoute, null);
+});
+
+// --- where artboards sit -------------------------------------------------------
+
+test("with nothing moved, artboards form the old row", () => {
+  assert.deepEqual(layoutArtboards(["/", "/a", "/b"], undefined, 1440, 64), {
+    "/": { x: 0, y: 0 },
+    "/a": { x: 1504, y: 0 },
+    "/b": { x: 3008, y: 0 },
+  });
+});
+
+test("a moved artboard stays put, and a new one joins to the right of everything", () => {
+  const layout = layoutArtboards(
+    ["/", "/a", "/new"],
+    { "/": { x: 0, y: 0 }, "/a": { x: 4000, y: 900 } },
+    1440,
+    64,
+  );
+  assert.deepEqual(layout["/a"], { x: 4000, y: 900 });
+  assert.deepEqual(layout["/new"], { x: 4000 + 1440 + 64, y: 0 }, "past the rightmost, not into a gap");
+});
+
+test("a page moved far left doesn't drag the row's new arrivals with it", () => {
+  // New arrivals start where the row always started; only something stored
+  // further right pushes them along.
+  const layout = layoutArtboards(["/", "/b"], { "/": { x: -9000, y: 0 } }, 390, 64);
+  assert.deepEqual(layout["/b"], { x: 0, y: 0 });
+});
+
+test("positions come back per viewport, for open artboards, as numbers", () => {
+  const positions = {
+    desktop: { "/": { x: 10, y: 20 }, "/pricing": { x: 2000, y: -300 } },
+    mobile: { "/": { x: 5, y: 5 } },
+  };
+  saveCanvas(ROOT, canvas({ positions }));
+  assert.deepEqual(loadCanvas(ROOT)!.positions, positions);
+
+  stored({
+    ...canvas(),
+    positions: {
+      desktop: {
+        "/": { x: 1, y: 2 },
+        "/closed": { x: 3, y: 4 }, // not an open artboard
+        "/pricing": { x: "9", y: 0 }, // not a number
+      },
+      tablet: { "/": { x: Infinity, y: 0 } }, // not finite → nothing left
+      junk: "nope",
+    },
+  });
+  assert.deepEqual(loadCanvas(ROOT)!.positions, { desktop: { "/": { x: 1, y: 2 } } });
 });
 
 console.log(`\n${passed} canvas-memory checks passed`);

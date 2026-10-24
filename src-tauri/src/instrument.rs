@@ -71,14 +71,7 @@ pub fn setup(root: &str, dev_script: Option<&str>) -> Result<Option<Instrumentat
 }
 
 fn find_vite_config(root: &Path) -> Option<PathBuf> {
-    const CANDIDATES: [&str; 5] = [
-        "vite.config.ts",
-        "vite.config.js",
-        "vite.config.mjs",
-        "vite.config.mts",
-        "vite.config.cjs",
-    ];
-    CANDIDATES
+    crate::project::VITE_CONFIG_NAMES
         .iter()
         .map(|c| root.join(c))
         .find(|p| p.exists())
