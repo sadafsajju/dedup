@@ -662,7 +662,7 @@ mod tests {
             " ",
             "- Local: http://localhost:3000",
             "- PID: 67063",
-            "- Dir: /Users/admin/Documents/sadaf/Apps/web/umrah",
+            "- Dir: /Users/me/projects/shop",
             "- Log: .next/dev/logs/next-development.log",
             "Run kill 67063 to stop it.",
         ] {
@@ -670,7 +670,7 @@ mod tests {
         }
         assert_eq!(
             info.complete(),
-            Some((67063, "/Users/admin/Documents/sadaf/Apps/web/umrah"))
+            Some((67063, "/Users/me/projects/shop"))
         );
     }
 

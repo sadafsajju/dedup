@@ -3,6 +3,8 @@ name = "dedup"
 version = "0.1.0"
 description = "Detect and merge near-duplicate React components"
 authors = ["Sadaf Kasim (GetBega Tech)"]
+license = "MIT"
+repository = "https://github.com/sadafsajju/dedup"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
