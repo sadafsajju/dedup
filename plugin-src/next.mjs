@@ -28,11 +28,6 @@
 //     only: a header set by a `middleware.ts` is served by Next itself, out of
 //     a config wrapper's reach, and would still blank the canvas.
 //
-// It does not serve the component harness: rendering one component in
-// isolation needs an arbitrary module URL from the dev server, which Vite
-// gives you and Next does not. The Components tab says so rather than showing
-// empty cards.
-
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

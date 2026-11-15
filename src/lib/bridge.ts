@@ -25,6 +25,10 @@ export type OverlayStructuralOp =
 
 type OverlayCommand =
   | { type: "select-id"; id: string }
+  /** A multi-selection, mirrored into every frame: each outlines the ones it
+   *  holds. With `report`, a frame holding any answers with their payloads
+   *  (`selected` / `selected-many`), the way a marquee does. */
+  | { type: "select-ids"; ids: string[]; report?: boolean }
   | { type: "clear" }
   /** Something dragged from outside this page is over (x, y) in its CSS px:
    *  draw the slot it would land in and answer with it (`probe-result`). */
@@ -60,8 +64,6 @@ type OverlayCommand =
   | { type: "set-busy"; id: string | null }
   /** Let a held frame resume: flushes the timers the hold queued. */
   | { type: "release-hold" }
-  | { type: "list-files" }
-  | { type: "list-sizes" }
   | { type: "set-mode"; mode: "inspect" | "browse" }
   | { type: "set-viewport"; height: number }
   | { type: "navigate"; path: string }
@@ -101,71 +103,18 @@ export function sendToOverlay(cmd: OverlayCommand) {
   }
 }
 
+/** Command every page frame but one — a selection made on one artboard
+ *  ends whatever was selected on the others. */
+export function sendToOtherFrames(win: unknown, cmd: OverlayCommand) {
+  for (const el of frames.values()) {
+    if (el.contentWindow === win) continue;
+    el.contentWindow?.postMessage({ __dedup: true, ...cmd }, "*");
+  }
+}
+
 /** Command one specific page frame (e.g. snap it back to its pinned route). */
 export function sendToFrame(route: string, cmd: OverlayCommand) {
   frames.get(route)?.contentWindow?.postMessage({ __dedup: true, ...cmd }, "*");
-}
-
-/** Source files behind one page artboard's rendered elements (FR-5.1 canvas
- * scope) — the scan is scoped to the artboard the user selected. Resolves
- * null when the frame doesn't answer (dev server down, untagged project) —
- * callers fall back to a full scan. */
-export function requestFrameFiles(
-  route: string,
-  timeoutMs = 1500,
-): Promise<string[] | null> {
-  const el = frames.get(route);
-  if (!el?.contentWindow) return Promise.resolve(null);
-  return new Promise((resolve) => {
-    const finish = (files: string[] | null) => {
-      clearTimeout(timer);
-      window.removeEventListener("message", onMessage);
-      resolve(files);
-    };
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    function onMessage(e: MessageEvent) {
-      const m = e.data;
-      if (!m || m.__dedup !== true || m.type !== "files") return;
-      // Every frame answers a list-files broadcast; only the selected
-      // artboard's answer defines the scope.
-      if (routeOfWindow(e.source) !== route) return;
-      finish(Array.isArray(m.files) ? (m.files as string[]) : null);
-    }
-    window.addEventListener("message", onMessage);
-    sendToFrame(route, { type: "list-files" });
-  });
-}
-
-/** Rendered on-page size per component (`file#name` → w×h) as measured by
- * one artboard's overlay — the component gallery sizes its cards to match
- * the site. Null when the frame doesn't answer (older overlay bundle, dev
- * server down) — callers fall back to harness-measured sizes. */
-export function requestFrameSizes(
-  route: string,
-  timeoutMs = 1500,
-): Promise<Record<string, { w: number; h: number }> | null> {
-  const el = frames.get(route);
-  if (!el?.contentWindow) return Promise.resolve(null);
-  return new Promise((resolve) => {
-    const finish = (sizes: Record<string, { w: number; h: number }> | null) => {
-      clearTimeout(timer);
-      window.removeEventListener("message", onMessage);
-      resolve(sizes);
-    };
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    function onMessage(e: MessageEvent) {
-      const m = e.data;
-      if (!m || m.__dedup !== true || m.type !== "component-sizes") return;
-      if (routeOfWindow(e.source) !== route) return;
-      finish(
-        m.sizes && typeof m.sizes === "object"
-          ? (m.sizes as Record<string, { w: number; h: number }>)
-          : null,
-      );
-    }
-    window.addEventListener("message", onMessage);
-    sendToFrame(route, { type: "list-sizes" });
-  });
 }
 
 /**

@@ -9,7 +9,7 @@
 // opt-in. The generation is the convenience; the seed itself is honest.
 
 import Anthropic from "@anthropic-ai/sdk";
-import type { AiBackend } from "./categorize";
+import type { AiBackend } from "./types";
 import type { AuthContext } from "./types";
 
 const SYSTEM_PROMPT = `You are helping a visual code editor ("dedup") reach a React app's protected pages so their layout can be edited. The app guards routes on the client and redirects to a login page when no session is present.

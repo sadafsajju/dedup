@@ -5,6 +5,11 @@ import { classAttrFor, toHtmlSnippet, withAttr, withText } from "./palette";
 /** A coding-agent CLI dedup can borrow for a prompt. Mirrors `ai::Agent`. */
 export type CliAgent = "claude-code" | "codex";
 
+/** How editor chat and session prompts reach the selected AI backend. */
+export type AiBackend =
+  | { kind: "cli"; agent: CliAgent; run: (prompt: string) => Promise<string> }
+  | { kind: "api"; apiKey: string };
+
 /** What dedup knows about one agent on this machine. */
 export interface AgentState {
   /** null until probed. */
@@ -14,7 +19,7 @@ export interface AgentState {
   consent: boolean;
   /** Model override for that CLI; null keeps its own default. */
   model: string | null;
-  /** Switched on in the AI menu (persisted). Both agents can be on at once —
+  /** Switched on in Settings → AI (persisted). Both agents can be on at once —
    * a message names one with `@claude`/`@codex` — so this is a per-agent
    * switch rather than a single choice. Off keeps `consent`: switching back
    * on is instant, with no second test prompt. */
@@ -76,7 +81,6 @@ export type PackageManager = "pnpm" | "yarn" | "bun" | "npm" | "unknown";
  *  package manager — dedup serves the folder itself and stamps the markup on
  *  the way out. */
 export type Framework = "vite" | "next" | "static" | "unknown";
-export type SupportLevel = "full" | "partial" | "unsupported";
 
 /** The starters dedup can write into an empty folder. */
 export type StarterKind = "react" | "html";
@@ -95,6 +99,9 @@ export interface ProjectInfo {
   name: string;
   packageManager: PackageManager;
   framework: Framework;
+  /** What the project is called ("Astro", "Django") — `framework` is only
+   *  how dedup drives it, and `unknown` there means "runs its own server". */
+  stack: string;
   hasTailwind: boolean;
   hasTypescript: boolean;
   hasGit: boolean;
@@ -107,9 +114,15 @@ export interface ProjectInfo {
   /** Which script that was (`dev` or `start`) — the launch needs the name,
    *  not just the body. */
   devScriptName: string | null;
-  support: SupportLevel;
+  /** The shell command that starts a project with no package script to run
+   *  (Django, Rails, Laravel, Hugo…). When set, it is how the project starts. */
+  runCommand: string | null;
+  /** False when dedup found no way to start it — the one case the launch
+   *  screen stops to ask, and what it asks for is a command. */
+  runnable: boolean;
   summary: string;
-  warnings: string[];
+  /** How dedup will handle this project. Information, never a gate. */
+  notes: string[];
 }
 
 export interface GitStatus {
@@ -322,6 +335,9 @@ export interface Clipboard {
   refs: string[];
   /** True when the copy was a cut — the source element is staged for removal. */
   cut: boolean;
+  /** The rest of a multi-selection's copy, in page order. A paste writes
+   *  this clip and then each of these, as one gesture. */
+  more?: Omit<Clipboard, "cut" | "more">[];
 }
 
 export type StructuralAction =
@@ -575,6 +591,9 @@ export interface SelectedElement extends ElementRef {
   instanceCount: number;
   /** Innermost-first chain of tagged ancestors, including the element. */
   ancestry: ElementRef[];
+  /** The colours the page painted it with at selection time (computed CSS
+   *  strings). Absent from an overlay built before this was reported. */
+  colors?: { background: string | null; text: string | null; border: string | null };
 }
 
 /** One chat conversation, persisted per project (localStorage). */
@@ -670,170 +689,6 @@ export function targetOf(dedupId: string): EditTarget | null {
   return parsed ? { dedupId, ...parsed } : null;
 }
 
-// --- Duplicate scan (FR-5.1, FR-5.2, FR-5.3) --------------------------------
-
-export interface ScanMember {
-  name: string;
-  file: string;
-  line: number;
-  col: number;
-  exportKind: "default" | "named" | "local";
-  props: string[];
-  nodeCount: number;
-  /** Name-based `<Name` usage count across the project (approximate). */
-  callSites: number;
-  classTokens: string[];
-  /** Indented tag/class outline of the component's JSX, for the diff view. */
-  skeleton: string;
-}
-
-export interface ScanCluster {
-  /** Stable hash of the member set — dismissals key off this. */
-  id: string;
-  confidence: number;
-  totalCallSites: number;
-  members: ScanMember[];
-}
-
-/** A component that qualifies for a rendered artboard on the canvas. */
-export interface GalleryEntry {
-  name: string;
-  file: string;
-  line: number;
-  col: number;
-  exportKind: "default" | "named" | "local";
-  props: string[];
-  nodeCount: number;
-  callSites: number;
-  clusterId: string | null;
-  /** Capped structural outline — AI categorization input + change hash. */
-  skeleton: string;
-}
-
-/** Bump alongside scan.mjs's `schema` whenever the result shape changes. */
-export const SCAN_SCHEMA = 2;
-
-export interface ScanResult {
-  ok: boolean;
-  /** Persisted-result schema version; restores require an exact match. */
-  schema?: number;
-  error?: string;
-  files: number;
-  skipped: number;
-  components: number;
-  /** File count when scoped to the current canvas page; null = whole project. */
-  scopedFiles: number | null;
-  clusters: ScanCluster[];
-  gallery: GalleryEntry[];
-  durationMs: number;
-  /** Epoch ms when the scan ran — restored results show their age. */
-  scannedAt?: number;
-}
-
-export interface ScanProgress {
-  stage: "inventory" | "similarity";
-  done: number;
-  total: number;
-}
-
-// --- Inline drift (FR-5.10) -------------------------------------------------
-//
-// The scan's unit is a named component. This one's is a repeated JSX *subtree*
-// — markup that was never a component at all. Everything here is reported by
-// `plugin-src/extract.mjs`; keep the shapes in step with it.
-
-/** One copy of a drifted subtree, in the file where it was written out. */
-export interface DriftOccurrence {
-  file: string;
-  line: number;
-  col: number;
-  /** Source range of the subtree — what a future codemod replaces. */
-  start: number;
-  end: number;
-  /** The component this copy was found inside, when it was inside one. */
-  component: string | null;
-  source: string;
-  /** Static markup for the preview harness — a picture of the occurrence, not
-   *  a translation of it: handlers and computed values are dropped rather than
-   *  approximated. Built by `previewHtml` in plugin-src/extract.mjs. */
-  html: string;
-}
-
-/** A class knob whose value differs between copies. `layout` is the load-
- * bearing bit: a varying layout knob belongs at the call site, not in the
- * extracted component (see LAYOUT_KNOBS in plugin-src/jsxfacts.mjs). */
-export interface DriftClassVariance {
-  node: number;
-  knob: string;
-  layout: boolean;
-  /** Per-occurrence value; null where that copy doesn't set the knob at all. */
-  values: (string | null)[];
-}
-
-export interface DriftAttrVariance {
-  node: number;
-  name: string;
-  values: (string | null)[];
-}
-
-export interface DriftTextVariance {
-  node: number;
-  values: string[];
-}
-
-/** A copy dedup found but cannot describe — reported rather than dropped. */
-export interface DriftRefusal {
-  file: string;
-  line: number;
-  reason: string;
-}
-
-export interface DriftCandidate {
-  id: string;
-  /** Host tag of the repeated subtree's root. */
-  tag: string;
-  shape: string;
-  elements: number;
-  weight: number;
-  fileCount: number;
-  /** Source bytes currently spent on the copies. */
-  bytes: number;
-  /** Elements extracting this would remove from the codebase. */
-  elementsRemoved: number;
-  /** Shared structure, carrying only the classes every copy agrees on. */
-  skeleton: string;
-  /** Set when one copy is already a component's whole body — the canonical
-   * component exists and the rest of the copies are ignoring it. */
-  existing: { file: string; name: string } | null;
-  occurrences: DriftOccurrence[];
-  varies: {
-    classes: DriftClassVariance[];
-    attrs: DriftAttrVariance[];
-    texts: DriftTextVariance[];
-  };
-  refused: DriftRefusal[];
-}
-
-/** Bump alongside extract.mjs's `schema` whenever the result shape changes. */
-export const DRIFT_SCHEMA = 1;
-
-export interface DriftResult {
-  ok: boolean;
-  schema?: number;
-  error?: string;
-  files: number;
-  skipped: number;
-  candidates: DriftCandidate[];
-  durationMs: number;
-  scannedAt?: number;
-}
-
-export interface DriftProgress {
-  stage: "inventory" | "grouping";
-  done: number;
-  total: number;
-}
-
 // --- Mock session (zero-login editing, FR-6.3) ------------------------------
 
 /** A user-reviewed browser-storage seed that makes a client-side auth guard
@@ -869,7 +724,7 @@ export interface AuthContext {
   files: AuthContextFile[];
 }
 
-export type SidebarTab = "pages" | "layers" | "duplicates" | "drift";
+export type SidebarTab = "pages" | "layers" | "commit";
 
 // Canvas viewport presets (FR-1.4).
 export interface Viewport {
@@ -893,161 +748,50 @@ export function artboardHeight(viewport: Viewport, measured: number | undefined)
   return Math.min(Math.max(viewport.height ?? 800, measured ?? 0), 12000);
 }
 
-// --- Guarded merge (FR-5.4 → FR-5.7) ----------------------------------------
-
-/** One member of a cluster, as the codemod reads it back off disk. */
-export interface MergeMemberPlan {
-  name: string;
-  file: string;
-  exportKind: "default" | "named" | "local";
-  /** The component's full declaration, verbatim — what the model rewrites. */
-  source: string;
-  props: string[];
-  behavior: {
-    hooks: string[];
-    handlers: string[];
-    calls: string[];
-    statements: number;
-  };
-  /** Everything else the file declares — empty means the file can be retired. */
-  otherDeclarations: string[];
-  callSites: number;
-  fileIsDedicated: boolean;
-}
-
-/** One traced use of a member. Traced, not name-matched: a `<Card>` only
- * counts when its binding resolves to this member's file (see resolve.mjs). */
-export interface MergeCallSite {
-  file: string;
-  component: string;
-  localName: string;
-  line: number;
-  col: number;
-  attrs: { name: string | null; spread: boolean; text: string; value?: string | null }[];
-  text: string;
-}
-
-export interface MergePlan {
-  ok: boolean;
-  error?: string;
-  canonicalSuggestion: { name: string; file: string };
-  members: MergeMemberPlan[];
-  callSites: MergeCallSite[];
-  /** FR-5.8: do the members differ in behaviour, not just markup? */
-  behaviorDiff: { differs: boolean; detail: string | null };
-  /** Barrels re-exporting a member — these block a merge until resolved. */
-  reExports: { file: string; name: string }[];
-  filesScanned: number;
-}
-
-/** What the model proposed, after parsing — never applied unreviewed. */
-export interface MergeProposal {
-  /** Canonical component name and the file it will live in. */
-  name: string;
-  file: string;
-  /** The complete new content of that file. */
-  source: string;
-  /** Per member: the props a call site needs to keep looking the same. */
-  mapping: { name: string; file: string; props: Record<string, string | number | boolean> }[];
-  /** One-line description of the API the model chose. */
-  summary: string;
-  /** Anything it wants the reviewer to know (behaviour it could not merge). */
-  notes: string[];
-}
-
-export interface MergeChange {
-  file: string;
-  before: string;
-  after: string;
-  kind: "canonical" | "created" | "callsite" | "retired";
-}
-
-/** The dry run: every file's before/after, written nowhere yet (FR-5.4). */
-export interface MergePreview {
-  ok: boolean;
-  error?: string;
-  dryRun?: boolean;
-  canonical: { name: string; file: string };
-  changes: MergeChange[];
-  retired: string[];
-  leftBehind: { file: string; name: string }[];
-  callSiteFiles: number;
-  warnings: string[];
-  /** Present only on a real apply. */
-  trashed?: string[];
-  written?: string[];
-}
-
-/** One safety gate's verdict (FR-5.6). "skipped" is never a pass. */
-export interface GateResult {
-  kind: "typecheck" | "build" | "visual";
-  status: "passed" | "failed" | "skipped";
-  command: string;
-  output: string;
-  durationMs: number;
-}
-
-export type MergeStage =
-  | "idle"
-  | "planning"
-  | "proposing"
-  | "review"
-  | "applying"
-  | "gating"
-  | "done"
-  | "rolledback"
-  | "failed";
-
-/** Everything about the merge currently in flight. One at a time, on purpose:
- * a merge is a whole-project rewrite behind gates, not a background task. */
-export interface MergeSession {
-  clusterId: string;
-  members: { name: string; file: string }[];
-  stage: MergeStage;
-  plan: MergePlan | null;
-  proposal: MergeProposal | null;
-  preview: MergePreview | null;
-  gates: GateResult[];
-  /** Which gate is running right now, for the progress line. */
-  runningGate: GateResult["kind"] | null;
-  error: string | null;
-  /** Short hash of the merge commit, once it lands. */
-  commit: string | null;
-  /** Why the merge was rolled back, when it was. */
-  rollbackReason: string | null;
-}
-
 /** One dedup commit on the session branch (FR-5.7). */
 export interface HistoryEntry {
   hash: string;
   subject: string;
   when: string;
   files: string[];
-  isMerge: boolean;
 }
 
-/** Pixel comparison of two canvas captures (FR-5.6 #3). */
-export interface VisualDiff {
-  ratio: number;
-  changedPixels: number;
-  totalPixels: number;
-  width: number;
-  height: number;
-  sizeChanged: boolean;
+// --- pushing and landing (src-tauri/src/publish.rs) --------------------------
+
+export interface RemoteInfo {
+  name: string;
+  /** Credentials already removed. */
+  url: string;
 }
 
-/** Files staged for deletion, awaiting the session-end confirmation. */
-export interface TrashEntry {
-  path: string;
-  at: number;
+/** One of the user's branches, measured against the current one. */
+export interface BranchSync {
+  name: string;
+  /** Commits the current branch has that this one lacks. */
+  ahead: number;
+  /** How many of those are dedup's own saves. */
+  dedupAhead: number;
+  /** Commits this branch has that the current one lacks — non-zero = diverged. */
+  behind: number;
+  checkedOutAt: string | null;
+  checkedOutHere: boolean;
+  /** Commits not on `<remote>/<name>`; null when the remote has no such branch. */
+  unpushed: number | null;
 }
 
-/** Default visual-regression tolerance (FR-5.6 #3 says "configurable, 1%"). */
-export const VISUAL_TOLERANCE = 0.01;
-
-/** The shape mergeFlow needs from a parsed build error — declared here so the
- * gate runner doesn't import the whole error parser just for a type. */
-export interface ParsedErrorLike {
-  source: string;
-  content: string;
+/** Where the branches stand, from refs alone (no fetch). */
+export interface SyncStatus {
+  isRepo: boolean;
+  /** null on a detached HEAD. */
+  branch: string | null;
+  detached: boolean;
+  onSession: boolean;
+  remotes: RemoteInfo[];
+  /** The remote a push defaults to. */
+  remote: string | null;
+  /** Short hashes the remote branch lacks; null = never pushed (or no remote). */
+  unpushed: string[] | null;
+  /** Commits the remote branch has that this one lacks, as of the last fetch. */
+  remoteAhead: number;
+  targets: BranchSync[];
 }

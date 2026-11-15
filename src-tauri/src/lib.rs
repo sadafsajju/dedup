@@ -2,26 +2,27 @@
 //! process management, git-state probe, and the recent-projects list.
 
 mod ai;
+mod appmenu;
 mod asset;
 mod devserver;
 mod export;
 mod git;
 mod instrument;
-mod merge;
+mod history;
 mod parking;
 mod project;
 mod proxy;
+mod publish;
 mod recents;
 mod scaffold;
-mod extract;
-mod scan;
 mod session;
 mod sidecar;
+mod terminal;
 mod thumbs;
 mod toolpath;
-mod visual;
 
 use devserver::{DevServerState, ExecSpec};
+use terminal::TerminalState;
 use project::{Framework, PackageManager, ProjectInfo};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -68,6 +69,8 @@ fn start_dev_server(
     dev_script: Option<String>,
     dev_script_name: Option<String>,
     static_dir: Option<String>,
+    run_command: Option<String>,
+    stack: Option<String>,
     custom_command: Option<String>,
 ) -> Result<(), String> {
     // The script detection actually found, not an assumed `dev` — a project
@@ -83,11 +86,13 @@ fn start_dev_server(
     } else if framework == Framework::Vite {
         match instrument::setup(&root, dev_script.as_deref()) {
             Ok(Some(instr)) => (
-                ExecSpec::Direct {
-                    program: instr.program,
-                    args: instr.args,
-                }
-                .into(),
+                devserver::Launch {
+                    exec: ExecSpec::Direct {
+                        program: instr.program,
+                        args: instr.args,
+                    },
+                    env: instr.env,
+                },
                 InstrumentationEvent { active: true, mode: "tagged", detail: None },
             ),
             Ok(None) => (
@@ -201,12 +206,32 @@ fn start_dev_server(
             },
         )
     } else {
+        // Everything dedup has no tagger for: run the project's own server
+        // exactly as its author does, and let the editor say that inspection
+        // is off. A backend's command first — when detection found one it
+        // cleared the package script, so there is one answer, not two.
+        let exec = match (run_command, dev_script_name.is_some()) {
+            (Some(cmd), _) => ExecSpec::Shell(cmd),
+            (None, true) => ExecSpec::Script(package_manager, script.clone(), Vec::new()),
+            (None, false) => {
+                return Err(
+                    "dedup couldn't tell how to start this project. Set the command you use \
+                     in project details (the gear on its card on the launch screen)."
+                        .into(),
+                )
+            }
+        };
         (
-            ExecSpec::Script(package_manager, script.clone(), Vec::new()).into(),
+            devserver::Launch {
+                exec,
+                // Create React App and its relatives open a browser tab on
+                // start; the canvas is the browser here.
+                env: vec![("BROWSER".into(), "none".into())],
+            },
             InstrumentationEvent {
                 active: false,
                 mode: "framework",
-                detail: Some("this framework".to_string()),
+                detail: Some(stack.unwrap_or_else(|| "This project".to_string())),
             },
         )
     };
@@ -225,6 +250,48 @@ fn stop_dev_server(app: AppHandle, state: State<'_, DevServerState>) -> Result<(
 #[tauri::command]
 fn dev_server_running(state: State<'_, DevServerState>) -> bool {
     devserver::is_running(&state)
+}
+
+/// A shell in the console drawer, started in the project root. Output
+/// streams back on `output` as raw bytes; the end arrives as `terminal://exit`.
+/// Async so a write that blocks on a full PTY never stalls the main thread.
+#[tauri::command]
+async fn terminal_open(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    cwd: String,
+    cols: u16,
+    rows: u16,
+    output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> Result<terminal::Opened, String> {
+    terminal::open(&app, &state, &cwd, cols, rows, output)
+}
+
+#[tauri::command]
+async fn terminal_write(state: State<'_, TerminalState>, id: u32, data: String) -> Result<(), String> {
+    terminal::write(&state, id, data.as_bytes())
+}
+
+#[tauri::command]
+async fn terminal_resize(
+    state: State<'_, TerminalState>,
+    id: u32,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    terminal::resize(&state, id, cols, rows)
+}
+
+#[tauri::command]
+async fn terminal_close(state: State<'_, TerminalState>, id: u32) -> Result<(), String> {
+    terminal::close(&state, id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn terminal_close_all(state: State<'_, TerminalState>) -> Result<(), String> {
+    terminal::close_all(&state);
+    Ok(())
 }
 
 /// Report the element at ordinal `index` in `file`: className editability,
@@ -343,49 +410,6 @@ async fn grep_project(root: String, pattern: String) -> Result<serde_json::Value
         .map_err(|e| format!("grep task failed: {e}"))?
 }
 
-/// Duplicate scan (FR-5.1/5.2): inventory + structural clustering. `files`
-/// (relative paths) scopes clustering to the current canvas page; None scans
-/// the whole project. Progress arrives as `scan://progress` events; the
-/// return value is the full result. Async so the (potentially long) sidecar
-/// run never blocks the main thread.
-#[tauri::command]
-async fn scan_project(
-    app: AppHandle,
-    root: String,
-    files: Option<Vec<String>>,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || scan::run(&app, &root, files))
-        .await
-        .map_err(|e| format!("scan task failed: {e}"))?
-}
-
-/// Last persisted scan for the project (None when never scanned).
-#[tauri::command]
-fn load_scan_result(root: String) -> Option<serde_json::Value> {
-    scan::load_saved(&root)
-}
-
-/// Inline-drift scan (FR-5.10): repeated JSX subtrees — markup that was never
-/// a component at all. Same shape as `scan_project`: `files` scopes it to the
-/// current canvas page, progress arrives as `drift://progress`, and the return
-/// value is the full result.
-#[tauri::command]
-async fn extract_project(
-    app: AppHandle,
-    root: String,
-    files: Option<Vec<String>>,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || extract::run(&app, &root, files))
-        .await
-        .map_err(|e| format!("drift task failed: {e}"))?
-}
-
-/// Last persisted drift run for the project (None when never run).
-#[tauri::command]
-fn load_extract_result(root: String) -> Option<serde_json::Value> {
-    extract::load_saved(&root)
-}
-
 /// Which coding-agent CLIs are installed. Preferred AI backends — they use a
 /// subscription the user already has; an API key is the fallback.
 #[tauri::command]
@@ -466,17 +490,6 @@ async fn agent_models(agent: String) -> Result<Vec<ai::ModelChoice>, String> {
     tauri::async_runtime::spawn_blocking(move || ai::models(agent))
         .await
         .map_err(|e| format!("agent task failed: {e}"))?
-}
-
-/// Cached AI category assignments for the project's components.
-#[tauri::command]
-fn load_categories(root: String) -> Option<serde_json::Value> {
-    scan::load_categories(&root)
-}
-
-#[tauri::command]
-fn save_categories(root: String, categories: serde_json::Value) -> Result<(), String> {
-    scan::save_categories(&root, &categories)
 }
 
 /// Mock-session seed for zero-login editing (None when never set up).
@@ -577,153 +590,54 @@ fn next_status(root: String) -> instrument::NextStatus {
     instrument::next_status(&root)
 }
 
-// --- Guarded merge (FR-5.4 -> FR-5.7) ----------------------------------------
-
-/// Read-only merge plan: member sources, prop signatures, behaviour signals,
-/// and every call site traced through a real import.
-#[tauri::command]
-async fn merge_plan(
-    root: String,
-    members: Vec<merge::MergeMember>,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || merge::plan(&root, members))
-        .await
-        .map_err(|e| format!("merge plan task failed: {e}"))?
-}
-
-/// Compute the merge. `dryRun` returns every file's before/after and writes
-/// nothing -- that is the diff the user approves before anything lands.
-#[tauri::command]
-async fn merge_apply(
-    root: String,
-    canonical: merge::Canonical,
-    mapping: Vec<merge::MergeMapping>,
-    dry_run: bool,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || merge::apply(&root, canonical, mapping, dry_run))
-        .await
-        .map_err(|e| format!("merge task failed: {e}"))?
-}
-
-/// Staged-deletion lifecycle: "list" | "restore" | "empty" (FR-5.5).
-#[tauri::command]
-async fn merge_trash(
-    root: String,
-    action: String,
-    files: Option<Vec<String>>,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || merge::trash(&root, &action, files))
-        .await
-        .map_err(|e| format!("trash task failed: {e}"))?
-}
-
-/// One safety gate: "typecheck" or "build" (FR-5.6). A project with neither
-/// reports `skipped` -- never a silent pass.
-#[tauri::command]
-async fn run_check(root: String, kind: String) -> Result<merge::CheckResult, String> {
-    tauri::async_runtime::spawn_blocking(move || merge::run_check(&root, &kind))
-        .await
-        .map_err(|e| format!("check task failed: {e}"))?
-}
-
 /// dedup's own commits on this session branch, newest first (FR-5.7).
 #[tauri::command]
-fn session_history(root: String, limit: Option<u32>) -> Result<Vec<merge::HistoryEntry>, String> {
-    merge::history(&root, limit.unwrap_or(50))
+fn session_history(root: String, limit: Option<u32>) -> Result<Vec<history::HistoryEntry>, String> {
+    history::history(&root, limit.unwrap_or(50))
 }
 
 /// Undo one dedup commit, restoring only the paths it touched.
 #[tauri::command]
 async fn revert_commit(root: String, hash: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || merge::revert(&root, &hash))
+    tauri::async_runtime::spawn_blocking(move || history::revert(&root, &hash))
         .await
         .map_err(|e| format!("revert task failed: {e}"))?
 }
 
-// --- Visual pass (FR-5.2 visual signal, FR-5.6 #3) ---------------------------
-
-/// Snapshots held between a "before" and an "after" capture. Bytes stay in
-/// Rust: a full-resolution PNG per artboard is not something to shuttle
-/// through the IPC boundary as base64 twice.
-#[derive(Default)]
-struct Snapshots(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
-
-/// Capture a canvas region under `label` for a later comparison.
+/// Where the branches stand for the Commit tab — refs only, no fetch.
 #[tauri::command]
-async fn visual_capture(
-    app: AppHandle,
-    snapshots: State<'_, Snapshots>,
-    label: String,
-    rect: Option<thumbs::Rect>,
-) -> Result<(), String> {
-    let png = tauri::async_runtime::spawn_blocking({
-        let app = app.clone();
-        move || thumbs::snapshot_png(&app, rect)
-    })
-    .await
-    .map_err(|e| format!("capture task failed: {e}"))??;
-    snapshots
-        .0
-        .lock()
-        .map_err(|_| "snapshot store poisoned")?
-        .insert(label, png);
-    Ok(())
-}
-
-/// Pixel-diff two captures (FR-5.6 #3). A size change counts as a regression,
-/// not as something to resize away.
-#[tauri::command]
-fn visual_compare(
-    snapshots: State<'_, Snapshots>,
-    before: String,
-    after: String,
-) -> Result<visual::DiffResult, String> {
-    let store = snapshots.0.lock().map_err(|_| "snapshot store poisoned")?;
-    let a = store
-        .get(&before)
-        .ok_or("no before-capture for that artboard")?;
-    let b = store
-        .get(&after)
-        .ok_or("no after-capture for that artboard")?;
-    Ok(visual::compare(&visual::decode_png(a)?, &visual::decode_png(b)?))
-}
-
-/// Perceptual hash of a canvas region -- the visual similarity signal.
-#[tauri::command]
-async fn visual_hash(app: AppHandle, rect: Option<thumbs::Rect>) -> Result<String, String> {
-    let png = tauri::async_runtime::spawn_blocking(move || thumbs::snapshot_png(&app, rect))
+async fn git_sync_status(root: String) -> Result<publish::SyncStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || publish::sync_status(&root))
         .await
-        .map_err(|e| format!("hash task failed: {e}"))??;
-    // As hex: a u64 does not survive JSON's number precision intact.
-    Ok(format!("{:016x}", visual::phash(&visual::decode_png(&png)?)))
+        .map_err(|e| format!("status task failed: {e}"))
 }
 
-/// Visual similarity of two perceptual hashes, 0..1. Lives here rather than
-/// in the frontend so there is one definition of "how alike do these look" —
-/// the hash and its comparison are two halves of the same decision.
+/// Push one named branch to one named remote. Only ever from the user's own
+/// click on a button that names both; never forced (see `publish.rs`).
 #[tauri::command]
-fn visual_similarity(a: String, b: String) -> Result<f64, String> {
-    let parse = |h: &str| u64::from_str_radix(h, 16).map_err(|_| format!("bad hash: {h}"));
-    Ok(visual::hash_similarity(parse(&a)?, parse(&b)?))
+async fn git_push(root: String, remote: String, branch: String) -> Result<publish::PushResult, String> {
+    tauri::async_runtime::spawn_blocking(move || publish::push(&root, &remote, &branch))
+        .await
+        .map_err(|e| format!("push task failed: {e}"))?
 }
 
+/// Fast-forward one of the user's branches to a session branch, or refuse.
 #[tauri::command]
-fn visual_forget(snapshots: State<'_, Snapshots>, prefix: Option<String>) -> Result<(), String> {
-    let mut store = snapshots.0.lock().map_err(|_| "snapshot store poisoned")?;
-    match prefix {
-        Some(p) => store.retain(|k, _| !k.starts_with(&p)),
-        None => store.clear(),
-    }
-    Ok(())
+async fn git_land(root: String, session: String, target: String) -> Result<publish::LandResult, String> {
+    tauri::async_runtime::spawn_blocking(move || publish::land(&root, &session, &target))
+        .await
+        .map_err(|e| format!("land task failed: {e}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .menu(appmenu::build)
+        .on_menu_event(appmenu::on_event)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(DevServerState::default())
-        .manage(Snapshots::default())
+        .manage(TerminalState::default())
         .invoke_handler(tauri::generate_handler![
             detect_project,
             scaffold_project,
@@ -731,6 +645,11 @@ pub fn run() {
             start_dev_server,
             stop_dev_server,
             dev_server_running,
+            terminal_open,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
+            terminal_close_all,
             inspect_element,
             copy_element,
             import_agent_asset,
@@ -741,12 +660,6 @@ pub fn run() {
             revert_sources,
             list_project_files,
             grep_project,
-            scan_project,
-            load_scan_result,
-            extract_project,
-            load_extract_result,
-            load_categories,
-            save_categories,
             load_session_seed,
             save_session_seed,
             collect_auth_context,
@@ -766,17 +679,11 @@ pub fn run() {
             capture_project_thumbnail,
             detect_routes,
             next_status,
-            merge_plan,
-            merge_apply,
-            merge_trash,
-            run_check,
             session_history,
             revert_commit,
-            visual_capture,
-            visual_compare,
-            visual_hash,
-            visual_forget,
-            visual_similarity,
+            git_sync_status,
+            git_push,
+            git_land,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -786,6 +693,9 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<DevServerState>() {
                     devserver::shutdown(&state);
+                }
+                if let Some(state) = app.try_state::<TerminalState>() {
+                    terminal::close_all(&state);
                 }
             }
         });

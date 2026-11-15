@@ -1,3 +1,4 @@
+import { commitMessage, previewClash, previewClashMessage } from "./commitTab";
 import { create } from "zustand";
 import {
   captureCanvasThumbnail,
@@ -13,52 +14,26 @@ import {
   commitSession,
   gitInitBaseline,
   gitStatus,
+  gitSyncStatus,
+  gitPush,
+  gitLand,
   copyElement,
   importAgentAsset,
   inspectElement,
-  loadCategories,
-  loadScanResult,
   readSource,
   writeSources,
   revertSources,
   listProjectFiles,
   grepProject,
-  saveCategories,
-  scanProject,
-  extractProject,
-  loadExtractResult,
   applyEdits,
   writeSource,
   loadSessionSeed as apiLoadSessionSeed,
   saveSessionSeed as apiSaveSessionSeed,
   collectAuthContext,
   detectRoutesFromSource,
-  mergePlan as apiMergePlan,
-  mergeApply,
-  mergeTrash,
   sessionHistory,
   revertCommit,
-  visualForget,
 } from "./api";
-import {
-  captureArtboards,
-  gateSummary,
-  gatesPassed,
-  hmrGate,
-  runBuildGates,
-  runVisualGate,
-} from "./mergeFlow";
-import { parseMergeReply, runMergePrompt } from "./mergeProposal";
-import {
-  parseExtractReply,
-  runExtractPrompt,
-  type ExtractionProposal,
-} from "./driftProposal";
-import {
-  combinedConfidence,
-  runVisualPass,
-  type VisualScore,
-} from "./visualPass";
 import { generateSeed } from "./session";
 import { artboardUrl, resolveOrigin } from "./origins";
 import { clampZoom } from "./panZoom";
@@ -100,6 +75,7 @@ import {
 } from "./chatEdits";
 import { mentionAlias, routeMention } from "./mentions";
 import { redoStep, undoStep } from "./undo";
+import { countLabel, outermostOnly } from "./multiSelect";
 import {
   persistable,
   reconcileParked,
@@ -109,16 +85,7 @@ import {
   type Point,
 } from "./parking";
 import {
-  categorizeComponents,
-  needingCategorization,
-  skeletonHash,
-  type AiBackend,
-  type CategoryCache,
-} from "./categorize";
-import {
   requestElementHtml,
-  requestFrameFiles,
-  requestFrameSizes,
   sendToFrame,
   sendToOverlay,
 } from "./bridge";
@@ -129,8 +96,6 @@ import {
   stagingConflict,
   withoutAction,
   PENDING_PREFIX,
-  SCAN_SCHEMA,
-  DRIFT_SCHEMA,
   targetOf,
   VIEWPORTS,
 } from "./types";
@@ -159,11 +124,8 @@ import type {
   Clipboard,
   ChatSession,
   CliAgent,
-  GateResult,
   HistoryEntry,
-  MergeSession,
   PendingEdit,
-  TrashEntry,
   DevServerStatus,
   GitStatus,
   InstrumentationInfo,
@@ -171,16 +133,12 @@ import type {
   LogEvent,
   PageMeta,
   ProjectInfo,
-  ScanCluster,
-  ScanProgress,
   AuthProvider,
-  ScanResult,
   SelectedElement,
   SessionSeed,
   SnippetLang,
   SidebarTab,
-  DriftProgress,
-  DriftResult,
+  SyncStatus,
   Tool,
   DropPosition,
   EditAction,
@@ -191,6 +149,35 @@ import type {
 } from "./types";
 
 const MAX_LOG_LINES = 2000;
+
+/** A shell tab in the console drawer. `key` is the tab's own identity; the
+ * PTY behind it belongs to the pane that renders it (ConsoleDrawer), so a
+ * tab that is closed — or a project that is left — takes its shell with it. */
+export interface TerminalTab {
+  key: number;
+  title: string;
+  /** Set once the shell has ended on its own; the tab stays so its last
+   * output can still be read. */
+  exited?: number | null;
+}
+
+/** What the drawer shows: the dev-server stream, or a terminal by key. */
+export type ConsoleTab = "output" | number;
+
+const CONSOLE_HEIGHT_STORAGE = "dedup:console-height";
+export const CONSOLE_MIN_HEIGHT = 120;
+const CONSOLE_DEFAULT_HEIGHT = 208;
+
+function loadConsoleHeight(): number {
+  try {
+    const n = Number(localStorage.getItem(CONSOLE_HEIGHT_STORAGE));
+    return n >= CONSOLE_MIN_HEIGHT ? n : CONSOLE_DEFAULT_HEIGHT;
+  } catch {
+    return CONSOLE_DEFAULT_HEIGHT;
+  }
+}
+
+let nextTerminalKey = 0;
 
 type View = "launch" | "editor";
 
@@ -218,6 +205,11 @@ interface AppState {
 
   logs: LogEvent[];
   consoleOpen: boolean;
+  consoleTab: ConsoleTab;
+  /** Height of the drawer's body in px — dragged by its top edge, and
+   * remembered across projects (it is about the screen, not the project). */
+  consoleHeight: number;
+  terminals: TerminalTab[];
   /** Build errors parsed out of the dev-server stream (see lib/errors) —
    * the truthful "is the app broken right now" state, cleared by the next
    * successful compile. */
@@ -270,7 +262,7 @@ interface AppState {
   layers: Record<string, LayerNode[]>;
   /** Page title/route from the overlay — the root frame's label (FR-6.1). */
   pageMeta: PageMeta | null;
-  /** Page artboard the user selected (click its label) — the scan's scope. */
+  /** Page artboard the user selected by clicking its label. */
   selectedRoute: string | null;
 
   // Mock session (zero-login editing). The seed that lets protected routes
@@ -283,8 +275,6 @@ interface AppState {
   /** The app's auth SDK, when it uses one — tells the user up front whether a
    * seed can reach its session at all. null until probed. */
   authProvider: AuthProvider | null;
-  /** Top-level editor view: the live canvas or the component gallery. */
-  editorTab: "canvas" | "components" | "drift";
 
   /**
    * The source file open in the split code panel, or null.
@@ -310,6 +300,12 @@ interface AppState {
 
   /** Element currently selected on the canvas (FR-2.2). */
   selected: SelectedElement | null;
+  /** Several elements selected at once (a marquee, shift-click). Either two
+   *  or more with `selected` null, or empty — never both. So everything that
+   *  edits *the* selection (classes, text, resize, the paste anchor, chat
+   *  context) is inert under a multi-selection by construction, and only
+   *  what is safe for all of them — delete, copy, cut — reads this. */
+  multi: SelectedElement[];
   /** What the write-back says about the selection: classes, text, and which
    * structural edits it would accept (FR-4.2). */
   sourceInfo: NodeInfo | null;
@@ -374,57 +370,6 @@ interface AppState {
    *  computed against file contents the first one would have changed, so
    *  holding two would mean holding one that is quietly wrong. */
   pendingEdit: PendingEdit | null;
-
-  // Duplicate scan (FR-5.x).
-  scanning: boolean;
-  scanProgress: ScanProgress | null;
-  scanResult: ScanResult | null;
-  scanError: string | null;
-  /** file#name → rendered size on the scanned artboard, measured from the
-   * live DOM — the Components tab sizes each card to match the site.
-   * Persisted per project so restored scans keep their card sizes. */
-  liveSizes: Record<string, { w: number; h: number }>;
-  /** Cluster ids the user marked "not duplicates" — persisted per project. */
-  dismissed: Record<string, true>;
-  /** Cluster open in the review view. */
-  openClusterId: string | null;
-
-  // Inline drift (FR-5.10) — repeated markup that was never a component.
-  driftRunning: boolean;
-  driftProgress: DriftProgress | null;
-  driftResult: DriftResult | null;
-  driftError: string | null;
-  /** Candidate expanded in the drift list, and shown in the drift view. */
-  openDriftId: string | null;
-  /** The drift view's own viewport. Separate from the canvas's: switching
-   *  tabs is a change of scene, not of viewport. */
-  driftZoom: number;
-  driftPan: { x: number; y: number };
-  /** The model's proposed component for the current selection, once asked. */
-  driftProposal: ExtractionProposal | null;
-  driftProposing: boolean;
-  driftProposalError: string | null;
-  /** Occurrences of the open candidate the user wants in the extraction,
-   *  keyed `file:start`. Opening a candidate selects all of them — the common
-   *  case is "these are all the same thing", and deselecting the odd one out
-   *  is less work than picking fifteen. */
-  driftSelection: Record<string, true>;
-  /** Visual similarity per cluster (FR-5.2's third signal). Absent = the pass
-   * hasn't run; a `score` of null inside one = it ran and the members could
-   * not be rendered in isolation, which is reported, not averaged away. */
-  visualScores: Record<string, VisualScore>;
-  /** file#name → perceptual hash, reused across passes within a scan. */
-  visualHashes: Record<string, string>;
-  visualPass: { done: number; total: number } | null;
-
-  // AI categorization (organization only — detection stays deterministic).
-  /** file#name → category label, for the components of the current scan. */
-  categories: Record<string, string>;
-  /** file#name → JSON mock props for the preview harness. */
-  mockProps: Record<string, string>;
-  categorizing: boolean;
-  categorizeProgress: { done: number; total: number } | null;
-  categorizeError: string | null;
   /** Anthropic API key (user-supplied, stored locally) — fallback backend. */
   anthropicKey: string;
   /** Per coding-agent CLI: installed, connected, model, last error. One
@@ -434,16 +379,11 @@ interface AppState {
   /** The API-key backend's switch (persisted). The agents' switches live in
    *  `agents[…].enabled`; this is the same thing for the key. */
   apiEnabled: boolean;
-
-  // Guarded merge (FR-5.4 → FR-5.7). One at a time: a merge rewrites the
-  // project behind gates, so a second one running underneath the first would
-  // make both reviews meaningless.
-  merge: MergeSession | null;
   /** dedup's commits on this session branch — the revert panel (FR-5.7). */
   history: HistoryEntry[];
-  historyOpen: boolean;
-  /** Files staged for deletion, awaiting the end-of-session confirmation. */
-  trash: TrashEntry[];
+  /** Where the branches and remotes stand — what the Commit tab's push and
+   *  landing buttons are judged against. Null until read (and with no git). */
+  sync: SyncStatus | null;
 
   // actions
   enterEditor: (
@@ -464,6 +404,12 @@ interface AppState {
   /** Hand the current build errors to the inspector chat as an instruction. */
   askAiToFix: () => void;
   toggleConsole: (open?: boolean) => void;
+  setConsoleTab: (tab: ConsoleTab) => void;
+  setConsoleHeight: (px: number) => void;
+  /** Open a new shell tab in the project root and show it. */
+  newTerminal: () => void;
+  closeTerminalTab: (key: number) => void;
+  updateTerminal: (key: number, patch: Partial<Omit<TerminalTab, "key">>) => void;
   setViewport: (id: Viewport["id"]) => void;
   setTool: (tool: Tool) => void;
   setZoom: (zoom: number) => void;
@@ -514,7 +460,6 @@ interface AppState {
   saveSessionSeed: (enabled: boolean, script: string) => Promise<void>;
   /** Draft a seed from the project's auth source via the active AI backend. */
   generateSessionSeed: () => Promise<void>;
-  setEditorTab: (tab: "canvas" | "components" | "drift") => void;
   /** Open a source file in the split code panel, revealing `line`. */
   openCode: (file: string, line?: number) => Promise<void>;
   closeCode: () => void;
@@ -522,6 +467,9 @@ interface AppState {
   /** Write the buffer through the parse gate and commit it. */
   saveCode: () => Promise<void>;
   setSelected: (sel: SelectedElement | null) => void;
+  /** What the overlay reports after a marquee or a shift-click: none, one
+   *  (an ordinary selection) or several. */
+  setMultiSelected: (list: SelectedElement[]) => void;
   /** Clear selection here and in the overlay. */
   clearSelection: () => void;
   /** Ask the overlay to select an element by dedupId (breadcrumb clicks). */
@@ -600,7 +548,9 @@ interface AppState {
   undo: () => void;
   redo: () => void;
   /** Write staged edits to source, commit on the session branch (FR-4.x). */
-  saveAll: () => Promise<void>;
+  /** Write the staged program and commit it. `message` is the user's own
+   *  commit message from the Commit tab; without one the save describes itself. */
+  saveAll: (message?: string) => Promise<void>;
 
   setSidebarTab: (tab: SidebarTab) => void;
   /** Persisted widths of the two side panels, clamped to PANEL_BOUNDS. */
@@ -618,36 +568,6 @@ interface AppState {
   newChatSession: () => void;
   selectChatSession: (id: string | null) => void;
   deleteChatSession: (id: string) => void;
-  /** Run the duplicate scan and land on the Duplicates tab (FR-5.1/5.2). */
-  runScan: () => Promise<void>;
-  /** Load the last persisted scan for the open project, if any. */
-  restoreScan: () => Promise<void>;
-  setScanProgress: (p: ScanProgress) => void;
-  openCluster: (id: string | null) => void;
-  /** "Not duplicates" — hide the cluster and remember that (FR-5.3). */
-  dismissCluster: (id: string) => void;
-  /** Drop one member out of a cluster (FR-5.3); dissolves at < 2 members. */
-  removeMember: (clusterId: string, memberIndex: number) => void;
-  /** Find repeated JSX subtrees and land on the Drift tab (FR-5.10). */
-  runDrift: () => Promise<void>;
-  /** Load the last persisted drift run for the open project, if any. */
-  restoreDrift: () => Promise<void>;
-  setDriftProgress: (p: DriftProgress) => void;
-  /** Open a candidate: expands its row, selects every copy, and shows them
-   *  rendered together in the main view. */
-  openDrift: (id: string | null) => void;
-  toggleDriftOccurrence: (key: string) => void;
-  /** Put every copy back in the selection. */
-  selectAllDrift: () => void;
-  setDriftTransform: (t: { zoom: number; pan: { x: number; y: number } }) => void;
-  /** Ask the model for the component that replaces the selected copies. This
-   *  never writes: the extraction codemod does not exist, so a proposal is
-   *  shown and nothing lands. */
-  proposeExtraction: () => Promise<void>;
-  /** Render every cluster member in isolation and compare the pixels — the
-   * scan's visual signal (FR-5.2). Runs on demand, from the Components tab. */
-  runVisualPass: () => Promise<void>;
-  cancelVisualPass: () => void;
 
   setAnthropicKey: (key: string) => void;
   /** Detect a coding-agent CLI once per app run. */
@@ -664,6 +584,12 @@ interface AppState {
   exportArtboard: (route: string, format: "png" | "pdf", scale?: number) => Promise<void>;
   /** The route an export is running for, if any — one at a time. */
   exporting: string | null;
+  /** The Settings page (menu bar → Settings…, ⌘,). App-wide rather than per
+   *  project: it opens over the launch screen as readily as over the editor. */
+  settingsOpen: boolean;
+  settingsSection: SettingsSection;
+  openSettings: (section?: SettingsSection) => void;
+  closeSettings: () => void;
   /** Where the user has put each artboard, per viewport id (persisted with
    *  the canvas). Missing entries fall back to the row — `artboardLayout`. */
   artboardPos: Record<string, Record<string, Point>>;
@@ -708,32 +634,17 @@ interface AppState {
   /** Consent moment: a live round-trip that proves the CLI is installed and
    * signed in. dedup never spends someone's subscription before it passes. */
   connectAgent: (agent: CliAgent) => Promise<void>;
-  /** The backend categorize() will actually use right now, if any. */
+  /** The selected AI backend, if any. */
   activeAiBackend: () => CliAgent | "api" | null;
-  /** Categorize the current gallery with Claude; cached per project. */
-  categorize: () => Promise<void>;
-
-  /** Plan the merge and ask the model for a canonical component (FR-5.4). */
-  startMerge: (clusterId: string) => Promise<void>;
-  /** Re-run the proposal, e.g. after the user edited the canonical source. */
-  reproposeMerge: () => Promise<void>;
-  /** Replace the proposed source by hand and re-compute the preview. */
-  editProposal: (source: string) => Promise<void>;
-  /** Write the merge, commit it, run the gates, roll back on any failure. */
-  confirmMerge: () => Promise<void>;
-  cancelMerge: () => void;
-  /** Undo the merge that just landed, restoring its staged files. */
-  rollbackMerge: (reason: string) => Promise<void>;
 
   loadHistory: () => Promise<void>;
-  toggleHistory: (open?: boolean) => void;
+  loadSync: () => Promise<void>;
+  /** Push one named branch to one named remote. Throws the refusal. */
+  pushBranch: (remote: string, branch: string) => Promise<void>;
+  /** Fast-forward `target` to this session's branch. Throws the refusal;
+   *  resolves to how many commits it brought. */
+  landOn: (target: string) => Promise<number>;
   revertEntry: (hash: string) => Promise<void>;
-
-  loadTrash: () => Promise<void>;
-  restoreTrash: (files?: string[]) => Promise<void>;
-  emptyTrash: () => Promise<void>;
-  /** Apply cached categories (no API call) for the current scan result. */
-  applyCachedCategories: () => Promise<void>;
 }
 
 /**
@@ -1009,94 +920,6 @@ function loadPanelWidths(): Record<Panel, number> {
   return fallback;
 }
 
-/** Cache entries that still match their component's current skeleton. */
-function validAssignments(
-  cache: CategoryCache,
-  gallery: { file: string; name: string; skeleton: string }[],
-): { categories: Record<string, string>; mockProps: Record<string, string> } {
-  const categories: Record<string, string> = {};
-  const mockProps: Record<string, string> = {};
-  for (const e of gallery) {
-    const key = `${e.file}#${e.name}`;
-    const hit = cache[key];
-    if (hit && hit.hash === skeletonHash(e.skeleton)) {
-      categories[key] = hit.category;
-      if (hit.mockProps) mockProps[key] = hit.mockProps;
-    }
-  }
-  return { categories, mockProps };
-}
-
-/** Clusters not dismissed, ranked by confidence × instance count (FR-5.3).
- * Pure so components can memo it instead of re-deriving on every store tick. */
-/**
- * Clusters the user hasn't dismissed, ranked by confidence × reach (FR-5.3).
- *
- * `visualScores` folds the visual signal into the confidence when the pass has
- * run — which can push a structurally-similar-but-visually-different cluster
- * down the list, where it belongs. Without the pass the ordering is exactly
- * the scan's, so this is a refinement, never a different answer.
- */
-export function rankClusters(
-  result: ScanResult | null,
-  dismissed: Record<string, true>,
-  visualScores: Record<string, VisualScore> = {},
-): ScanCluster[] {
-  if (!result) return [];
-  const weight = (c: ScanCluster) =>
-    combinedConfidence(c.confidence, visualScores[c.id]) *
-    Math.max(c.totalCallSites, c.members.length);
-  return result.clusters
-    .filter((c) => !dismissed[c.id])
-    .sort((a, b) => weight(b) - weight(a));
-}
-
-const liveSizesKey = (root: string) => `dedup:live-sizes:${root}`;
-
-function loadLiveSizes(root: string): Record<string, { w: number; h: number }> {
-  try {
-    const raw = localStorage.getItem(liveSizesKey(root));
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveLiveSizes(
-  root: string,
-  sizes: Record<string, { w: number; h: number }>,
-) {
-  try {
-    localStorage.setItem(liveSizesKey(root), JSON.stringify(sizes));
-  } catch {
-    // Persistence is best-effort; the session still works without it.
-  }
-}
-
-const dismissedKey = (root: string) => `dedup:dismissed:${root}`;
-
-function loadDismissed(root: string): Record<string, true> {
-  try {
-    const raw = localStorage.getItem(dismissedKey(root));
-    if (!raw) return {};
-    return Object.fromEntries(
-      (JSON.parse(raw) as string[]).map((id) => [id, true as const]),
-    );
-  } catch {
-    return {};
-  }
-}
-
-function saveDismissed(root: string, dismissed: Record<string, true>) {
-  try {
-    localStorage.setItem(dismissedKey(root), JSON.stringify(Object.keys(dismissed)));
-  } catch {
-    // Persistence is best-effort; the session still works without it.
-  }
-}
-
 /**
  * The canvas waiting for a dev server that can mount it, from entering a
  * project until its first ready URL. Module scope, deliberately not store
@@ -1121,6 +944,10 @@ function rememberCanvas(s: AppState) {
     positions: s.artboardPos,
   });
 }
+
+/** The sections of the Settings page. One for now; a union so the next is a
+ *  row in the page's nav rather than a second page. */
+export type SettingsSection = "ai";
 
 /** Where each open artboard sits on the canvas surface, for the current
  *  viewport — the one layout every consumer reads (canvas, markup, focus). */
@@ -1492,10 +1319,101 @@ function stageRemoval(
   if (!target) return false;
   if (!get().stage({ kind: "remove", target, label, gesture })) return false;
   if (get().selected?.dedupId === dedupId) {
-    set({ selected: null, sourceInfo: null });
+    set({ selected: null, multi: [], sourceInfo: null });
     sendToOverlay({ type: "clear" });
   }
   return true;
+}
+
+/**
+ * Why a set of elements cannot all be deleted, or null when they can.
+ *
+ * A multi-selection offers only what is safe for every element in it, so one
+ * refusal refuses the gesture — deleting four of five and mentioning the
+ * fifth in a notice is a result nobody asked for. The verdict is the
+ * write-back's, asked per element exactly as a single selection asks it.
+ */
+async function removalRefusal(
+  get: () => AppState,
+  list: SelectedElement[],
+): Promise<string | null> {
+  const root = get().project?.root;
+  const verdicts = await Promise.all(
+    list.map(async (el): Promise<string | null> => {
+      // A staged insert can always be withdrawn.
+      if (isPendingId(el.dedupId)) return null;
+      const target = targetOf(el.dedupId);
+      if (!target || !root) return "it isn't in a file dedup can edit";
+      try {
+        const r = await inspectElement(root, target.file, target.index);
+        if (!r.ok) return r.error ?? "source lookup failed";
+        return r.canRemove ? null : (r.structuralReason ?? "it can't be deleted");
+      } catch (e) {
+        return String(e instanceof Error ? e.message : e);
+      }
+    }),
+  );
+  const at = verdicts.findIndex((v) => v !== null);
+  return at === -1 ? null : `${labelOfElement(list[at])} can't go: ${verdicts[at]}`;
+}
+
+/**
+ * Stage the removal of several elements as one gesture — one undo step, and
+ * all or nothing. Synchronous on purpose: the program it rolls back to is
+ * the one it read, with no await in between for another edit to slip into.
+ */
+function stageRemovals(
+  get: () => AppState,
+  set: (partial: Partial<AppState>) => void,
+  list: SelectedElement[],
+  verb: string,
+): boolean {
+  const before = get().actions;
+  const beforeRedo = get().redoStack;
+  // Staged inserts first: something never written is withdrawn rather than
+  // removed, with the edits made to it (the rule `removeSelected` has always
+  // had) — and withdrawing one can be what frees its anchor to be deleted.
+  const withdrawn = new Set(list.map((el) => el.dedupId).filter(isPendingId));
+  if (withdrawn.size > 0) {
+    const next = before.filter(
+      (a) =>
+        !(a.kind === "insert" && withdrawn.has(a.id)) &&
+        !(isValueAction(a) && withdrawn.has(a.target.dedupId)),
+    );
+    set({ actions: next, redoStack: [] });
+    syncCanvas(next);
+  }
+  const gesture = crypto.randomUUID();
+  for (const el of list) {
+    if (withdrawn.has(el.dedupId)) continue;
+    if (!stageRemoval(get, set, el.dedupId, labelOfElement(el), gesture)) {
+      // Refused (`stage` has said why): put the program back exactly as it
+      // was, so half a deletion is never what is left on the canvas.
+      set({ actions: before, redoStack: beforeRedo });
+      syncCanvas(before);
+      return false;
+    }
+  }
+  set({ selected: null, multi: [], sourceInfo: null });
+  sendToOverlay({ type: "clear" });
+  if (verb !== "Cut") get().setNotice(`${verb} ${countLabel(list.length)}.`);
+  return true;
+}
+
+/** ⌫ on a multi-selection: ask whether all may go, then stage them. */
+async function removeMany(
+  get: () => AppState,
+  set: (partial: Partial<AppState>) => void,
+): Promise<void> {
+  const selection = get().multi;
+  const list = outermostOnly(selection);
+  const refusal = await removalRefusal(get, list);
+  if (get().multi !== selection) return; // the selection moved on while asking
+  if (refusal) {
+    get().setNotice(`Nothing deleted — ${refusal}`);
+    return;
+  }
+  stageRemovals(get, set, list, "Deleted");
 }
 
 /** How a capture reads in a notice: what it was, and what it leaves behind. */
@@ -1517,7 +1435,36 @@ async function copyToClipboard(
   set: (partial: Partial<AppState>) => void,
   cut: boolean,
 ): Promise<boolean> {
-  const { selected } = get();
+  const { selected, multi } = get();
+  if (multi.length > 0) {
+    // Each element through the same capture a single copy uses, in page
+    // order (the order the overlay reported them in).
+    const list = outermostOnly(multi);
+    const captures = await Promise.all(
+      list.map((el) => captureClip(get, el.dedupId, el)),
+    );
+    const clips: Omit<Clipboard, "cut">[] = [];
+    let unsaved = 0;
+    for (const c of captures) {
+      if ("error" in c) {
+        get().setNotice(c.error);
+        return false;
+      }
+      clips.push(c.clip);
+      unsaved += c.unsaved;
+    }
+    const [first, ...more] = clips;
+    set({ clipboard: { ...first, more, cut } });
+    const what = `${cut ? "Cut" : "Copied"} ${countLabel(clips.length)}`;
+    get().setNotice(
+      unsaved > 0
+        ? `${what} as they are saved — ${unsaved} unsaved edit${
+            unsaved === 1 ? "" : "s"
+          } inside them ${unsaved === 1 ? "isn't" : "aren't"} included.`
+        : `${what}.`,
+    );
+    return true;
+  }
   if (!selected) {
     get().setNotice("Select something on the canvas first.");
     return false;
@@ -1561,7 +1508,7 @@ function describeProgram(actions: EditAction[]): string {
 }
 
 
-// --- merge helpers -----------------------------------------------------------
+// --- agent helpers -----------------------------------------------------------
 
 type Setter = (partial: Partial<AppState>) => void;
 type Getter = () => AppState;
@@ -1577,18 +1524,6 @@ function patchAgent(
 ) {
   const agents = get().agents;
   set({ agents: { ...agents, [agent]: { ...agents[agent], ...patch } } });
-}
-
-/**
- * Update the in-flight merge, and only that one. Every step of a merge is
- * async, so the session it started on may have been cancelled or replaced
- * before it returns — writing into a stale session would show one merge's
- * gate results under another merge's proposal.
- */
-function patchMerge(set: Setter, get: Getter, patch: Partial<MergeSession>) {
-  const current = get().merge;
-  if (!current) return;
-  set({ merge: { ...current, ...patch } });
 }
 
 /** An agent the user has connected (a live round-trip, not just installed) —
@@ -1607,46 +1542,6 @@ function imageAgent(state: AppState): CliAgent | null {
   );
 }
 
-/** The AI backend the user explicitly chose, or null (never a silent one). */
-function aiBackend(state: AppState): AiBackend | null {
-  const kind = state.activeAiBackend();
-  if (kind && kind !== "api") {
-    return {
-      kind: "cli",
-      agent: kind,
-      run: (p: string) =>
-        agentPrompt(kind, p, useStore.getState().agents[kind].model),
-    };
-  }
-  if (kind === "api") return { kind: "api", apiKey: state.anthropicKey };
-  return null;
-}
-
-/**
- * Re-run the codemod in dry-run mode and park the result for review. This is
- * the only thing that puts a merge into `review`: the user is shown the exact
- * before/after the real apply will produce, computed by the same code path,
- * so approving the diff approves what actually happens.
- */
-async function refreshPreview(set: Setter, get: Getter): Promise<void> {
-  const { project, merge } = get();
-  if (!project || !merge?.proposal) return;
-  const { proposal } = merge;
-  try {
-    const preview = await mergeApply(
-      project.root,
-      { name: proposal.name, file: proposal.file, source: proposal.source },
-      proposal.mapping,
-      true,
-    );
-    if (get().merge?.clusterId !== merge.clusterId) return;
-    if (!preview.ok) throw new Error(preview.error ?? "the merge preview failed");
-    patchMerge(set, get, { preview, stage: "review", error: null });
-  } catch (e) {
-    patchMerge(set, get, { stage: "failed", error: errorText(e) });
-  }
-}
-
 export const useStore = create<AppState>((set, get) => ({
   view: "launch",
   project: null,
@@ -1662,6 +1557,9 @@ export const useStore = create<AppState>((set, get) => ({
 
   logs: [],
   consoleOpen: false,
+  consoleTab: "output",
+  consoleHeight: loadConsoleHeight(),
+  terminals: [],
   errors: [],
 
   viewportId: "desktop",
@@ -1690,9 +1588,8 @@ export const useStore = create<AppState>((set, get) => ({
   sessionBusy: false,
   sessionError: null,
   authProvider: null,
-  editorTab: "canvas",
   codePanel: null,
-  selected: null,
+  selected: null, multi: [],
   sourceInfo: null,
 
   actions: [],
@@ -1718,33 +1615,6 @@ export const useStore = create<AppState>((set, get) => ({
   chatBusy: false,
   chatActivity: null,
   pendingEdit: null,
-  scanning: false,
-  scanProgress: null,
-  scanResult: null,
-  driftRunning: false,
-  driftProgress: null,
-  driftResult: null,
-  driftError: null,
-  openDriftId: null,
-  driftSelection: {},
-  driftZoom: 1,
-  driftPan: { x: 120, y: 96 },
-  driftProposal: null,
-  driftProposing: false,
-  driftProposalError: null,
-  scanError: null,
-  liveSizes: {},
-  dismissed: {},
-  openClusterId: null,
-  visualScores: {},
-  visualHashes: {},
-  visualPass: null,
-
-  categories: {},
-  mockProps: {},
-  categorizing: false,
-  categorizeProgress: null,
-  categorizeError: null,
   anthropicKey: localStorage.getItem(KEY_STORAGE) ?? "",
   agents: loadAgents(),
   apiEnabled: loadApiEnabled(),
@@ -1754,12 +1624,11 @@ export const useStore = create<AppState>((set, get) => ({
   parked: [],
   dragOut: null,
   artboardPos: {},
+  settingsOpen: false,
+  settingsSection: "ai",
   panelWidths: loadPanelWidths(),
-
-  merge: null,
   history: [],
-  historyOpen: false,
-  trash: [],
+  sync: null,
 
   enterEditor: (project, git, customCommand = null) => {
     // Parked canvas pieces come back too — after the reset below has cleared
@@ -1790,34 +1659,7 @@ export const useStore = create<AppState>((set, get) => ({
       dragOut: null,
       artboardPos: {},
       pendingEdit: null,
-      scanning: false,
-      scanProgress: null,
-      scanResult: null,
-      driftRunning: false,
-      driftProgress: null,
-      driftResult: null,
-      driftError: null,
-      openDriftId: null,
-      driftSelection: {},
-      driftZoom: 1,
-      driftPan: { x: 120, y: 96 },
-      driftProposal: null,
-      driftProposing: false,
-      driftProposalError: null,
-      scanError: null,
-      liveSizes: loadLiveSizes(project.root),
-      dismissed: loadDismissed(project.root),
-      openClusterId: null,
-      visualScores: {},
-      visualHashes: {},
-      visualPass: null,
-      categories: {},
-      mockProps: {},
-      categorizing: false,
-      categorizeProgress: null,
-      categorizeError: null,
       view: "editor",
-      editorTab: "canvas",
       codePanel: null,
       selectedRoute: null,
       sessionSeed: null,
@@ -1842,10 +1684,14 @@ export const useStore = create<AppState>((set, get) => ({
       crashed: false,
       logs: [],
       errors: [],
+      // Shells are per-project: they start in its root. Their panes unmount
+      // with the editor, and that closes the PTYs behind them.
+      terminals: [],
+      consoleTab: "output",
       tool: "select",
       textEditing: null,
       textToolSticky: false,
-      selected: null,
+      selected: null, multi: [],
       sourceInfo: null,
       actions: [],
       redoStack: [],
@@ -1863,10 +1709,8 @@ export const useStore = create<AppState>((set, get) => ({
       directWritePrompt: null,
       saveError: null,
       notice: null,
-      merge: null,
       history: [],
-      historyOpen: false,
-      trash: [],
+      sync: null,
     });
   },
 
@@ -1888,40 +1732,11 @@ export const useStore = create<AppState>((set, get) => ({
       dragOut: null,
       artboardPos: {},
       pendingEdit: null,
-      scanning: false,
-      scanProgress: null,
-      scanResult: null,
-      driftRunning: false,
-      driftProgress: null,
-      driftResult: null,
-      driftError: null,
-      openDriftId: null,
-      driftSelection: {},
-      driftZoom: 1,
-      driftPan: { x: 120, y: 96 },
-      driftProposal: null,
-      driftProposing: false,
-      driftProposalError: null,
-      scanError: null,
-      liveSizes: {},
-      dismissed: {},
-      openClusterId: null,
-      visualScores: {},
-      visualHashes: {},
-      visualPass: null,
-      categories: {},
-      mockProps: {},
-      categorizing: false,
-      categorizeProgress: null,
-      categorizeError: null,
       view: "launch",
-      editorTab: "canvas",
       codePanel: null,
       selectedRoute: null,
-      merge: null,
       history: [],
-      historyOpen: false,
-      trash: [],
+      sync: null,
       sessionSeed: null,
       sessionModalOpen: false,
       sessionBusy: false,
@@ -1942,8 +1757,12 @@ export const useStore = create<AppState>((set, get) => ({
       devPort: null,
       logs: [],
       errors: [],
+      // Shells are per-project: they start in its root. Their panes unmount
+      // with the editor, and that closes the PTYs behind them.
+      terminals: [],
+      consoleTab: "output",
       crashed: false,
-      selected: null,
+      selected: null, multi: [],
       sourceInfo: null,
       actions: [],
       redoStack: [],
@@ -2056,6 +1875,46 @@ export const useStore = create<AppState>((set, get) => ({
   toggleConsole: (open) =>
     set((s) => ({ consoleOpen: open ?? !s.consoleOpen })),
 
+  setConsoleTab: (consoleTab) => set({ consoleTab, consoleOpen: true }),
+
+  setConsoleHeight: (px) => {
+    const consoleHeight = Math.max(CONSOLE_MIN_HEIGHT, Math.round(px));
+    try {
+      localStorage.setItem(CONSOLE_HEIGHT_STORAGE, String(consoleHeight));
+    } catch {
+      // A height that isn't remembered is still the height.
+    }
+    set({ consoleHeight });
+  },
+
+  newTerminal: () =>
+    set((s) => {
+      const key = ++nextTerminalKey;
+      return {
+        terminals: [...s.terminals, { key, title: "" }],
+        consoleTab: key,
+        consoleOpen: true,
+      };
+    }),
+
+  closeTerminalTab: (key) =>
+    set((s) => {
+      const i = s.terminals.findIndex((t) => t.key === key);
+      if (i < 0) return {};
+      const terminals = s.terminals.filter((t) => t.key !== key);
+      // Closing the tab on screen shows its neighbour, as a browser does.
+      const consoleTab =
+        s.consoleTab !== key
+          ? s.consoleTab
+          : (terminals[Math.min(i, terminals.length - 1)]?.key ?? "output");
+      return { terminals, consoleTab };
+    }),
+
+  updateTerminal: (key, patch) =>
+    set((s) => ({
+      terminals: s.terminals.map((t) => (t.key === key ? { ...t, ...patch } : t)),
+    })),
+
   setViewport: (viewportId) => set({ viewportId }),
 
   setTool: (tool) => {
@@ -2141,14 +2000,14 @@ export const useStore = create<AppState>((set, get) => ({
       sessionModes: drop(s.sessionModes),
       heldRoutes: drop(s.heldRoutes),
       offlineRoutes: drop(s.offlineRoutes),
-      // The scan targets an artboard; closing it leaves no target.
+      // Closing the selected artboard clears its selection.
       selectedRoute: s.selectedRoute === path ? null : s.selectedRoute,
       // pageMeta is the root frame's report of the live app.
       ...(path === "/" ? { pageMeta: null } : {}),
       // The selection lived in a frame that is going away. Staged edits do
       // NOT go with it — they address `file@ordinal`, so they still apply and
       // still save; only the on-screen selection is gone.
-      selected: null,
+      selected: null, multi: [],
       sourceInfo: null,
     });
 
@@ -2345,7 +2204,7 @@ export const useStore = create<AppState>((set, get) => ({
     // for a page guarded *for* them it is exactly wrong — the guest origin has
     // its own storage, so a real login there never applies. Whenever a session
     // has just changed, the shared origin is the one that has it.
-    set({ frameOrigins: {}, selected: null, sourceInfo: null });
+    set({ frameOrigins: {}, selected: null, multi: [], sourceInfo: null });
     // Reload each frame *at its pinned route*, not wherever it sits: a
     // protected frame is parked on /login, and a plain refresh would just
     // reload the login page it was bounced to.
@@ -2405,7 +2264,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!backend) {
       set({
         sessionError:
-          "No AI backend is on — switch one on in the AI menu (top bar), or write the seed by hand.",
+          "No AI backend is on — switch one on in Settings → AI (⌘,), or write the seed by hand.",
       });
       return;
     }
@@ -2423,8 +2282,6 @@ export const useStore = create<AppState>((set, get) => ({
       set({ sessionBusy: false });
     }
   },
-
-  setEditorTab: (editorTab) => set({ editorTab }),
 
   openCode: async (file, line = 1) => {
     const { project, codePanel } = get();
@@ -2476,6 +2333,11 @@ export const useStore = create<AppState>((set, get) => ({
     const { project, codePanel } = get();
     if (!project || !codePanel || codePanel.saving) return;
     if (codePanel.draft === codePanel.original) return;
+    const clash = previewClash([codePanel.file], get().pendingEdit);
+    if (clash) {
+      set({ codePanel: { ...codePanel, error: previewClashMessage(clash) } });
+      return;
+    }
     if (needsDirectWriteWarning(set, get, [codePanel.file], () => void get().saveCode())) {
       return;
     }
@@ -2507,7 +2369,7 @@ export const useStore = create<AppState>((set, get) => ({
       // A hand edit can add or remove elements, which renumbers the ordinals
       // every dedup id is built from — the canvas must re-read its tags.
       setTimeout(() => sendToOverlay({ type: "reload" }), 150);
-      set({ selected: null, sourceInfo: null });
+      set({ selected: null, multi: [], sourceInfo: null });
     } catch (e) {
       const current = get().codePanel;
       if (current?.file === codePanel.file) {
@@ -2532,7 +2394,7 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     sourceInfoPending = null;
-    set({ selected, sourceInfo: null });
+    set({ selected, multi: [], sourceInfo: null });
     if (!selected) return;
     // A staged insert has no file to ask — its snippet is the source of truth.
     const insert = pendingInsert(get().actions, selected.dedupId);
@@ -2605,6 +2467,16 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().tool === "text") void get().requestTextEdit(selected.dedupId);
   },
 
+  setMultiSelected: (list) => {
+    if (list.length === 0) return get().clearSelection();
+    if (list.length === 1) return get().setSelected(list[0]);
+    // Same reason clearSelection ends one: a caret is part of a single
+    // selection, and there no longer is one.
+    if (get().textEditing !== null) sendToOverlay({ type: "text-edit-end" });
+    sourceInfoPending = null;
+    set({ selected: null, multi: list, sourceInfo: null });
+  },
+
   clearSelection: () => {
     // A caret on the canvas is part of the selection, and the overlay's own
     // `clear` does not touch it — nor does the iframe losing focus, which
@@ -2613,7 +2485,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().textEditing !== null) sendToOverlay({ type: "text-edit-end" });
     sendToOverlay({ type: "clear" });
     sourceInfoPending = null;
-    set({ selected: null, sourceInfo: null });
+    set({ selected: null, multi: [], sourceInfo: null });
   },
 
   selectById: (id) => sendToOverlay({ type: "select-id", id }),
@@ -2730,6 +2602,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   removeSelected: () => {
+    if (get().multi.length > 0) {
+      void removeMany(get, set);
+      return;
+    }
     const { selected, sourceInfo, actions } = get();
     if (!selected || !sourceInfo?.canRemove) return;
 
@@ -2742,7 +2618,7 @@ export const useStore = create<AppState>((set, get) => ({
           !(a.kind === "insert" && a.id === selected.dedupId) &&
           !(isValueAction(a) && a.target.dedupId === selected.dedupId),
       );
-      set({ actions: next, redoStack: [], selected: null, sourceInfo: null });
+      set({ actions: next, redoStack: [], selected: null, multi: [], sourceInfo: null });
       syncCanvas(next);
       sendToOverlay({ type: "clear" });
       return;
@@ -2764,7 +2640,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     // The element is gone from the canvas — a selection pointing at it would
     // show controls for something the user can no longer see.
-    set({ selected: null, sourceInfo: null });
+    set({ selected: null, multi: [], sourceInfo: null });
     sendToOverlay({ type: "clear" });
   },
 
@@ -2827,6 +2703,21 @@ export const useStore = create<AppState>((set, get) => ({
    * is gone and on no clipboard.
    */
   cutSelected: async () => {
+    if (get().multi.length > 0) {
+      // Same order as a single cut, for the same reason: may they all go,
+      // then the copy, and only then the removals.
+      const list = get().multi;
+      const refusal = await removalRefusal(get, outermostOnly(list));
+      if (get().multi !== list) return; // the selection moved on
+      if (refusal) {
+        get().setNotice(`Nothing cut — ${refusal}`);
+        return;
+      }
+      if (!(await copyToClipboard(get, set, true))) return;
+      if (get().multi !== list) return;
+      stageRemovals(get, set, outermostOnly(list), "Cut");
+      return;
+    }
     const selected = get().selected;
     if (!selected) {
       get().setNotice("Select something on the canvas first.");
@@ -2852,7 +2743,11 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     if (!selected) {
-      get().setNotice("Select where to paste — the copy lands next to it.");
+      get().setNotice(
+        get().multi.length > 0
+          ? "Select one element to paste next to — several are selected."
+          : "Select where to paste — the copy lands next to it.",
+      );
       return;
     }
 
@@ -2887,8 +2782,40 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
 
-    const id = await stagePaste(get, clipboard, target, position, "Pasted");
-    if (id) get().selectById(id);
+    const more = clipboard.more ?? [];
+    if (more.length === 0) {
+      const id = await stagePaste(get, clipboard, target, position, "Pasted");
+      if (id) get().selectById(id);
+      return;
+    }
+    // A copy of several elements: one paste each, at the same anchor (pastes
+    // at one anchor land one behind the other, so page order survives), and
+    // one gesture id so ⌘Z takes them back together. All or nothing — a
+    // refusal part-way takes back the ones already staged.
+    const gesture = crypto.randomUUID();
+    const ids: string[] = [];
+    const warnings: string[] = [];
+    for (const clip of [clipboard, ...more]) {
+      const id = await stagePaste(get, clip, target, position, "Pasted", gesture);
+      if (!id) {
+        const next = get().actions.filter(
+          (a) => !(a.kind === "insert" && a.gesture === gesture),
+        );
+        set({ actions: next });
+        syncCanvas(next);
+        return;
+      }
+      ids.push(id);
+      // stagePaste says its own piece; anything beyond the plain sentence is
+      // a warning (a name the destination file lacks) and must not be lost
+      // under the summary.
+      const said = get().notice;
+      if (said && said !== `Pasted ${clip.label}.`) warnings.push(said);
+    }
+    get().setNotice(
+      warnings.length > 0 ? warnings.join(" ") : `Pasted ${countLabel(ids.length)}.`,
+    );
+    sendToOverlay({ type: "select-ids", ids, report: true });
   },
 
   setNotice: (message) => {
@@ -3021,7 +2948,7 @@ export const useStore = create<AppState>((set, get) => ({
       actions: [],
       redoStack: [],
       saveError: null,
-      selected: null,
+      selected: null, multi: [],
       sourceInfo: null,
     });
     syncCanvas([]);
@@ -3046,7 +2973,7 @@ export const useStore = create<AppState>((set, get) => ({
     syncCanvas(step.actions);
   },
 
-  saveAll: async () => {
+  saveAll: async (draft) => {
     const { project, actions, saving } = get();
     if (!project || saving) return;
     // A class edit scrubbed back to where it started is not a change.
@@ -3054,6 +2981,13 @@ export const useStore = create<AppState>((set, get) => ({
       (a) => !isValueAction(a) || a.before !== a.after,
     );
     if (dirty.length === 0) return;
+    // A save commits whole files, so it would take a chat preview sitting in
+    // one of them into history unaccepted. A refusal, not a failed save.
+    const clash = previewClash(dirty.map((a) => a.target.file), get().pendingEdit);
+    if (clash) {
+      get().setNotice(previewClashMessage(clash));
+      return;
+    }
     if (
       needsDirectWriteWarning(set, get, dirty.map((a) => a.target.file), () =>
         void get().saveAll(),
@@ -3080,7 +3014,12 @@ export const useStore = create<AppState>((set, get) => ({
         if (!res.ok) throw new Error(res.error ?? `write failed for ${file}`);
       }
 
-      const message = `dedup: ${describeProgram(dirty)}`;
+      // `typeof`, not truthiness: a caller wired straight to onClick would
+      // hand this a MouseEvent.
+      const message = commitMessage(
+        typeof draft === "string" ? draft : null,
+        describeProgram(dirty),
+      );
       const saved = await commitOrDirect(get, project.root, message, [...byFile.keys()]);
 
       syncCanvas([]);
@@ -3098,7 +3037,7 @@ export const useStore = create<AppState>((set, get) => ({
       // already has. HMR re-stamps on its own for class-only saves.
       if (dirty.some((a) => !isValueAction(a))) {
         setTimeout(() => sendToOverlay({ type: "reload" }), 150);
-        set({ selected: null, sourceInfo: null });
+        set({ selected: null, multi: [], sourceInfo: null });
       }
       // Branch may have just been created — refresh the TopBar indicator.
       gitStatus(project.root)
@@ -3223,13 +3162,13 @@ export const useStore = create<AppState>((set, get) => ({
 
     // A mention is a request for that agent specifically, so it is answered
     // by that agent or not at all — quietly handing the message to the
-    // default instead would be the silent backend the AI switch exists to
+    // default instead would be the silent backend Settings → AI exists to
     // rule out.
     if (mentioned && !agentConnected(get(), mentioned)) {
       push({
         role: "assistant",
         error: true,
-        text: `${agentLabel(mentioned)} is off — switch it on in the AI menu (top bar), then send again.`,
+        text: `${agentLabel(mentioned)} is off — switch it on in Settings → AI (⌘,), then send again.`,
       });
       return;
     }
@@ -3248,7 +3187,7 @@ export const useStore = create<AppState>((set, get) => ({
       push({
         role: "assistant",
         error: true,
-        text: "No AI backend is on — switch one on in the AI menu (top bar).",
+        text: "No AI backend is on — switch one on in Settings → AI (⌘,).",
       });
       return;
     }
@@ -3653,7 +3592,7 @@ export const useStore = create<AppState>((set, get) => ({
       // selection — the edit may have shifted every position in the file, so
       // the old id can't be trusted for a follow-up.
       sendToOverlay({ type: "reload" });
-      set({ selected: null, sourceInfo: null });
+      set({ selected: null, multi: [], sourceInfo: null });
     } catch (e) {
       push({
         role: "assistant",
@@ -3736,7 +3675,7 @@ export const useStore = create<AppState>((set, get) => ({
         .catch(() => {});
       if (!pendingEdit.previewing) {
         sendToOverlay({ type: "reload" });
-        set({ selected: null, sourceInfo: null });
+        set({ selected: null, multi: [], sourceInfo: null });
       }
     } catch (e) {
       push({
@@ -3783,7 +3722,7 @@ export const useStore = create<AppState>((set, get) => ({
         .then((g) => set({ git: g }))
         .catch(() => {});
       sendToOverlay({ type: "reload" });
-      set({ selected: null, sourceInfo: null });
+      set({ selected: null, multi: [], sourceInfo: null });
     } finally {
       set({ chatBusy: false });
     }
@@ -3806,253 +3745,6 @@ export const useStore = create<AppState>((set, get) => ({
     });
   },
 
-  runScan: async () => {
-    const { project, scanning, devStatus, instrumentation, selectedRoute } =
-      get();
-    if (!project || scanning) return;
-    // The duplicate engine reads React components; a static site has none.
-    // Refused here as well as hidden in the tab, so a keyboard shortcut or a
-    // stale call can't start a scan that could only ever find nothing.
-    if (project.framework === "static") {
-      set({
-        scanError:
-          "Duplicate detection compares React components — a static HTML site has none to compare.",
-        sidebarTab: "duplicates",
-      });
-      return;
-    }
-    // A live, tagged canvas scans one artboard at a time — the user picks
-    // which by selecting it. No selection = ask, don't guess.
-    const canvasLive = devStatus === "ready" && instrumentation?.active;
-    if (canvasLive && !selectedRoute) {
-      set({
-        scanError:
-          "Select an artboard first — click its name above the frame — then Scan.",
-        sidebarTab: "duplicates",
-      });
-      return;
-    }
-    set({
-      scanning: true,
-      scanError: null,
-      scanProgress: null,
-      sidebarTab: "duplicates",
-      openClusterId: null,
-    });
-    try {
-      // Scope to the selected artboard's page, and grab each component's
-      // rendered on-page size while the frame is right there — the gallery
-      // cards take the same dimensions the components have on the site.
-      // No running canvas or no tagged elements → honest fallback to a
-      // whole-project scan (and harness-measured card sizes).
-      const [canvasFiles, liveSizes] =
-        canvasLive && selectedRoute
-          ? await Promise.all([
-              requestFrameFiles(selectedRoute),
-              requestFrameSizes(selectedRoute),
-            ])
-          : [null, null];
-      const scope = canvasFiles && canvasFiles.length > 0 ? canvasFiles : null;
-      const result = await scanProject(project.root, scope);
-      if (!result.ok) throw new Error(result.error ?? "scan failed");
-      if (liveSizes) saveLiveSizes(project.root, liveSizes);
-      // Fresh results land in the Components tab (restores stay put).
-      set({
-        scanResult: result,
-        editorTab: "components",
-        ...(liveSizes ? { liveSizes } : {}),
-      });
-      // One button, whole flow: cached categories apply instantly, then AI
-      // categorizes whatever is new/changed (no-op without an API key).
-      await get().applyCachedCategories();
-      void get().categorize();
-    } catch (e) {
-      set({ scanError: String(e instanceof Error ? e.message : e) });
-    } finally {
-      set({ scanning: false, scanProgress: null });
-    }
-  },
-
-  restoreScan: async () => {
-    const { project, scanResult, scanning } = get();
-    if (!project || scanResult || scanning) return;
-    try {
-      const saved = await loadScanResult(project.root);
-      // Still relevant? The user may have scanned or left meanwhile. Saves
-      // from older builds (schema mismatch) are ignored — just rescan.
-      if (
-        saved?.ok &&
-        saved.schema === SCAN_SCHEMA &&
-        get().project?.root === project.root &&
-        !get().scanResult
-      ) {
-        set({ scanResult: saved });
-        void get().applyCachedCategories();
-      }
-    } catch {
-      // No saved scan is a perfectly fine state.
-    }
-  },
-
-  setScanProgress: (scanProgress) => set({ scanProgress }),
-
-  runDrift: async () => {
-    const { project, driftRunning } = get();
-    if (!project || driftRunning) return;
-    // Same refusal as the scan, for the same reason: the detector reads JSX.
-    if (project.framework === "static") {
-      set({
-        driftError:
-          "Drift detection reads JSX subtrees — a static HTML site has none.",
-        sidebarTab: "drift",
-      });
-      return;
-    }
-    set({
-      driftRunning: true,
-      driftError: null,
-      driftProgress: null,
-      sidebarTab: "drift",
-      openDriftId: null,
-    });
-    try {
-      // Deliberately NOT scoped to the selected artboard, which is where the
-      // scan differs: the scan needs an artboard because its output is
-      // rendered previews of what is on that page, while drift is *by
-      // definition* cross-file — "the same button in nine files" cannot be
-      // seen one page at a time. Scoping it to a page turns the finding into
-      // a much smaller and much less true one. The sidecar still takes a file
-      // list; nothing here has a reason to pass one.
-      const result = await extractProject(project.root, null);
-      if (!result.ok) throw new Error(result.error ?? "drift scan failed");
-      set({ driftResult: result });
-    } catch (e) {
-      set({ driftError: String(e instanceof Error ? e.message : e) });
-    } finally {
-      set({ driftRunning: false, driftProgress: null });
-    }
-  },
-
-  restoreDrift: async () => {
-    const { project, driftResult, driftRunning } = get();
-    if (!project || driftResult || driftRunning) return;
-    try {
-      const saved = await loadExtractResult(project.root);
-      // Still relevant? Saves from older builds are ignored — just rerun.
-      if (
-        saved?.ok &&
-        saved.schema === DRIFT_SCHEMA &&
-        get().project?.root === project.root &&
-        !get().driftResult
-      ) {
-        set({ driftResult: saved });
-      }
-    } catch {
-      // No saved run is a perfectly fine state.
-    }
-  },
-
-  setDriftProgress: (driftProgress) => set({ driftProgress }),
-
-  openDrift: (openDriftId) => {
-    const candidate = get().driftResult?.candidates.find(
-      (c) => c.id === openDriftId,
-    );
-    const driftSelection: Record<string, true> = {};
-    for (const o of candidate?.occurrences ?? []) {
-      driftSelection[`${o.file}:${o.start}`] = true;
-    }
-    set({
-      openDriftId,
-      driftSelection,
-      driftProposal: null,
-      driftProposalError: null,
-      // A new candidate is a new scene — open it framed, not wherever the
-      // last one was left.
-      ...(openDriftId ? { driftZoom: 1, driftPan: { x: 120, y: 96 } } : {}),
-      // Opening a candidate is the request to *see* the copies — that is the
-      // whole point of the tab, and a list of file:line is what every other
-      // tool already gives you.
-      ...(openDriftId ? { editorTab: "drift" as const } : {}),
-    });
-  },
-
-  proposeExtraction: async () => {
-    const { driftResult, openDriftId, driftSelection, driftProposing } = get();
-    if (driftProposing) return;
-    const candidate = driftResult?.candidates.find((c) => c.id === openDriftId);
-    if (!candidate) return;
-    const picked = candidate.occurrences.filter(
-      (o) => driftSelection[`${o.file}:${o.start}`],
-    );
-    if (picked.length < 2) {
-      set({ driftProposalError: "Select at least two copies to combine." });
-      return;
-    }
-    const kind = get().activeAiBackend();
-    const backend =
-      kind && kind !== "api"
-        ? {
-            kind: "cli" as const,
-            agent: kind,
-            run: (p: string) => agentPrompt(kind, p, get().agents[kind].model),
-          }
-        : kind === "api"
-          ? { kind: "api" as const, apiKey: get().anthropicKey }
-          : null;
-    if (!backend) {
-      set({
-        driftProposalError:
-          "No AI backend is on — switch one on in the AI menu (top bar).",
-      });
-      return;
-    }
-    set({ driftProposing: true, driftProposalError: null, driftProposal: null });
-    try {
-      const reply = await runExtractPrompt(backend, candidate, picked);
-      set({
-        driftProposal: { ...parseExtractReply(reply), fromCount: picked.length },
-      });
-    } catch (e) {
-      set({ driftProposalError: String(e instanceof Error ? e.message : e) });
-    } finally {
-      set({ driftProposing: false });
-    }
-  },
-
-  setDriftTransform: ({ zoom, pan }) =>
-    set({ driftZoom: clampZoom(zoom), driftPan: pan }),
-
-  selectAllDrift: () => {
-    const { driftResult, openDriftId } = get();
-    const candidate = driftResult?.candidates.find((c) => c.id === openDriftId);
-    if (!candidate) return;
-    const driftSelection: Record<string, true> = {};
-    for (const o of candidate.occurrences) {
-      driftSelection[`${o.file}:${o.start}`] = true;
-    }
-    set({ driftSelection });
-  },
-
-  toggleDriftOccurrence: (key) => {
-    const next = { ...get().driftSelection };
-    if (next[key]) delete next[key];
-    else next[key] = true;
-    set({ driftSelection: next });
-  },
-
-  openCluster: (openClusterId) => set({ openClusterId }),
-
-  dismissCluster: (id) => {
-    const { project, dismissed, openClusterId } = get();
-    const next = { ...dismissed, [id]: true as const };
-    if (project) saveDismissed(project.root, next);
-    set({
-      dismissed: next,
-      openClusterId: openClusterId === id ? null : openClusterId,
-    });
-  },
-
   setAnthropicKey: (anthropicKey) => {
     try {
       if (anthropicKey) localStorage.setItem(KEY_STORAGE, anthropicKey);
@@ -4061,18 +3753,6 @@ export const useStore = create<AppState>((set, get) => ({
       // Best-effort persistence; the in-memory key still works this session.
     }
     set({ anthropicKey });
-  },
-
-  applyCachedCategories: async () => {
-    const { project, scanResult } = get();
-    if (!project || !scanResult) return;
-    try {
-      const cache = (await loadCategories(project.root)) ?? {};
-      if (get().scanResult !== scanResult) return; // scan changed meanwhile
-      set(validAssignments(cache, scanResult.gallery));
-    } catch {
-      // No cache is a fine state.
-    }
   },
 
   detectAgent: async (agent) => {
@@ -4184,6 +3864,10 @@ export const useStore = create<AppState>((set, get) => ({
   dismissExportNotice: () => set({ exportNotice: null }),
 
   setDragOut: (dragOut) => set({ dragOut }),
+
+  openSettings: (section) =>
+    set((s) => ({ settingsOpen: true, settingsSection: section ?? s.settingsSection })),
+  closeSettings: () => set({ settingsOpen: false }),
 
   moveArtboard: (route, at) => {
     const s = get();
@@ -4387,8 +4071,6 @@ export const useStore = create<AppState>((set, get) => ({
       }
       patchAgent(set, get, agent, { consent: true, enabled: true, error: null });
       saveAgentPrefs(get().agents);
-      // Organize the current scan right away with the new backend.
-      void get().categorize();
     } catch (e) {
       const msg = String(e instanceof Error ? e.message : e);
       patchAgent(set, get, agent, {
@@ -4404,9 +4086,8 @@ export const useStore = create<AppState>((set, get) => ({
   /**
    * Who answers when nobody was named: the first agent switched on, in
    * CLI_AGENTS order, then the API key. Fixed order rather than "last used"
-   * so the answer is stable and the AI menu can say which one it is — the
-   * other is one `@` away. Everything that isn't the chat (organizing scans,
-   * merges, the session seed) has no `@` to use, so this is its backend too.
+   * so the answer is stable and Settings → AI can say which one it is — the
+   * other is one `@` away. The session seed has no `@` to use, so this is its backend too.
    */
   activeAiBackend: () => {
     const { agents, apiEnabled, anthropicKey } = get();
@@ -4414,278 +4095,6 @@ export const useStore = create<AppState>((set, get) => ({
     if (first) return first.id;
     if (apiEnabled && anthropicKey) return "api";
     return null;
-  },
-
-  categorize: async () => {
-    const { project, scanResult, anthropicKey, categorizing } = get();
-    if (!project || !scanResult || categorizing) return;
-    // Backend is an explicit user choice (TopBar AI switch); no silent use.
-    const kind = get().activeAiBackend();
-    const backend: AiBackend | null =
-      kind && kind !== "api"
-        ? {
-            kind: "cli",
-            agent: kind,
-            run: (p) => agentPrompt(kind, p, get().agents[kind].model),
-          }
-        : kind === "api"
-          ? { kind: "api", apiKey: anthropicKey }
-          : null;
-    if (!backend) return;
-    set({ categorizing: true, categorizeError: null, categorizeProgress: null });
-    try {
-      const cache = (await loadCategories(project.root)) ?? {};
-      const pending = needingCategorization(scanResult.gallery, cache);
-      if (pending.length > 0) {
-        const fresh = await categorizeComponents(
-          backend,
-          pending,
-          (done, total) => set({ categorizeProgress: { done, total } }),
-        );
-        Object.assign(cache, fresh);
-        await saveCategories(project.root, cache);
-      }
-      set(validAssignments(cache, scanResult.gallery));
-    } catch (e) {
-      set({ categorizeError: String(e instanceof Error ? e.message : e) });
-    } finally {
-      set({ categorizing: false, categorizeProgress: null });
-    }
-  },
-
-  removeMember: (clusterId, memberIndex) => {
-    const { scanResult, openClusterId } = get();
-    if (!scanResult) return;
-    const clusters = scanResult.clusters
-      .map((c) => {
-        if (c.id !== clusterId) return c;
-        const members = c.members.filter((_, i) => i !== memberIndex);
-        return { ...c, members };
-      })
-      .filter((c) => c.members.length >= 2);
-    const stillOpen = clusters.some((c) => c.id === openClusterId);
-    set({
-      scanResult: { ...scanResult, clusters },
-      openClusterId: stillOpen ? openClusterId : null,
-    });
-  },
-
-  runVisualPass: async () => {
-    const { project, scanResult, dismissed, visualPass, editorTab } = get();
-    if (!project || !scanResult || visualPass) return;
-    const clusters = rankClusters(scanResult, dismissed);
-    if (clusters.length === 0) return;
-    // The pass hashes what the gallery draws, so the gallery has to be the
-    // visible view — the snapshot API rasterises the window, not the DOM.
-    if (editorTab !== "components") set({ editorTab: "components" });
-    set({ visualPass: { done: 0, total: 0 } });
-    try {
-      const { scores, hashes } = await runVisualPass(
-        clusters,
-        (done, total) => set({ visualPass: { done, total } }),
-        () => get().visualPass === null || get().scanResult !== scanResult,
-      );
-      if (get().scanResult !== scanResult) return; // rescanned meanwhile
-      set({
-        visualScores: { ...get().visualScores, ...scores },
-        visualHashes: { ...get().visualHashes, ...hashes },
-      });
-    } finally {
-      set({ visualPass: null });
-    }
-  },
-
-  /** Stop the pass — `runVisualPass` polls this flag between captures. */
-  cancelVisualPass: () => set({ visualPass: null }),
-
-  // --- Guarded merge (FR-5.4 → FR-5.7) --------------------------------------
-
-  startMerge: async (clusterId) => {
-    const { project, scanResult, merge } = get();
-    if (!project || merge) return; // one merge at a time, by design
-    const cluster = scanResult?.clusters.find((c) => c.id === clusterId);
-    if (!cluster) return;
-    const members = cluster.members.map((m) => ({ name: m.name, file: m.file }));
-    set({
-      merge: {
-        clusterId,
-        members,
-        stage: "planning",
-        plan: null,
-        proposal: null,
-        preview: null,
-        gates: [],
-        runningGate: null,
-        error: null,
-        commit: null,
-        rollbackReason: null,
-      },
-    });
-    try {
-      const plan = await apiMergePlan(project.root, members);
-      if (get().merge?.clusterId !== clusterId) return; // cancelled meanwhile
-      if (!plan.ok) throw new Error(plan.error ?? "the merge plan failed");
-      patchMerge(set, get, { plan });
-      await get().reproposeMerge();
-    } catch (e) {
-      patchMerge(set, get, { stage: "failed", error: errorText(e) });
-    }
-  },
-
-  reproposeMerge: async () => {
-    const { project, merge } = get();
-    if (!project || !merge?.plan) return;
-    const backend = aiBackend(get());
-    if (!backend) {
-      patchMerge(set, get, {
-        stage: "failed",
-        error:
-          "A merge proposal needs an AI backend — switch an agent on, or add an API key, in the AI menu (top bar).",
-      });
-      return;
-    }
-    patchMerge(set, get, { stage: "proposing", error: null });
-    try {
-      const reply = await runMergePrompt(backend, merge.plan);
-      if (get().merge?.clusterId !== merge.clusterId) return;
-      const proposal = parseMergeReply(reply, merge.plan);
-      patchMerge(set, get, { proposal });
-      await refreshPreview(set, get);
-    } catch (e) {
-      patchMerge(set, get, { stage: "failed", error: errorText(e) });
-    }
-  },
-
-  editProposal: async (source) => {
-    const merge = get().merge;
-    if (!merge?.proposal) return;
-    patchMerge(set, get, {
-      proposal: { ...merge.proposal, source },
-      stage: "planning",
-    });
-    await refreshPreview(set, get);
-  },
-
-  confirmMerge: async () => {
-    const { project, merge, routes, devStatus } = get();
-    if (!project || !merge?.proposal || merge.stage !== "review") return;
-    const { proposal } = merge;
-    // The one save that never writes in place. Its gates undo a failed merge
-    // by restoring the commit — without git, a merge that fails its typecheck
-    // or build would stay applied, which is the codebase corruption the
-    // gates exist to prevent.
-    if (get().git?.isRepo === false) {
-      patchMerge(set, get, {
-        error:
-          "A merge needs git: if it fails its checks, dedup undoes it by restoring the commit. Use “Set up git” in the top bar first.",
-      });
-      return;
-    }
-
-    patchMerge(set, get, { stage: "applying", error: null, gates: [] });
-    // The "before" side of the visual gate has to be taken while the old
-    // code is still what the canvas is rendering — after the write, it is
-    // gone. Nothing else in the merge can happen first.
-    let capturedBefore: string[] = [];
-    try {
-      await visualForget("merge:");
-      capturedBefore = await captureArtboards("before", routes);
-    } catch {
-      // No captures = no visual gate; runVisualGate reports that as skipped.
-    }
-
-    try {
-      const preview = await mergeApply(
-        project.root,
-        { name: proposal.name, file: proposal.file, source: proposal.source },
-        proposal.mapping,
-        false,
-      );
-      if (!preview.ok) throw new Error(preview.error ?? "the merge could not be applied");
-
-      const message = `dedup: merge ${merge.members
-        .map((m) => m.name)
-        .join(", ")} → ${proposal.name}`;
-      // Commit every path the merge touched, including the files it retired,
-      // so the commit is a complete unit that a single revert can undo.
-      const paths = [
-        ...new Set([...(preview.written ?? []), ...(preview.retired ?? [])]),
-      ];
-      const [, commit] = await commitSession(project.root, message, paths);
-      patchMerge(set, get, { preview, commit, stage: "gating" });
-      gitStatus(project.root).then((g) => set({ git: g })).catch(() => {});
-
-      // Structural rewrite across files: ordinals everywhere shifted, so the
-      // canvas must re-read its tags rather than trust the DOM it has.
-      sendToOverlay({ type: "reload" });
-      set({ selected: null, sourceInfo: null, actions: [], redoStack: [] });
-
-      // --- gates (FR-5.6) ---
-      const gates: GateResult[] = [];
-      // 1 + 2: the project's own typecheck and build.
-      const buildGates = await runBuildGates(project.root, (kind) =>
-        patchMerge(set, get, { runningGate: kind }),
-      );
-      gates.push(...buildGates);
-      // The live compile is a second, faster read on the same question — it
-      // is what catches a break on the page the user is looking at.
-      gates.push(hmrGate(devStatus === "ready", get().errors, 0));
-      patchMerge(set, get, { gates: [...gates], runningGate: "visual" });
-
-      // 3: the visual pass, against the artboards captured above.
-      const capturedAfter = await captureArtboards("after", routes);
-      gates.push(
-        await runVisualGate({ before: capturedBefore, after: capturedAfter }),
-      );
-      patchMerge(set, get, { gates: [...gates], runningGate: null });
-
-      if (!gatesPassed(gates)) {
-        await get().rollbackMerge(gateSummary(gates));
-        return;
-      }
-      patchMerge(set, get, { stage: "done" });
-      void get().loadHistory();
-      void get().loadTrash();
-    } catch (e) {
-      // A failure after the commit landed still has to be undone.
-      if (get().merge?.commit) await get().rollbackMerge(errorText(e));
-      else patchMerge(set, get, { stage: "failed", error: errorText(e) });
-    }
-  },
-
-  rollbackMerge: async (reason) => {
-    const { project, merge } = get();
-    if (!project || !merge) return;
-    patchMerge(set, get, { stage: "applying", rollbackReason: reason });
-    try {
-      // Files first: the commit's revert restores the retired sources, and
-      // the trash copy would otherwise linger as a duplicate of a live file.
-      if (merge.commit) await revertCommit(project.root, merge.commit);
-      const staged = merge.preview?.trashed ?? [];
-      if (staged.length > 0) {
-        await mergeTrash(project.root, "restore", staged).catch(() => {});
-        // The revert already put the files back; drop the staged copies
-        // rather than leaving two spellings of the same source on disk.
-        await mergeTrash(project.root, "empty").catch(() => {});
-      }
-      sendToOverlay({ type: "reload" });
-      gitStatus(project.root).then((g) => set({ git: g })).catch(() => {});
-      patchMerge(set, get, { stage: "rolledback", rollbackReason: reason });
-      void get().loadHistory();
-      void get().loadTrash();
-    } catch (e) {
-      patchMerge(set, get, {
-        stage: "failed",
-        error: `the merge failed (${reason}) and the rollback also failed: ${errorText(
-          e,
-        )} — your work is on the session branch; \`git log\` and revert by hand`,
-      });
-    }
-  },
-
-  cancelMerge: () => {
-    void visualForget("merge:").catch(() => {});
-    set({ merge: null });
   },
 
   loadHistory: async () => {
@@ -4699,10 +4108,49 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  toggleHistory: (open) => {
-    const next = open ?? !get().historyOpen;
-    set({ historyOpen: next });
-    if (next) void get().loadHistory();
+  loadSync: async () => {
+    const { project } = get();
+    if (!project) return;
+    const root = project.root;
+    try {
+      const sync = await gitSyncStatus(root);
+      // The project can have been closed, or another opened, meanwhile.
+      if (get().project?.root === root) set({ sync });
+    } catch {
+      if (get().project?.root === root) set({ sync: null });
+    }
+  },
+
+  // Pushing and landing are the two things dedup does outside its session
+  // branch. Both are reached only from a confirm in the Commit tab that names
+  // the branch and remote, and both move *commits*: staged edits are not on
+  // disk and a chat preview is not committed, so neither can travel. The
+  // refusals live in Rust (publish.rs); these only relay them.
+  pushBranch: async (remote, branch) => {
+    const { project } = get();
+    if (!project) return;
+    try {
+      await gitPush(project.root, remote, branch);
+    } finally {
+      // Also after a failure: a rejected push is usually news about the remote.
+      await get().loadSync();
+    }
+  },
+
+  landOn: async (target) => {
+    const { project, sync } = get();
+    if (!project) return 0;
+    if (!sync?.branch || !sync.onSession) {
+      throw new Error("This isn't a dedup session branch, so there is nothing to bring across.");
+    }
+    try {
+      const res = await gitLand(project.root, sync.branch, target);
+      return res.commits;
+    } finally {
+      gitStatus(project.root).then((g) => set({ git: g })).catch(() => {});
+      await get().loadSync();
+      await get().loadHistory();
+    }
   },
 
   revertEntry: async (hash) => {
@@ -4710,34 +4158,10 @@ export const useStore = create<AppState>((set, get) => ({
     if (!project) return;
     await revertCommit(project.root, hash);
     sendToOverlay({ type: "reload" });
-    set({ selected: null, sourceInfo: null });
+    set({ selected: null, multi: [], sourceInfo: null });
     gitStatus(project.root).then((g) => set({ git: g })).catch(() => {});
     await get().loadHistory();
-  },
-
-  loadTrash: async () => {
-    const { project } = get();
-    if (!project) return;
-    try {
-      const res = await mergeTrash(project.root, "list");
-      set({ trash: res.files ?? [] });
-    } catch {
-      set({ trash: [] });
-    }
-  },
-
-  restoreTrash: async (files) => {
-    const { project } = get();
-    if (!project) return;
-    await mergeTrash(project.root, "restore", files ?? null);
-    await get().loadTrash();
-  },
-
-  emptyTrash: async () => {
-    const { project } = get();
-    if (!project) return;
-    await mergeTrash(project.root, "empty");
-    await get().loadTrash();
+    void get().loadSync();
   },
 
 }));

@@ -1,8 +1,8 @@
 # dedup — working notes for agents
 
 macOS Tauri 2 app: opens a React+Tailwind codebase, Figma-style inspection and
-Tailwind editing with AST write-back, and (the differentiator) duplicate
-component detection + guarded merging. **Read `dedup-mvp-prd.md` before
+Tailwind editing with AST write-back and AI chat edits.
+Deduplication was removed on 2026-11-10; earlier progress entries are historical. **Read `dedup-mvp-prd.md` before
 non-trivial work; check `PROGRESS.md` for phase status, decisions already
 made, and known limitations — don't re-litigate settled decisions.**
 
@@ -15,19 +15,18 @@ pnpm build:plugin       # bundle plugin-src/ → src-tauri/assets/ (REQUIRED aft
 pnpm test:plugin        # tagger + write-back smoke tests (tests the BUILT bundles)
 pnpm test:overlay       # overlay load + select/stage paths against a stub DOM
 pnpm test:actions       # staged program → write-back ops (incl. insert folding)
-pnpm test:scan          # duplicate-scan bundle tests
 pnpm test:tw            # tailwind class⇄knob mapping tests
 pnpm test:errors        # dev-server output → build-error parsing
 pnpm test:origins       # which session (origin) a page artboard renders under
 pnpm test:chat          # chat agent: tool protocol + multi-file edit parse/apply
-pnpm test:merge         # guarded-merge codemod (tests the BUILT bundle)
-pnpm test:proposal      # merge proposal parse + review diff + gate rules
 pnpm test:highlight     # code-panel syntax colouring (round-trip invariant)
 pnpm test:html          # static sites: HTML walk/stamp/write-back + the server
 pnpm test:prompts       # chat composer: ↑/↓ prompt history state machine
 pnpm test:mentions      # chat composer: which agent `@claude`/`@codex` routes to
 pnpm test:parking       # parked canvas pieces + one-gesture undo (lib/parking, lib/undo)
-pnpm test:openprefs     # when the compatibility card is shown on open
+pnpm test:marquee       # what a marquee selects (plugin-src/marquee.mjs) + multi-selection rules
+pnpm test:commit        # Commit tab: the one list, the message, when push/land are offered
+pnpm test:openprefs     # when opening a project stops to ask (command / dirty tree)
 pnpm test:canvas        # the canvas a project reopens with (routes + choices)
 pnpm test:annotate      # canvas markup: rough.js geometry + what a mark stores
 pnpm test:frame         # frame-blocking response headers the canvas must relax
@@ -55,13 +54,15 @@ cargo test              # from src-tauri/ — all Rust tests
   plugin assets into the user's `node_modules/.dedup/`, rewrites vite launch),
   `sidecar.rs` (one-shot node runner for write-back), `git.rs` (session
   branch + scoped commits), `session.rs` (mock-session seed for zero-login
-  editing + the auth-context scanner that feeds its AI draft), `merge.rs`
-  (guarded-merge sidecar runner, the typecheck/build gates, session history +
-  rollback), `asset.rs` (the gated copy of an agent-generated image into the
+  editing + the auth-context scanner that feeds its AI draft), `history.rs`
+  (session save history and scoped undo), `publish.rs` (push a named branch;
+  fast-forward the user's branch to the session — the only git that leaves
+  the session branch), `asset.rs` (the gated copy of an agent-generated image into the
   project), `scaffold.rs` (the two starters written into an empty folder),
-  `visual.rs` (PNG diff for the regression gate, perceptual hash
-  for the visual similarity signal), `export.rs` (an artboard as PNG or
-  vector PDF, rendered off-screen at its real size).
+  `export.rs` (an artboard as PNG or
+  vector PDF, rendered off-screen at its real size), `appmenu.rs` (the menu
+  bar: Tauri's default menu plus Settings… ⌘,), `terminal.rs` (the console
+  drawer's shells: the user's login shell on a PTY in the project root).
 - **Two kinds of project.** A *node* project (Vite/Next) runs the user's own
   dev server with dedup's tagger injected into the build. A *static* project (a
   folder of `.html` files, `Framework::Static`) has no build to inject into, so
@@ -70,20 +71,32 @@ cargo test              # from src-tauri/ — all Rust tests
   exist only in what the browser receives — reached by a shorter road. It
   announces its URL in Vite's format on purpose, so `devserver.rs` needs no
   second code path for it.
+- **Every folder opens; there is no compatibility verdict** (owner's decision,
+  2026-11-10). `project::detect` describes, it does not grade: `framework` is
+  only *how dedup drives it* (`Unknown` = run the project's own server as
+  written, untagged), `stack` is what it is called, and `runnable` is the one
+  thing that can make opening stop — to ask for a command, never to refuse.
+  What dedup cannot do for a project is said inside the editor, beside the
+  thing that is off (the instrumentation event), not at the door. Don't
+  reintroduce a grade, a struck-out capability chip, or a "first open" card:
+  `reasonToAsk` (`lib/openPrefs.ts`) returns only `needs-command` and
+  `needs-ack`. Backend markers (`manage.py`, `artisan`, `bin/rails`…) are
+  checked **before** the JS heuristics on purpose — Laravel depends on `vite`
+  and Rails ships `public/404.html`. And opening wider did not widen the write
+  gate: `validateContent` still refuses any file type it has no check for.
 - An empty folder is not an unsupported project, it is a project that does not
   exist yet: `project::detect` reports `is_empty` before any heuristic runs, and
   the launch screen offers a starter (`scaffold.rs`) instead of a verdict.
 - `plugin-src/` — JS that runs *inside the user's project*: `jsxwalk.mjs` (the
   shared JSX traversal defining element ids + what may be done to each node),
   `tagcode.mjs` (the one stamping transform, shared by both build pipelines),
-  `tagger.mjs` (Vite plugin + harness/routes/session routes), `next.mjs` +
+  `tagger.mjs` (Vite plugin + routes/session routes), `next.mjs` +
   `next-loader.mjs` (the Next config wrapper and its webpack loader),
   `overlay.js` (in-iframe hover/select/staged-program preview/drag-to-reparent
   + postMessage bridge), `writeback.mjs` (AST inspect + copy + edit
-  programs: class/text/insert/remove/move), `files.mjs` (the one project traversal the
-  scan and the merge share), `resolve.mjs` (import-specifier resolution:
-  relative, tsconfig `paths`, `baseUrl`), `merge.mjs` (the guarded-merge
-  codemod). Bundled self-contained by `build.mjs` — never depends on the
+  programs: class/text/insert/remove/move), `files.mjs` (shared project traversal and parsing),
+  `marquee.mjs` (which elements a marquee selects — pure, bundled into the overlay),
+  bundled self-contained by `build.mjs` — never depends on the
   user's node_modules.
 - `plugin-src/` (static sites): `htmlwalk.mjs` (the shared HTML traversal —
   htmlwalk is to HTML exactly what jsxwalk is to JSX), `htmltag.mjs` (the
@@ -99,15 +112,14 @@ cargo test              # from src-tauri/ — all Rust tests
   `lib/errors.ts` (dev-server stream → build errors), `lib/palette.ts`
   (insertable elements + the one-element snippet rewriter), `lib/bridge.ts`
   (iframe messaging),
-  `lib/mergeProposal.ts` (the model boundary: prompt + strict reply parsing),
   `lib/chat.ts` + `lib/chatEdits.ts` (the chat agent's boundary: prompt, tool
   protocol, and the strict parse of what comes back),
   `lib/promptHistory.ts` (the composer's ↑/↓ walk, pure so it can be tested),
   `lib/annotate.ts` (canvas markup: rough.js geometry, seeds, storage),
-  `lib/mergeFlow.ts` (the gate runner), `lib/diff.ts` (the review diff),
-  `lib/visualPass.ts` (perceptual-hash similarity over the rendered gallery),
-  `components/` (LaunchScreen/Editor/Canvas/AnnotationLayer/Inspector/
-  StylePanel/ReviewPanel/MergeReview/History/NextSetup).
+  `lib/diff.ts` (the review diff), `lib/commitTab.ts` (the Commit tab's list,
+  message and push/land rules, pure),
+  `components/` (LaunchScreen/ProjectDetails/Editor/Canvas/AnnotationLayer/
+  Inspector/StylePanel/Sidebar → Pages/Layers/CommitTab/NextSetup).
 
 ## Gotchas (hard-won)
 
@@ -345,18 +357,6 @@ cargo test              # from src-tauri/ — all Rust tests
   a program deletes *before* the op loop and refuse an insert whose anchor is
   being deleted or whose insertion point falls inside something that is. Before
   the loop, not during it: the two ops arrive in either order.
-- **A merge is the one place a bug corrupts a codebase.** Its rules are not
-  negotiable and are each covered by a test: every output file is re-parsed
-  *before any file is written* (all-or-nothing across files, the same guarantee
-  the class write-back makes within one file); a call site only counts when its
-  binding resolves to the member's file through a real import — a name match is
-  not a call site; and the model's reply crosses one narrow boundary
-  (`lib/mergeProposal.ts`), never the codemod's decisions about what to rewrite
-  or delete. When adding to it, add the refusal and its test first.
-- **A gate that could not run is not a gate that passed.** `skipped` is a real
-  verdict with a reason attached (no typecheck script, no build script, no
-  artboard on screen), and it must survive into the summary line. Rounding it
-  up to a pass is the failure mode the whole phase exists to prevent.
 - **A save must never land on disk and then report failure.** `saveAll` and
   `saveCode` write first and commit second, so in a folder with no git the
   write succeeded, the commit threw, and the edit stayed staged under a save
@@ -374,7 +374,7 @@ cargo test              # from src-tauri/ — all Rust tests
   Rust while the user has one open.
 - **`git commit -- <path>` takes a pathspec, and a pathspec only matches files
   git already knows.** Any dedup path that can be a *new* file — a chat agent
-  creating a component or a page, a merge writing into a new file — must be
+  creating a component or a page — must be
   `git add`ed first or the whole commit dies with "did not match any file(s)
   known to git", after the file is already on disk. `git::commit_paths` stages
   exactly the untracked paths in the set and no others: for a tracked path the
@@ -383,7 +383,36 @@ cargo test              # from src-tauri/ — all Rust tests
   listed as untracked is `.gitignore`d, and is refused with that reason rather
   than force-added — overriding an ignore rule the user wrote down is not
   dedup's call.
-- Merge rollback restores the commit's own paths and commits that — never
+- **Push and land are the only git that leaves the session branch**
+  (`publish.rs`, owner's decision 2026-11-10), and the rules are structural,
+  not checks to remember. Both take the branch and remote **by name** from a
+  confirm in the Commit tab that spells the sentence out — never "whatever is
+  configured", never as a side effect of a save. Push builds its own refspec
+  (`refs/heads/x:refs/heads/x`), so there is no `+` and no way to force; a
+  rejected push stays rejected. Land is **fast-forward or refuse**, done by
+  moving the target's *ref* (`update-ref` compare-and-swap) with the target
+  not checked out — HEAD, index and files never move, so the user's
+  uncommitted work and a chat preview cannot be swept in by construction.
+  The one path that moves files is "target is checked out in this folder",
+  and it requires a clean tree; checked out in another worktree is refused.
+  Diverged is a refusal on purpose: a merge commit is a tree nobody has seen
+  rendered. Don't add `--force`, `-u`, `--no-verify`, a fetch, or a merge
+  here without a new decision. Each refusal has a test; add the refusal first.
+- **`SyncStatus` never touches the network.** "Behind the remote" is as of
+  the user's last fetch and the tab says so; the push is what finds out.
+  Remote URLs are stripped of `user:token@` before they reach the UI.
+- **A save commits whole files, so it must not run over a chat preview.**
+  `git commit -- <path>` takes the file as it is on disk; a staged edit saved
+  into a file a live preview has changed would commit the AI's edit
+  unaccepted. `previewClash` (`lib/commitTab.ts`) stops `saveAll` and
+  `saveCode`, and blocks Undo on a commit whose file holds a preview (the
+  restore would overwrite it). A new save path needs the same check.
+- **`saveAll` takes an optional message — never wire it straight to
+  `onClick`**, or the "message" is a MouseEvent. It checks `typeof`, and the
+  type makes `onClick={saveAll}` a compile error; keep both. Whatever the
+  user types, the subject is `dedup: …` (`commitMessage`): that prefix is how
+  history and undo tell dedup's commits from the user's.
+- History undo restores the commit's own paths and commits that — never
   `git revert`, which demands a clean tree and would involve the user's
   in-flight work.
 - The Vite plugin and the Next webpack loader both call `tagcode.mjs` and
@@ -433,11 +462,6 @@ cargo test              # from src-tauri/ — all Rust tests
 - **The bundle tests test the built bundles.** After editing anything under
   `plugin-src/`, run `pnpm build:plugin` before the suites, or you will be
   testing the previous build and drawing conclusions from it.
-- The visual similarity hash is median-thresholded aHash, **not** dHash. dHash
-  only sees horizontal gradients, so a component with a dark left column and
-  one with a dark top row hash identically — and UI is mostly flat,
-  axis-aligned blocks. Both invariants are pinned by tests; don't "simplify"
-  it back.
 - Route discovery has two callers — the Vite plugin's `/__dedup/routes`
   middleware and the write-back sidecar's `routes` command — because Next has
   no middleware dedup can add. It lives in `plugin-src/routes.mjs`; a copy in
@@ -463,6 +487,44 @@ cargo test              # from src-tauri/ — all Rust tests
   confident lie. Grid is deliberately not guessed at. The dragged element's
   fade is inline and restored to what was found, and every way a drag can end
   (pointerup, Escape, blur) must clear all three — `test:overlay` walks them.
+- **In the select tool a drag is one of two gestures, decided at the press**
+  (settled 2026-11-10, when the marquee landed). A press *inside the single
+  selected element* picks that element up — the re-parent drag, unchanged from
+  there on (ghost, capture, park, cross-artboard). Every other press-and-drag
+  draws a **marquee**; Shift always means marquee, and adds to the selection;
+  with several selected a drag is always a marquee. `dragOwner` in the overlay
+  is the whole rule. It replaced "any press on any element is a drag" because
+  a page has no empty space — every pixel is inside some element — so that
+  rule left nowhere to start a marquee from. The cost, on purpose: moving an
+  element is now select, then drag (Figma's order), and the grab cursor is
+  offered only over the selection. Three things that are easy to break: a
+  marquee release is never also a click (`suppressClick`, spent by the click
+  the browser fires next, reset by the next press) or a `drop` (its branch
+  returns before the drag's); Escape mid-marquee is *not* forwarded, or it
+  would also deselect what was there before; and every way it can end —
+  release, Escape, blur, leaving the tool — hides the box. `test:overlay`
+  walks them.
+- **What a marquee selects is one pure function** (`marqueeHits`,
+  `plugin-src/marquee.mjs`), which is why `build.mjs` now *bundles* the overlay
+  instead of copying it. Outermost wins; a *container* that encloses the
+  marquee is looked through (a drag inside a section must not select the
+  section), a leaf that encloses it is selected (nothing to look through to),
+  and an element the marquee misses is still descended into (overflowing
+  children, `display: contents`). The overlay is still one script that must
+  not throw while evaluating — the import only moved where one function lives.
+- **A multi-selection is `multi`, and `selected` is null while it is not
+  empty** (`lib/store.ts`; the overlay mirrors it as `multiEls` / `selectedEl`).
+  That invariant is the safety: class edits, text, resize grips, the paste
+  anchor and chat context all read `selected`, so none of them can quietly act
+  on one element of several. Anything that sets `selected: null` must also set
+  `multi: []`. What *is* offered for several — ⌫, ⌘C, ⌘X — goes through the
+  same `captureClip` / `stageRemoval` / `stagePaste` as one element, shares a
+  `gesture` id (one undo), is all-or-nothing (one element the write-back won't
+  remove refuses the gesture; a `stage` refusal part-way puts the program
+  back), and acts on `outermostOnly` — a shift-click can select a parent and
+  its child, and deleting both is a program the write-back refuses. A
+  selection is unique by dedup id and never spans artboards; the frame that
+  reports one is the only one that keeps it.
 - **Clicks inside an artboard never reach the canvas root** — they happen in
   another document and arrive as overlay messages instead. So the canvas root's
   own click handler only ever sees empty canvas or its floating chrome, which
@@ -528,7 +590,7 @@ cargo test              # from src-tauri/ — all Rust tests
   closed and reordered. Nothing in this path can reach the user's source, and
   the gesture hint says so.
 - The chrome floats over a full-bleed canvas. Anything that positions content
-  on the canvas (initial pan, focus-a-route, the Components gallery) must inset
+  on the canvas (initial pan, focus-a-route) must inset
   by the live panel widths, or it lands under a panel. `.panel` in `styles.css`
   is the single definition of that elevation — new floating surfaces use it
   rather than re-deriving a shadow.
@@ -549,6 +611,16 @@ cargo test              # from src-tauri/ — all Rust tests
   failure is still silent. Known gap: a header set by a Next `middleware.ts`
   is out of a config wrapper's reach.
 
+- **The menu bar is Tauri's default menu with one item added, never a
+  hand-built one.** On macOS ⌘C/⌘V/⌘Z/⌘A in a text field *are* Edit-menu
+  items — a web view does not do them on its own — so a menu written from
+  scratch that forgot one breaks copy and paste in every input. `appmenu.rs`
+  inserts **Settings… ⌘,** after About and emits `open-settings`; the Settings
+  page (`components/Settings.tsx`) mounts at the app root, over the launch
+  screen as well as the editor. AI backends live there and only there — the
+  top bar has no AI control (the chat links to Settings when nothing is on).
+  Being a native
+  accelerator, ⌘, works even with focus inside a canvas iframe.
 - **An artboard export is a render, not a crop.** `thumbs::snapshot_png`
   rasterises a region of the app window — right for before/after diffs,
   wrong for a deliverable (canvas zoom, the window edge, a floating panel over
@@ -565,6 +637,14 @@ cargo test              # from src-tauri/ — all Rust tests
   artboard. `takeSnapshot`'s width is in *points* and returns at the screen's
   backing scale (`snapshot_width_pt`). Staged edits are not in an export —
   the overlay previews them, the files don't have them — and the notice says so.
+- **A terminal is the user's, and only the user's.** Each console-drawer
+  shell lives exactly as long as its `TerminalPane` — mount opens the PTY,
+  unmount hangs it up — so panes stay mounted (hidden) while the drawer is
+  folded, and nothing may key a pane on anything but the tab. Nothing in dedup
+  writes to one: the chat agent having no tools is the design, and a shell is
+  the least audited path to the source there is. PTY output is raw bytes all
+  the way to xterm; decoding it anywhere earlier splits characters that
+  straddle two reads.
 - tauri-dev hot-restarts kill the app hard → the user-project dev server can
   be orphaned. Check `lsof -nP -iTCP:5173 -sTCP:LISTEN` after restarts; kill
   leftovers.
@@ -597,8 +677,6 @@ cargo test              # from src-tauri/ — all Rust tests
   that there is no branch or commit to undo it — once per session, with "Set
   up git" offered beside "Replace files". Every save path goes through
   `needsDirectWriteWarning` + `commitOrDirect`; a new save path must too.
-  **Merges never write in place**: their gates undo a failure by restoring the
-  commit, so without git a failed merge would stay applied.
 - User's source/config are never mutated for tooling — everything injected
   lives in `sidecar::support_dir` (see the gotcha) or is served virtually.
   Scaffolding a starter into an **empty** folder is not an exception to that

@@ -2,6 +2,7 @@
 // Run: pnpm test:tw  (node --experimental-strip-types)
 import assert from "node:assert/strict";
 import {
+  pageColor,
   KNOBS,
   cssColor,
   fromTokens,
@@ -210,6 +211,24 @@ test("a corner grip sets both axes", () => {
   assert.match(out, /w-\[300px\]/);
   assert.match(out, /h-\[180px\]/);
   assert.match(out, /rounded/);
+});
+
+test("a project token's colour comes from the page, for the class it was read with", () => {
+  const el = {
+    domClassName: "flex bg-primary text-muted-foreground/80 border-border",
+    colors: { background: "rgb(37, 99, 235)", text: "oklch(0.5 0 0 / 0.8)", border: "rgb(1, 2, 3)" },
+  };
+  assert.equal(pageColor("primary", "bg", el), "rgb(37, 99, 235)");
+  assert.equal(pageColor("muted-foreground/80", "text", el), "oklch(0.5 0 0 / 0.8)");
+  assert.equal(pageColor("border", "border", el), "rgb(1, 2, 3)");
+  // The user staged a different fill: the snapshot is about the old one.
+  assert.equal(pageColor("secondary", "bg", el), null);
+  // A prefix is not a match (`bg-primary` is not `bg-primary-foreground`).
+  assert.equal(pageColor("primary-foreground", "bg", el), null);
+  // No fill, no selection, or an overlay that predates the report.
+  assert.equal(pageColor(null, "bg", el), null);
+  assert.equal(pageColor("primary", "bg", null), null);
+  assert.equal(pageColor("primary", "bg", { domClassName: "bg-primary" }), null);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? " (with failures)" : ""}`);

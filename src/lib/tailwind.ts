@@ -255,3 +255,32 @@ export function cssColor(value: string | null): string | null {
   if (/^[a-z]+-(?:50|[1-9]00|950)$/.test(v)) return `var(--color-${v}, transparent)`;
   return null;
 }
+
+/**
+ * The colour the page actually painted for a colour token, when it is known.
+ *
+ * `cssColor` can only resolve what the editor's own theme knows: the stock
+ * palette and arbitrary values. A project token — `bg-primary`, `text-muted`,
+ * anything with an opacity suffix, or a palette name the project redefined —
+ * resolves only inside the page, so the overlay reports the computed colours
+ * with the selection.
+ *
+ * That report is a snapshot, and it is trusted only for the class it was
+ * taken with: once the user stages a different fill, the snapshot describes
+ * the old one, and the token's own resolution (or nothing) is the honest
+ * answer until the element is selected again.
+ */
+export function pageColor(
+  token: string | null,
+  prefix: "bg" | "text" | "border",
+  el: {
+    domClassName: string;
+    colors?: { background: string | null; text: string | null; border: string | null };
+  } | null,
+): string | null {
+  if (!token || !el?.colors) return null;
+  if (!el.domClassName.split(/\s+/).includes(`${prefix}-${token}`)) return null;
+  const css =
+    prefix === "bg" ? el.colors.background : prefix === "text" ? el.colors.text : el.colors.border;
+  return css || null;
+}

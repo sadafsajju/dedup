@@ -1,5 +1,5 @@
-//! Coding-agent CLI bridge — lets dedup's AI features (categorization, mock
-//! props, seed drafts, merge proposals) run through an agent the user already
+//! Coding-agent CLI bridge — lets chat edits and session-seed drafts
+//! run through an agent the user already
 //! has installed and signed into, instead of a raw API key.
 //!
 //! One shape, two agents: spawn a headless single-shot invocation, feed the

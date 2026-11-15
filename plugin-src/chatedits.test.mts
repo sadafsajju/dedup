@@ -262,7 +262,7 @@ test("ASSET names a file the agent generated, alongside the markup using it", ()
   const r = parseChatReply(
     [
       "<<<<<<< ASSET public/hero.png",
-      "/Users/admin/.codex/generated_images/abc/exec-def.png",
+      "/Users/me/.codex/generated_images/abc/exec-def.png",
       ">>>>>>> END",
       "<<<<<<< SEARCH index.html",
       "  <header>",
@@ -277,7 +277,7 @@ test("ASSET names a file the agent generated, alongside the markup using it", ()
   assert.deepEqual(r.assets, [
     {
       file: "public/hero.png",
-      source: "/Users/admin/.codex/generated_images/abc/exec-def.png",
+      source: "/Users/me/.codex/generated_images/abc/exec-def.png",
     },
   ]);
   assert.equal(r.blocks.length, 1, "the edit using it rides along");

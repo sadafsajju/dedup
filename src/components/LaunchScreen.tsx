@@ -11,8 +11,8 @@ import {
 } from "../lib/api";
 import { useStore } from "../lib/store";
 import type { Framework, GitStatus, ProjectInfo, RecentProject } from "../lib/types";
-import { CompatCard } from "./CompatCard";
-import { forgetOpen, prefFor, reasonToShowCard, rememberOpen } from "../lib/openPrefs";
+import { ProjectDetails } from "./ProjectDetails";
+import { forgetOpen, prefFor, reasonToAsk, rememberOpen } from "../lib/openPrefs";
 import { forgetCanvas } from "../lib/canvasMemory";
 import { StarterPicker } from "./StarterPicker";
 import { CubeIcon, Cross2Icon, GearIcon } from "@radix-ui/react-icons";
@@ -26,7 +26,9 @@ const FRAMEWORK_LABEL: Record<Framework, string> = {
   vite: "Vite",
   next: "Next.js",
   static: "HTML",
-  unknown: "React",
+  // dedup runs these on their own dev server; the recents list only stores
+  // how a project is driven, not what it is called.
+  unknown: "App",
 };
 
 /** "Edited" line under a card: Figma-ish, coarse on purpose. */
@@ -122,9 +124,9 @@ export function LaunchScreen() {
   }, [loadRecents]);
 
   /**
-   * Open a project. `force` shows the compatibility card even when dedup has
-   * nothing new to say about this project — the deliberate way back to the
-   * custom dev command and the verdict.
+   * Open a project. It goes straight in unless there is a question only the
+   * user can answer (`reasonToAsk`). `force` shows project details anyway —
+   * the deliberate way back to the start command.
    */
   const inspect = useCallback(async (path: string, force = false) => {
     setError(null);
@@ -134,11 +136,10 @@ export function LaunchScreen() {
         detectProject(path),
         gitStatus(path),
       ]);
-      // The card exists to deliver a verdict and take two acknowledgements.
-      // When the user has already seen this exact verdict, showing it again
-      // teaches them to click through it — so go straight in, carrying the
-      // dev command they set last time.
-      if (!force && reasonToShowCard(info, git) === null) {
+      // An empty folder gets the starter picker. Everything else opens —
+      // carrying the start command they set last time — unless dedup needs a
+      // command it couldn't find or the one-time dirty-tree acknowledgement.
+      if (!info.isEmpty && !force && reasonToAsk(info, git) === null) {
         await confirmOpen(info, git, prefFor(info.root)?.customCommand ?? null);
         return;
       }
@@ -189,8 +190,8 @@ export function LaunchScreen() {
     customCommand: string | null,
   ) {
     await addRecentProject(info.root, info.name, info.framework);
-    // Remember the verdict they just accepted, so the next open is silent
-    // unless something about the project actually changed.
+    // Remember the command and the acknowledgement, so the next open has
+    // nothing left to ask.
     rememberOpen(info, git, customCommand);
     enterEditor(info, git, customCommand);
   }
@@ -199,7 +200,7 @@ export function LaunchScreen() {
     e.stopPropagation();
     e.preventDefault();
     // Nothing about a forgotten project should outlive it — re-adding it
-    // later is a first open again, card included and canvas empty.
+    // later is a first open again: nothing remembered, canvas empty.
     forgetOpen(path);
     forgetCanvas(path);
     await loadRecents(await removeRecentProject(path));
@@ -219,9 +220,9 @@ export function LaunchScreen() {
               </span>
             </div>
             <p className="text-ink-dim mt-1.5 text-[13px] leading-snug">
-              Open a React&nbsp;+&nbsp;Tailwind project to inspect, tune, and
-              merge near-duplicate components. A plain HTML site works too —
-              and an empty folder starts a new one.
+              Open any web project to see it on the canvas and edit it.
+              React&nbsp;+&nbsp;Tailwind and plain HTML get click-to-inspect
+              styling; an empty folder starts a new one.
             </p>
           </div>
           {!empty && (
@@ -342,9 +343,9 @@ export function LaunchScreen() {
                         {meta}
                       </div>
                     </button>
-                    {/* The card is skipped once its verdict has been seen,
-                        so it needs a deliberate way back — it is the only
-                        place the custom dev command lives. */}
+                    {/* Opening goes straight in, so project details need a
+                        deliberate way in — it is the only place the start
+                        command lives. */}
                     <span
                       role="button"
                       tabIndex={-1}
@@ -353,7 +354,7 @@ export function LaunchScreen() {
                         e.preventDefault();
                         void inspect(r.path, true);
                       }}
-                      title="Project details — compatibility and dev command"
+                      title="Project details — start command"
                       className="absolute top-2 right-9 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 rounded bg-surface-0/80 text-ink-dim hover:text-ink p-1 backdrop-blur-sm transition-opacity cursor-default"
                     >
                       <GearIcon width={12} height={12} />
@@ -385,8 +386,7 @@ export function LaunchScreen() {
         </div>
       )}
 
-      {/* An empty folder gets the starter picker, not a verdict — see
-          StarterPicker. Once it has written a starter the folder is a real
+      {/* An empty folder gets the starter picker — see StarterPicker. Once it has written a starter the folder is a real
           project, so it re-enters through the same open path as any other. */}
       {candidate?.info.isEmpty ? (
         <StarterPicker
@@ -399,9 +399,10 @@ export function LaunchScreen() {
         />
       ) : (
         candidate && (
-          <CompatCard
+          <ProjectDetails
             info={candidate.info}
             git={candidate.git}
+            initialCommand={prefFor(candidate.info.root)?.customCommand ?? null}
             onCancel={() => setCandidate(null)}
             onConfirm={(cmd) => confirmOpen(candidate.info, candidate.git, cmd)}
           />

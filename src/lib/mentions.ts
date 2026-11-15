@@ -3,7 +3,7 @@
 // Both agents can be connected at once — each Connect is its own consent — so
 // choosing between them is a property of the *message*, not a global mode the
 // user has to flip and remember to flip back. A message with no mention goes
-// to the default (the top-bar AI switch); a message with one goes to that
+// to the default (the first agent on in Settings → AI); a message with one goes to that
 // agent, for that message only.
 //
 // Pure so the edges can be tested (pnpm test:mentions): which `@` counts, what

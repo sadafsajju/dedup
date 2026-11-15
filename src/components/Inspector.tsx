@@ -1,4 +1,5 @@
 import { PANEL_BOUNDS, useStore } from "../lib/store";
+import { outermostOnly } from "../lib/multiSelect";
 import { parseDedupId } from "../lib/types";
 import { ChatPanel } from "./ChatPanel";
 import { NextSetup } from "./NextSetup";
@@ -185,7 +186,7 @@ function noInspectionReason(
     case "next-optin":
       return `Element inspection needs one line in ${detail ?? "next.config"} — see below.`;
     case "framework":
-      return `${detail ?? "This framework"} isn't instrumented — element inspection needs dedup's tagger in the build. The canvas preview and duplicate Scan still work.`;
+      return `${detail ?? "This framework"} runs on its own dev server, which dedup has no tagger for — so elements can't be clicked to inspect. The canvas is live: the chat and the code panel can edit its JS/TS, CSS and HTML files, and it updates as they change.`;
     case "custom":
       return "The custom dev command runs without dedup's tagging plugin, so element inspection is off. Use the project's plain `vite` dev script to inspect.";
     case "script":
@@ -257,9 +258,86 @@ function SelectionHeader({
   );
 }
 
+/**
+ * Several elements selected. The panel offers only what is safe for all of
+ * them — delete, copy, cut, each as one gesture — and says in words what it
+ * is not offering, because a style panel that quietly edited one of five
+ * selected elements would be worse than none.
+ */
+function MultiSelection() {
+  const multi = useStore((s) => s.multi);
+  const removeSelected = useStore((s) => s.removeSelected);
+  const copySelected = useStore((s) => s.copySelected);
+  const cutSelected = useStore((s) => s.cutSelected);
+  const selectById = useStore((s) => s.selectById);
+  // What a delete or a copy will act on: an element nested inside another
+  // selected one travels with its parent, so it is not counted twice.
+  const acting = outermostOnly(multi);
+  const nested = multi.length - acting.length;
+  return (
+    <div className="flex-1 flex min-h-0 flex-col">
+      <div className="inspector-selection shrink-0 border-b border-line px-3 py-3">
+        <div className="text-[13px] font-semibold">
+          {multi.length} elements selected
+        </div>
+        <div className="mt-1.5 text-2xs text-ink-dim leading-relaxed">
+          Delete, copy and cut apply to all of them, as one step. Classes, text
+          and size are edited one element at a time — click one below to style
+          it.
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        <Section title="Selection" collapsible>
+          <div className="flex flex-col">
+            {multi.map((el) => (
+              <button
+                key={el.dedupId}
+                onClick={() => selectById(el.dedupId)}
+                title={`Select only this — ${el.dedupId}`}
+                className="flex items-center gap-1.5 rounded px-1 py-0.5 text-left text-2xs text-ink-dim hover:bg-surface-2 hover:text-ink"
+              >
+                <span className="truncate">{el.component ?? el.tag}</span>
+                <span className="font-mono text-ink-faint">{el.tag}</span>
+              </button>
+            ))}
+          </div>
+          {nested > 0 && (
+            <div className="mt-1.5 text-2xs text-ink-faint leading-relaxed">
+              {nested} of these {nested === 1 ? "is" : "are"} inside another
+              selected element, and {nested === 1 ? "goes" : "go"} wherever it
+              does.
+            </div>
+          )}
+          <div className="mt-2 flex items-center gap-1">
+            <ActionButton
+              label="Copy"
+              shortcut="⌘C"
+              icon={CopyIcon}
+              onClick={() => void copySelected()}
+            />
+            <ActionButton
+              label="Cut"
+              shortcut="⌘X"
+              icon={ScissorsIcon}
+              onClick={() => void cutSelected()}
+            />
+            <ActionButton
+              label="Delete"
+              shortcut="⌫"
+              icon={TrashIcon}
+              onClick={removeSelected}
+            />
+          </div>
+        </Section>
+      </div>
+    </div>
+  );
+}
+
 export function Inspector() {
   const project = useStore((s) => s.project);
   const selected = useStore((s) => s.selected);
+  const multiCount = useStore((s) => s.multi.length);
   const instrumentation = useStore((s) => s.instrumentation);
   const selectById = useStore((s) => s.selectById);
   const sourceInfo = useStore((s) => s.sourceInfo);
@@ -315,6 +393,8 @@ export function Inspector() {
 
       {tab === "chat" ? (
         <ChatPanel />
+      ) : multiCount > 0 ? (
+        <MultiSelection />
       ) : selected ? (
         <div className="flex-1 flex min-h-0 flex-col">
           <SelectionHeader selected={selected} src={src} sourceInfo={sourceInfo} />
@@ -421,7 +501,7 @@ export function Inspector() {
 
       <div className="inspector-footer border-t border-line px-3 py-2 text-2xs text-ink-faint flex items-center justify-between">
         <span>{project?.hasTailwind ? "Tailwind detected" : "No Tailwind"}</span>
-        <span className="font-mono">{project?.framework}</span>
+        <span className="font-mono">{project?.stack ?? project?.framework}</span>
       </div>
     </aside>
   );

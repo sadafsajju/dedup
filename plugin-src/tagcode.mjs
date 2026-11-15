@@ -24,11 +24,9 @@ import { makeDedupId, walkJsx } from "./jsxwalk.mjs";
  * nodes the write-back would refuse anyway — the affordance is honest before
  * the user pulls on it, with no round-trip to the sidecar.
  *
- * `exportName` (harness only) additionally appends `export { Name };` so a
- * file-local component becomes importable. Exported for tests. Returns
- * { code, map } or null when nothing was changed.
+ * Returns { code, map } or null when nothing was changed.
  */
-export function tagCode(code, relFile, exportName = null) {
+export function tagCode(code, relFile) {
   let ast;
   try {
     ast = parse(code, {
@@ -42,11 +40,6 @@ export function tagCode(code, relFile, exportName = null) {
 
   const s = new MagicString(code);
   let tagged = 0;
-  if (exportName && /^[A-Za-z_$][\w$]*$/.test(exportName)) {
-    s.append(`\nexport { ${exportName} };\n`);
-    tagged++;
-  }
-
   walkJsx(ast.program, (node) => {
     const { opening } = node;
     // Anchor right after the last attribute (or the name/generics when there

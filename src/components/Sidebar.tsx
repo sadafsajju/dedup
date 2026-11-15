@@ -1,14 +1,12 @@
-import { useMemo } from "react";
-import { PANEL_BOUNDS, rankClusters, useStore } from "../lib/store";
+import { PANEL_BOUNDS, useStore } from "../lib/store";
 import type { SidebarTab } from "../lib/types";
+import { isValueAction } from "../lib/types";
 import {
-  CopyIcon,
+  CommitIcon,
   FileTextIcon,
   LayersIcon,
-  MixerHorizontalIcon,
 } from "@radix-ui/react-icons";
-import { DriftTab } from "./Drift";
-import { DuplicatesTab } from "./Duplicates";
+import { CommitTab } from "./CommitTab";
 import { LayersTab } from "./Layers";
 import { PagesTab } from "./Pages";
 import { ResizeHandle, type IconType } from "./ui";
@@ -20,22 +18,21 @@ const TABS: {
 }[] = [
   { id: "pages", label: "Pages", icon: FileTextIcon },
   { id: "layers", label: "Layers", icon: LayersIcon },
-  { id: "duplicates", label: "Duplicates", icon: CopyIcon },
-  { id: "drift", label: "Drift", icon: MixerHorizontalIcon },
+  { id: "commit", label: "Commit", icon: CommitIcon },
 ];
 
 export function Sidebar() {
   const tab = useStore((s) => s.sidebarTab);
   const setTab = useStore((s) => s.setSidebarTab);
-  const scanResult = useStore((s) => s.scanResult);
-  const dismissed = useStore((s) => s.dismissed);
-  const clusterCount = useMemo(
-    () => rankClusters(scanResult, dismissed).length,
-    [scanResult, dismissed],
-  );
-  const driftCount = useStore((s) => s.driftResult?.candidates.length ?? 0);
   const width = useStore((s) => s.panelWidths.sidebar);
   const setPanelWidth = useStore((s) => s.setPanelWidth);
+  // Something is waiting on a decision in the Commit tab: unsaved edits, or
+  // an AI preview that is on disk and committed to nothing.
+  const waiting = useStore(
+    (s) =>
+      s.pendingEdit !== null ||
+      s.actions.some((a) => !isValueAction(a) || a.before !== a.after),
+  );
 
   return (
     <aside
@@ -75,18 +72,14 @@ export function Sidebar() {
               >
                 <Icon width={13} height={13} className="shrink-0" />
                 {/* Label on the active tab only: at the sidebar's real width
-                    three full labels truncate to noise, and the icon already
+                    full labels can truncate, and the icon already
                     carries the identity. */}
                 {tab === t.id && <span className="truncate">{t.label}</span>}
-                {t.id === "duplicates" && clusterCount > 0 && (
-                  <span className="rounded-full bg-accent px-1 text-[9px] leading-3 text-white tabular-nums">
-                    {clusterCount}
-                  </span>
-                )}
-                {t.id === "drift" && driftCount > 0 && (
-                  <span className="rounded-full bg-accent px-1 text-[9px] leading-3 text-white tabular-nums">
-                    {driftCount}
-                  </span>
+                {t.id === "commit" && waiting && (
+                  <span
+                    className="absolute right-1.5 top-1 h-1.5 w-1.5 rounded-full bg-accent"
+                    aria-label="Uncommitted changes"
+                  />
                 )}
               </button>
             );
@@ -94,12 +87,10 @@ export function Sidebar() {
         </div>
       </div>
 
-      {tab === "duplicates" ? (
-        <DuplicatesTab />
-      ) : tab === "drift" ? (
-        <DriftTab />
-      ) : tab === "layers" ? (
+      {tab === "layers" ? (
         <LayersTab />
+      ) : tab === "commit" ? (
+        <CommitTab />
       ) : (
         <PagesTab />
       )}

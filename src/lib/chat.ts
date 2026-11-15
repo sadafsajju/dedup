@@ -13,7 +13,7 @@
 // project inventory and finds its own way — the same conversation either way.
 
 import Anthropic from "@anthropic-ai/sdk";
-import type { AiBackend } from "./categorize";
+import type { AiBackend } from "./types";
 import type { SelectedElement } from "./types";
 
 /**

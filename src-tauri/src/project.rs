@@ -1,6 +1,15 @@
-//! Project detection (FR-1.2): given a folder, work out package manager,
-//! framework, and whether Tailwind / TypeScript are present, then produce a
-//! human-readable compatibility summary the launch screen can show before load.
+//! Project detection (FR-1.2): given a folder, work out what it is and how to
+//! start it — package manager, framework, Tailwind / TypeScript — and describe
+//! it in plain words.
+//!
+//! There is no verdict here. Detection used to grade a project full / partial /
+//! unsupported and the launch screen showed the grade before opening; a folder
+//! dedup had no tagger for was turned away at the door. Now every folder opens:
+//! dedup runs whatever server the project has and shows it on the canvas, and
+//! what it cannot do for *this* project (element inspection needs a tagger) is
+//! said inside the editor, next to the thing that is unavailable, by the
+//! instrumentation event. The one question detection can still leave open is
+//! "how do I start this?" — `runnable` — and that is a question, not a grade.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -27,11 +36,15 @@ pub struct ProjectInfo {
     pub name: String,
     pub package_manager: PackageManager,
     pub framework: Framework,
+    /// What this project is, in the words its author would use ("Astro",
+    /// "Django", "Create React App"). `framework` is how dedup *drives* it and
+    /// has four values; this is what it is called and has many.
+    pub stack: String,
     pub has_tailwind: bool,
     pub has_typescript: bool,
     pub has_git: bool,
     /// True when the folder holds nothing to open — the launch screen offers
-    /// to scaffold a starter into it instead of a compatibility verdict.
+    /// to scaffold a starter into it.
     pub is_empty: bool,
     /// For a static site whose pages don't sit at the root (`site/`, `www/`,
     /// `public/`), the folder the dev server serves — relative to `root`.
@@ -42,17 +55,24 @@ pub struct ProjectInfo {
     /// one — what `instrument::setup` inspects to decide whether it can rewrite
     /// the launch.
     pub dev_script: Option<String>,
-    /// The script's *name* (`dev` or `start`). Carried separately because the
-    /// two are not interchangeable: detection accepts either name, so a project
-    /// with only `start` must be launched as `start`. Running a hardcoded `dev`
-    /// against it reports the project as supported and then fails on a script
-    /// that isn't there.
+    /// The script's *name* (`dev`, `start`, …). Carried separately because
+    /// they are not interchangeable: detection accepts several names, so a
+    /// project with only `start` must be launched as `start`.
     pub dev_script_name: Option<String>,
-    /// Overall verdict + the one-line summary rendered on the compat card.
-    pub support: SupportLevel,
+    /// For a project with no package script to run — a Django, Rails, Laravel,
+    /// Hugo… app — the shell command that starts its dev server. When set it
+    /// is *the* way this project starts (`dev_script` is cleared), so the
+    /// launch never has two answers to choose between.
+    pub run_command: Option<String>,
+    /// False when dedup found no way to start this project. The only thing
+    /// left that makes the launch screen stop and ask — and what it asks is
+    /// "what command starts it?", never "are you sure?".
+    pub runnable: bool,
+    /// One line describing the project ("Astro + Tailwind + TS + pnpm").
     pub summary: String,
-    /// Specific reasons behind a `Partial`/`Unsupported` verdict.
-    pub warnings: Vec<String>,
+    /// Things worth knowing about how dedup will handle this project. Shown
+    /// in project details; none of them stops it opening.
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +97,7 @@ impl PackageManager {
     }
 }
 
+/// How dedup drives a project — not what the project is called (`stack`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Framework {
@@ -86,18 +107,10 @@ pub enum Framework {
     /// itself and stamps the served markup — the file *is* the source, so the
     /// element↔source mapping is 1:1 rather than compiled.
     Static,
+    /// Everything else. dedup runs the project's own server exactly as
+    /// written and shows it on the canvas; there is no tagger for it, so the
+    /// editor reports element inspection as off and says why.
     Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SupportLevel {
-    /// Everything we need is present.
-    Full,
-    /// Loadable, but something is missing or unverified (e.g. no Tailwind).
-    Partial,
-    /// We can't drive this project (no package.json / no dev script / no framework).
-    Unsupported,
 }
 
 /// Entries that don't count as content: a folder holding only these is one
@@ -115,7 +128,7 @@ const IGNORABLE: [&str; 6] = [
 /// empty: the repo is dedup's safety model, not the user's work.
 fn is_empty_folder(root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return false; // unreadable is a different problem, reported as unsupported
+        return false; // unreadable is a different problem
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -182,8 +195,277 @@ fn detect_static_tailwind(root: &Path, dir: &str) -> bool {
     false
 }
 
-/// Inspect `root` and return a compatibility report. Never fails hard — an
-/// unreadable or non-project folder comes back as `Unsupported` with reasons.
+/// Script names that start a dev server, in the order we'd pick. `dev` first:
+/// in a Next project `start` is the *production* server.
+const DEV_SCRIPTS: [&str; 5] = ["dev", "start", "develop", "serve", "storybook"];
+
+/// Dependencies that mean "this project has a dev server of its own", and
+/// what to call it. With one of these and a script to run, the project's
+/// server wins over dedup's static one even when there are `.html` files
+/// lying around — Create React App's `public/index.html` is a template, and
+/// serving it as a flat page shows an empty `<div id="root">`.
+const SERVER_STACKS: [(&str, &str); 17] = [
+    ("astro", "Astro"),
+    ("@remix-run/dev", "Remix"),
+    ("@react-router/dev", "React Router"),
+    ("nuxt", "Nuxt"),
+    ("@sveltejs/kit", "SvelteKit"),
+    ("gatsby", "Gatsby"),
+    ("react-scripts", "Create React App"),
+    ("@angular/core", "Angular"),
+    ("@vue/cli-service", "Vue CLI"),
+    ("@docusaurus/core", "Docusaurus"),
+    ("@11ty/eleventy", "Eleventy"),
+    ("vitepress", "VitePress"),
+    ("expo", "Expo"),
+    ("parcel", "Parcel"),
+    ("@rsbuild/core", "Rsbuild"),
+    ("@rspack/core", "Rspack"),
+    ("webpack-dev-server", "webpack"),
+];
+
+/// UI libraries — a name for the project, never a reason to run it one way
+/// or another.
+const UI_LIBS: [(&str, &str); 6] = [
+    ("vue", "Vue"),
+    ("svelte", "Svelte"),
+    ("solid-js", "Solid"),
+    ("preact", "Preact"),
+    ("@builder.io/qwik", "Qwik"),
+    ("react", "React"),
+];
+
+fn server_stack(pkg: Option<&PackageJson>) -> Option<&'static str> {
+    SERVER_STACKS
+        .iter()
+        .find(|(dep, _)| dep_present(pkg, dep))
+        .map(|(_, label)| *label)
+}
+
+fn ui_lib(pkg: Option<&PackageJson>) -> Option<&'static str> {
+    UI_LIBS
+        .iter()
+        .find(|(dep, _)| dep_present(pkg, dep))
+        .map(|(_, label)| *label)
+}
+
+/// A project whose dev server is not a package script: the app is Python,
+/// Ruby, PHP, Go templates… and the browser talks to *that*.
+struct Backend {
+    stack: &'static str,
+    /// None when the project is recognised but has nothing a browser can
+    /// load — a native app, or React Native with no web target.
+    command: Option<String>,
+    /// Something specific to say about this kind of project.
+    note: Option<String>,
+}
+
+/// True when the first 64KB of `path` contain `needle`. Enough to recognise
+/// an entry point by what it constructs without reading a whole module.
+fn file_mentions(path: &Path, needle: &str) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = String::new();
+    let _ = file.take(64 * 1024).read_to_string(&mut head);
+    head.contains(needle)
+}
+
+/// How this project runs Python. A project's own environment first — the
+/// system `python3` does not have its dependencies, so guessing it for a
+/// project with a virtualenv starts a server that dies on the first import.
+fn python_runner(root: &Path) -> String {
+    for venv in [".venv", "venv", "env"] {
+        if root.join(venv).join("bin/python").exists() {
+            return format!("{venv}/bin/python");
+        }
+    }
+    if root.join("uv.lock").exists() {
+        "uv run python".into()
+    } else if root.join("poetry.lock").exists() {
+        "poetry run python".into()
+    } else if root.join("Pipfile").exists() {
+        "pipenv run python".into()
+    } else {
+        "python3".into()
+    }
+}
+
+/// Recognise a backend-rendered project by the file its own tooling requires,
+/// and name the command its own docs give for a dev server. Checked before
+/// any JS heuristic: a Laravel app has a `vite` dependency and a Rails app a
+/// `public/404.html`, and neither is a Vite project or a static site — the
+/// page the user wants on the canvas comes from the app server.
+fn detect_backend(root: &Path, pkg: Option<&PackageJson>) -> Option<Backend> {
+    let has = |p: &str| root.join(p).exists();
+    let backend = |stack, command: String| {
+        Some(Backend { stack, command: Some(command), note: None })
+    };
+
+    if has("manage.py") {
+        return backend("Django", format!("{} manage.py runserver", python_runner(root)));
+    }
+    if has("artisan") {
+        return backend("Laravel", "php artisan serve".into());
+    }
+    if has("bin/rails") || (has("Gemfile") && has("config/application.rb")) {
+        // `bin/dev` runs the app *and* its asset watchers. Not when the assets
+        // are Vite's, though: its dev server prints a URL too, and whichever
+        // line arrives first is the one the canvas would load.
+        let command = if has("bin/dev") && !dep_present(pkg, "vite") {
+            "bin/dev"
+        } else {
+            "bin/rails server"
+        };
+        return backend("Rails", command.into());
+    }
+    if file_mentions(&root.join("mix.exs"), ":phoenix") {
+        return backend("Phoenix", "mix phx.server".into());
+    }
+    let hugo_named = ["hugo.toml", "hugo.yaml", "hugo.yml", "hugo.json"]
+        .iter()
+        .any(|c| has(c));
+    let hugo_legacy = (has("config.toml") || has("config.yaml"))
+        && has("content")
+        && (has("themes") || has("layouts") || has("archetypes"));
+    if hugo_named || hugo_legacy {
+        return backend("Hugo", "hugo server".into());
+    }
+    if has("_config.yml") || has("_config.yaml") {
+        let command = if has("Gemfile") {
+            "bundle exec jekyll serve"
+        } else {
+            "jekyll serve"
+        };
+        return backend("Jekyll", command.into());
+    }
+    if has("mkdocs.yml") || has("mkdocs.yaml") {
+        return backend("MkDocs", "mkdocs serve".into());
+    }
+    if file_mentions(&root.join("main.py"), "FastAPI(") {
+        return backend(
+            "FastAPI",
+            format!("{} -m uvicorn main:app --reload", python_runner(root)),
+        );
+    }
+    if file_mentions(&root.join("app.py"), "Flask(") || file_mentions(&root.join("wsgi.py"), "Flask(") {
+        return backend("Flask", format!("{} -m flask run", python_runner(root)));
+    }
+    detect_mobile(root, pkg)
+}
+
+/// A mobile app. dedup's canvas is a browser, so what it can show is the
+/// app's *web build* — which Expo and Flutter have, bare React Native has
+/// only if the project set one up, and a Swift or Kotlin app does not have at
+/// all. Each is named for what it is and told the truth about which of those
+/// it is, rather than run by a `start` script that boots Metro and never
+/// prints an address a browser can open.
+fn detect_mobile(root: &Path, pkg: Option<&PackageJson>) -> Option<Backend> {
+    let has = |p: &str| root.join(p).exists();
+    let pm = detect_package_manager(root).label();
+    // A `web` script is the project's own answer to "how does this run in a
+    // browser", so it outranks anything dedup would guess.
+    let web_script = pkg.and_then(|p| p.scripts.get("web")).map(|_| format!("{pm} run web"));
+
+    if dep_present(pkg, "expo") {
+        let note = (!dep_present(pkg, "react-native-web")).then(|| {
+            "This Expo app has no web target yet, so there is nothing for the canvas to load. \
+             Add one with `npx expo install react-native-web react-dom @expo/metro-runtime`."
+                .to_string()
+        });
+        return Some(Backend {
+            stack: "Expo",
+            command: Some(web_script.unwrap_or_else(|| "npx expo start --web".into())),
+            note: Some(format!(
+                "dedup shows this app's web build (react-native-web) — the same components, \
+                 rendered by a browser rather than by iOS or Android, so native-only modules \
+                 and platform styling won't match a device exactly.{}",
+                note.map(|n| format!(" {n}")).unwrap_or_default()
+            )),
+        });
+    }
+    if dep_present(pkg, "react-native") {
+        return Some(Backend {
+            stack: "React Native",
+            note: Some(if web_script.is_some() {
+                "dedup shows this app's web build, through its `web` script — rendered by a \
+                 browser rather than by iOS or Android."
+                    .into()
+            } else {
+                "A React Native app with no web target: it renders only on a device or \
+                 simulator, and dedup's canvas is a browser. Adding react-native-web (or \
+                 Expo) gives it one; then put the command that serves it here."
+                    .into()
+            }),
+            command: web_script,
+        });
+    }
+    if file_mentions(&root.join("pubspec.yaml"), "flutter:") {
+        return Some(Backend {
+            stack: "Flutter",
+            command: Some("flutter run -d web-server".into()),
+            note: Some(if has("web") {
+                "dedup shows this app's web build. Flutter paints the page itself rather \
+                 than building it from HTML elements, so it is a live preview — there are \
+                 no elements to select."
+                    .into()
+            } else {
+                "This Flutter app has no web target yet, so there is nothing for the canvas \
+                 to load. Add one with `flutter create --platforms web .`."
+                    .into()
+            }),
+        });
+    }
+
+    // Swift / Kotlin with no web anything. Only at the root: React Native and
+    // Flutter keep theirs in `ios/` and `android/`, and were answered above.
+    let root_has_ext = |exts: [&str; 2]| {
+        std::fs::read_dir(root).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| exts.contains(&x))
+            })
+        })
+    };
+    let native = if root_has_ext(["xcodeproj", "xcworkspace"]) {
+        Some("iOS app")
+    } else if pkg.is_none()
+        && (has("settings.gradle") || has("settings.gradle.kts"))
+        && (has("app/src/main/AndroidManifest.xml") || has("gradlew"))
+    {
+        Some("Android app")
+    } else {
+        None
+    };
+    native.map(|stack| Backend {
+        stack,
+        command: None,
+        note: Some(
+            "A native app has no web build, and dedup's canvas is a browser — it can't \
+             render Swift or Kotlin screens. If this project also serves a web version, \
+             give dedup the command that starts it."
+                .into(),
+        ),
+    })
+}
+
+/// Markers of a workspace root: the app lives in a subfolder, and that folder
+/// is the one dedup can tag.
+fn is_workspace_root(root: &Path, pkg: Option<&PackageJson>) -> bool {
+    pkg.is_some_and(|p| p.workspaces.is_some())
+        || ["pnpm-workspace.yaml", "turbo.json", "nx.json", "lerna.json"]
+            .iter()
+            .any(|f| root.join(f).exists())
+}
+
+const NO_GIT: &str = "No git repository. dedup's safety model requires git to save — the editor can set one up (top bar → Set up git).";
+
+/// Inspect `root` and describe it. Never fails and never refuses: a folder
+/// dedup cannot start on its own comes back with `runnable: false` and a note
+/// saying what it looked for.
 pub fn detect(root: &str) -> ProjectInfo {
     let root_path = PathBuf::from(root);
     let name = root_path
@@ -192,16 +474,16 @@ pub fn detect(root: &str) -> ProjectInfo {
         .unwrap_or_else(|| "project".to_string());
     let has_git = root_path.join(".git").exists();
 
-    // An empty folder isn't an unsupported project — it's a project that
-    // doesn't exist yet, and the launch screen offers to start one. Answered
-    // before anything else so no detection heuristic gets to call it a
-    // failure.
+    // An empty folder is a project that doesn't exist yet, and the launch
+    // screen offers to start one. Answered before anything else so no
+    // detection heuristic gets a say.
     if is_empty_folder(&root_path) {
         return ProjectInfo {
             root: root.to_string(),
             name,
             package_manager: detect_package_manager(&root_path),
             framework: Framework::Unknown,
+            stack: "Empty folder".to_string(),
             has_tailwind: false,
             has_typescript: false,
             has_git,
@@ -209,74 +491,66 @@ pub fn detect(root: &str) -> ProjectInfo {
             static_dir: None,
             dev_script: None,
             dev_script_name: None,
-            support: SupportLevel::Unsupported,
+            run_command: None,
+            runnable: false,
             summary: "Empty folder — pick something to start here.".to_string(),
-            warnings: Vec::new(),
+            notes: Vec::new(),
         };
     }
 
     let pkg_path = root_path.join("package.json");
     let pkg = read_package_json(&pkg_path);
-
     let package_manager = detect_package_manager(&root_path);
-    let framework = detect_framework(&root_path, pkg.as_ref());
+
+    // Name and body together: several names are accepted, so the name has to
+    // travel with the body or the launch runs a `dev` that doesn't exist.
+    let script = pkg.as_ref().and_then(|p| {
+        DEV_SCRIPTS
+            .iter()
+            .find_map(|n| p.scripts.get(*n).map(|s| (n.to_string(), s.clone())))
+    });
+
+    let backend = detect_backend(&root_path, pkg.as_ref());
+    let framework = if backend.is_some() {
+        Framework::Unknown
+    } else {
+        detect_framework(&root_path, pkg.as_ref(), script.is_some())
+    };
 
     // A plain HTML site takes a different route through everything: dedup
     // serves it, so there is no dev script to find, no package manager to
-    // drive, and no typecheck to gate on. Reported on its own terms rather
+    // drive, and no typecheck to gate on. Described on its own terms rather
     // than as a JS project missing most of its parts.
     if framework == Framework::Static {
         let dir = find_static_dir(&root_path).unwrap_or_default();
         let has_tailwind = detect_static_tailwind(&root_path, &dir);
-        let mut warnings = Vec::new();
+        let mut notes = Vec::new();
         if !dir.is_empty() {
-            warnings.push(format!(
+            notes.push(format!(
                 "Pages found in `{dir}/` — dedup serves that folder as the site root."
             ));
         }
         if !has_tailwind {
-            warnings.push(
+            notes.push(
                 "No Tailwind in this site. Inspection, text and structure edits work as \
                  normal, but the Style panel writes Tailwind classes, which won't render \
                  until Tailwind is on the page."
                     .into(),
             );
         }
-        warnings.push(
-            "Duplicate detection reads React components, so the Scan tab is off for a \
-             static site. Everything else on the canvas works."
-                .into(),
-        );
-        warnings.push(
-            "No typecheck or build script to run, so those safety gates report `skipped` \
-             rather than passed."
-                .into(),
-        );
         if !has_git {
-            warnings.push(
-                "No git repository. dedup's safety model requires git to save — the editor can set one up (top bar → Set up git)."
-                    .into(),
-            );
+            notes.push(NO_GIT.into());
         }
-        let support = if has_git {
-            SupportLevel::Full
-        } else {
-            SupportLevel::Partial
-        };
         let summary = format!(
-            "Static HTML{} — {}",
+            "Static HTML{} — dedup serves and edits it directly",
             if has_tailwind { " + Tailwind" } else { "" },
-            if support == SupportLevel::Full {
-                "dedup serves and edits it directly"
-            } else {
-                "partially supported"
-            },
         );
         return ProjectInfo {
             root: root.to_string(),
             name,
             package_manager,
             framework,
+            stack: "Static HTML".to_string(),
             has_tailwind,
             has_typescript: false,
             has_git,
@@ -284,49 +558,67 @@ pub fn detect(root: &str) -> ProjectInfo {
             static_dir: (!dir.is_empty()).then_some(dir),
             dev_script: None,
             dev_script_name: None,
-            support,
+            run_command: None,
+            runnable: true,
             summary,
-            warnings,
+            notes,
         };
     }
 
     let has_tailwind = detect_tailwind(&root_path, pkg.as_ref());
     let has_typescript = root_path.join("tsconfig.json").exists()
         || dep_present(pkg.as_ref(), "typescript");
-    // Name and body together: `start` is accepted as a dev script, so the name
-    // has to travel with it or the launch runs a `dev` that doesn't exist.
-    let (dev_script_name, dev_script) = pkg
-        .as_ref()
-        .and_then(|p| {
-            ["dev", "start"]
-                .iter()
-                .find_map(|n| p.scripts.get(*n).map(|s| (n.to_string(), s.clone())))
-        })
-        .map(|(n, s)| (Some(n), Some(s)))
-        .unwrap_or((None, None));
+
+    // A backend's own command is *the* way it starts. Its package.json, if it
+    // has one, holds asset scripts — a `dev` that watches CSS prints no URL,
+    // and launching it would leave the canvas waiting forever.
+    let run_command = backend.as_ref().and_then(|b| b.command.clone()).or_else(|| {
+        // PHP with no framework: the interpreter's built-in server.
+        (framework == Framework::Unknown
+            && script.is_none()
+            && root_path.join("index.php").exists())
+        .then(|| "php -S localhost:8000".to_string())
+    });
+    // A recognised backend or mobile app never falls back to a package
+    // script, even with no command of its own: React Native's `start` boots
+    // Metro, which serves nothing a browser can open.
+    let (dev_script_name, dev_script) = match (&run_command, script) {
+        (None, Some((n, s))) if backend.is_none() => (Some(n), Some(s)),
+        _ => (None, None),
+    };
 
     // A Vite project with no script at all is still drivable when its own vite
     // binary is present: `instrument::setup` defaults the script to a bare
     // `vite` and spawns that binary directly, with no package manager in the
-    // loop. Calling it unsupported forces the user into a custom command, and
-    // a custom command is the one launch path that skips instrumentation — so
-    // the verdict would cost them the tagging it was wrong about.
+    // loop.
     let vite_direct = framework == Framework::Vite
         && dev_script.is_none()
         && root_path.join("node_modules/.bin/vite").exists();
+    let runnable = dev_script.is_some() || run_command.is_some() || vite_direct;
 
-    let mut warnings = Vec::new();
-    if pkg.is_none() {
-        warnings.push("No package.json found — this doesn't look like a JS project.".into());
-    }
-    if framework == Framework::Unknown {
-        warnings.push("Couldn't detect Vite or Next.js. Only these are supported in the MVP.".into());
-    }
-    // Next.js is supported, but element tagging depends on one line in the
-    // project's own next.config — Next has no `--config` flag, so dedup can't
-    // wrap it invisibly the way it does Vite. The card says which of the two
-    // situations this project is in rather than a blanket "partial".
-    let next_ready = if framework == Framework::Next {
+    let stack = match framework {
+        Framework::Next => "Next.js".to_string(),
+        // SvelteKit, Remix and friends are Vite underneath; say both, since
+        // one is what the user calls it and the other is how dedup runs it.
+        Framework::Vite => match server_stack(pkg.as_ref()).or_else(|| ui_lib(pkg.as_ref())) {
+            Some("React") | None => "Vite".to_string(),
+            Some(label) => format!("{label} on Vite"),
+        },
+        _ => backend
+            .as_ref()
+            .map(|b| b.stack)
+            .or_else(|| server_stack(pkg.as_ref()))
+            .or_else(|| ui_lib(pkg.as_ref()))
+            .or_else(|| run_command.as_ref().map(|_| "PHP"))
+            .unwrap_or(if pkg.is_some() { "Node" } else { "Project" })
+            .to_string(),
+    };
+
+    let mut notes = Vec::new();
+    // Next.js is tagged through one line in the project's own next.config —
+    // Next has no `--config` flag, so dedup can't wrap it invisibly the way it
+    // does Vite. Say which of the situations this project is in.
+    if framework == Framework::Next {
         match crate::instrument::inspect_next_config(root) {
             crate::instrument::NextStatus::Wired { config, needs_webpack } => {
                 let bundler = if needs_webpack {
@@ -334,10 +626,9 @@ pub fn detect(root: &str) -> ProjectInfo {
                 } else {
                     ""
                 };
-                warnings.push(format!(
-                    "Next.js: element inspection is enabled via {config}.{bundler} Isolated component previews stay Vite-only — Next can't serve the harness route."
+                notes.push(format!(
+                    "Next.js: element inspection is enabled via {config}.{bundler}"
                 ));
-                true
             }
             crate::instrument::NextStatus::Offered { config, needs_webpack, .. } => {
                 let bundler = if needs_webpack {
@@ -345,64 +636,103 @@ pub fn detect(root: &str) -> ProjectInfo {
                 } else {
                     ""
                 };
-                warnings.push(format!(
+                notes.push(format!(
                     "Next.js: element inspection needs one line in {config}.{bundler} dedup shows you the exact change once the project is open — it's committed and undoable, and inert outside dedup."
                 ));
-                false
             }
             crate::instrument::NextStatus::Unavailable { reason } => {
-                warnings.push(format!(
-                    "Next.js: canvas, routes and the duplicate scan work, but element inspection is unavailable — {reason}."
+                notes.push(format!(
+                    "Next.js: canvas and routes work, but element inspection is unavailable — {reason}."
                 ));
-                false
             }
         }
-    } else {
-        true
-    };
-    if !has_tailwind {
-        warnings.push("Tailwind CSS not detected. The inspector edits Tailwind classes only.".into());
     }
-    if !has_typescript {
-        warnings.push("TypeScript not detected. The safety gate relies on `tsc` typechecking.".into());
-    }
-    if dev_script.is_none() && pkg.is_some() {
-        warnings.push(if vite_direct {
+    if framework == Framework::Unknown {
+        if runnable {
+            let how = match (&run_command, &dev_script_name) {
+                (Some(cmd), _) => format!("`{cmd}`"),
+                (None, Some(n)) => format!("its `{n}` script"),
+                (None, None) => "its dev server".to_string(),
+            };
+            notes.push(format!(
+                "dedup starts this project with {how} and shows it on the canvas. Clicking \
+                 elements to inspect and restyle them needs dedup's tagger, which exists for \
+                 Vite + React, Next.js and plain HTML. Here dedup's edits go through the AI chat \
+                 and the code panel, which write JS/TS, CSS and HTML files; other source \
+                 (.vue, .svelte, .astro, templates, server code) it shows but does not write."
+            ));
+        } else if backend.as_ref().is_some_and(|b| b.note.is_some()) {
+            // Recognised, and the reason it can't start is its own (below).
+        } else {
+            notes.push(
+                "dedup couldn't tell how to start this project — no `dev` or `start` script \
+                 and no framework it recognises. Give it the command you use and it will run \
+                 that and show the result on the canvas."
+                    .into(),
+            );
+        }
+        if let Some(note) = backend.as_ref().and_then(|b| b.note.clone()) {
+            notes.push(note);
+        }
+        if is_workspace_root(&root_path, pkg.as_ref()) {
+            notes.push(
+                "This looks like a workspace root. Opening the app's own folder instead \
+                 (e.g. `apps/web`) lets dedup recognise its framework."
+                    .into(),
+            );
+        }
+    } else if !runnable {
+        // Vite or Next with nothing to launch: no script, no installed binary.
+        notes.push(format!(
+            "No `dev` or `start` script found, and the framework's own binary isn't installed. \
+             Run `{} install`, or give dedup the command you use.",
+            package_manager.label()
+        ));
+    } else if vite_direct {
+        notes.push(
             "No `dev` or `start` script found. dedup runs this project's own \
              `node_modules/.bin/vite` directly, so inspection still works."
-                .into()
-        } else {
-            "No `dev` or `start` script found. You'll need to set a custom command.".to_string()
-        });
+                .into(),
+        );
+    }
+    if pkg.as_ref().is_some_and(|p| p.has_dependencies())
+        && backend.is_none()
+        && !root_path.join("node_modules").exists()
+    {
+        notes.push(format!(
+            "Dependencies aren't installed yet — run `{} install` (the console drawer has a terminal in this folder).",
+            package_manager.label()
+        ));
+    }
+    // A desktop shell around a web frontend. The frontend is what dedup shows.
+    if root_path.join("src-tauri").is_dir() || dep_present(pkg.as_ref(), "@tauri-apps/api") {
+        notes.push(
+            "A Tauri app: dedup shows its web frontend in the canvas, without the Rust side. \
+             Screens render and can be edited; anything that calls a Tauri command gets no \
+             answer here, so data loaded that way will be missing."
+                .into(),
+        );
+    }
+    if matches!(framework, Framework::Vite | Framework::Next) {
+        if !has_tailwind {
+            notes.push("Tailwind CSS not detected. The Style panel writes Tailwind classes, which won't render without it.".into());
+        }
+        if !has_typescript {
+            notes.push("TypeScript not detected. The safety gate relies on `tsc` typechecking.".into());
+        }
     }
     if !has_git {
-        warnings.push("No git repository. dedup's safety model requires git to save — the editor can set one up (top bar → Set up git).".into());
+        notes.push(NO_GIT.into());
     }
 
-    let support = if pkg.is_none()
-        || framework == Framework::Unknown
-        || (dev_script.is_none() && !vite_direct)
-    {
-        SupportLevel::Unsupported
-    } else if !has_tailwind || !has_typescript || !has_git || !next_ready {
-        SupportLevel::Partial
-    } else {
-        SupportLevel::Full
-    };
-
-    let summary = build_summary(
-        framework,
-        has_tailwind,
-        has_typescript,
-        package_manager,
-        support,
-    );
+    let summary = build_summary(&stack, has_tailwind, has_typescript, pkg.is_some().then_some(package_manager));
 
     ProjectInfo {
         root: root.to_string(),
         name,
         package_manager,
         framework,
+        stack,
         has_tailwind,
         has_typescript,
         has_git,
@@ -410,42 +740,25 @@ pub fn detect(root: &str) -> ProjectInfo {
         static_dir: None,
         dev_script,
         dev_script_name,
-        support,
+        run_command,
+        runnable,
         summary,
-        warnings,
+        notes,
     }
 }
 
-fn build_summary(
-    framework: Framework,
-    tailwind: bool,
-    ts: bool,
-    pm: PackageManager,
-    support: SupportLevel,
-) -> String {
-    if support == SupportLevel::Unsupported {
-        return "Unsupported project — see details below.".to_string();
-    }
-    let fw = match framework {
-        Framework::Vite => "Vite",
-        Framework::Next => "Next.js",
-        Framework::Static => "Static HTML",
-        Framework::Unknown => "Unknown",
-    };
-    let mut parts = vec![fw.to_string()];
+fn build_summary(stack: &str, tailwind: bool, ts: bool, pm: Option<PackageManager>) -> String {
+    let mut parts = vec![stack.to_string()];
     if tailwind {
         parts.push("Tailwind".into());
     }
     if ts {
         parts.push("TS".into());
     }
-    parts.push(pm.label().to_string());
-    let tail = if support == SupportLevel::Full {
-        "fully supported"
-    } else {
-        "partially supported"
-    };
-    format!("{} — {}", parts.join(" + "), tail)
+    if let Some(pm) = pm {
+        parts.push(pm.label().to_string());
+    }
+    parts.join(" + ")
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +769,14 @@ struct PackageJson {
     dependencies: std::collections::HashMap<String, String>,
     #[serde(rename = "devDependencies", default)]
     dev_dependencies: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    workspaces: Option<serde_json::Value>,
+}
+
+impl PackageJson {
+    fn has_dependencies(&self) -> bool {
+        !self.dependencies.is_empty() || !self.dev_dependencies.is_empty()
+    }
 }
 
 fn read_package_json(path: &Path) -> Option<PackageJson> {
@@ -484,7 +805,7 @@ fn detect_package_manager(root: &Path) -> PackageManager {
     }
 }
 
-fn detect_framework(root: &Path, pkg: Option<&PackageJson>) -> Framework {
+fn detect_framework(root: &Path, pkg: Option<&PackageJson>, has_script: bool) -> Framework {
     if dep_present(pkg, "next")
         || root.join("next.config.js").exists()
         || root.join("next.config.mjs").exists()
@@ -497,9 +818,18 @@ fn detect_framework(root: &Path, pkg: Option<&PackageJson>) -> Framework {
     {
         return Framework::Vite;
     }
-    // Last, and only last: a folder with pages but no bundler is a site dedup
-    // can serve itself. Checked after Vite and Next so their own index.html
-    // never gets mistaken for one.
+    // A framework with a dev server of its own, and a script that starts it:
+    // that server is the app. Its `.html` files are templates, not pages.
+    if has_script && server_stack(pkg).is_some() {
+        return Framework::Unknown;
+    }
+    // Same for PHP: `index.php` is the site, whatever `.html` sits beside it.
+    if root.join("index.php").exists() {
+        return Framework::Unknown;
+    }
+    // A folder with pages but no bundler is a site dedup can serve itself.
+    // Checked after everything that has a server of its own, so their
+    // index.html never gets mistaken for one.
     if find_static_dir(root).is_some() {
         return Framework::Static;
     }
@@ -547,14 +877,14 @@ mod tests {
         assert!(info.has_typescript);
         assert_eq!(info.package_manager, PackageManager::Pnpm);
         assert_eq!(info.dev_script.as_deref(), Some("vite"));
-        // No git in the temp dir -> at most Partial.
-        assert_eq!(info.support, SupportLevel::Partial);
+        assert!(info.runnable);
+        assert_eq!(info.summary, "Vite + Tailwind + TS + pnpm");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A wired next.config is not a "partial" project — and an unwired one
-    /// must say what to do rather than that the feature doesn't exist.
+    /// An unwired next.config must say what to do rather than that the
+    /// feature doesn't exist — and none of the three states stops it opening.
     #[test]
     fn next_verdict_follows_the_config() {
         let dir = std::env::temp_dir().join(format!("dedup-next-verdict-{}", std::process::id()));
@@ -570,21 +900,21 @@ mod tests {
 
         // No config at all: supported, but inspection is unavailable and says why.
         let bare = detect(root);
-        assert_eq!(bare.support, SupportLevel::Partial);
+        assert!(bare.runnable);
         assert!(
-            bare.warnings.iter().any(|w| w.contains("no next.config")),
+            bare.notes.iter().any(|w| w.contains("no next.config")),
             "{:?}",
-            bare.warnings
+            bare.notes
         );
 
         // A config dedup could wrap: the card offers the change.
         std::fs::write(dir.join("next.config.mjs"), "export default {};\n").unwrap();
         let offered = detect(root);
-        assert_eq!(offered.support, SupportLevel::Partial);
+        assert!(offered.runnable);
         assert!(
-            offered.warnings.iter().any(|w| w.contains("one line in next.config.mjs")),
+            offered.notes.iter().any(|w| w.contains("one line in next.config.mjs")),
             "{:?}",
-            offered.warnings
+            offered.notes
         );
 
         // Already wired: nothing about Next holds it back any more.
@@ -594,11 +924,11 @@ mod tests {
         )
         .unwrap();
         let wired = detect(root);
-        assert_eq!(wired.support, SupportLevel::Full, "{:?}", wired.warnings);
+        assert!(wired.runnable, "{:?}", wired.notes);
         assert!(
-            wired.warnings.iter().any(|w| w.contains("enabled via next.config.mjs")),
+            wired.notes.iter().any(|w| w.contains("enabled via next.config.mjs")),
             "{:?}",
-            wired.warnings
+            wired.notes
         );
 
         // The read-only probe must not have created anything.
@@ -629,7 +959,7 @@ mod tests {
         let dir = temp_dir("blank");
         let info = detect(dir.to_str().unwrap());
         assert!(info.is_empty);
-        assert!(info.warnings.is_empty(), "nothing is wrong with an empty folder");
+        assert!(info.notes.is_empty(), "nothing is wrong with an empty folder");
 
         // A fresh `git init` is still empty: the repo is dedup's safety model,
         // not the user's work.
@@ -654,13 +984,13 @@ mod tests {
         assert_eq!(info.framework, Framework::Static);
         assert!(!info.is_empty);
         assert_eq!(info.static_dir, None, "pages at the root need no subfolder");
-        assert_eq!(info.support, SupportLevel::Full);
+        assert!(info.runnable);
         assert!(info.summary.starts_with("Static HTML"), "{}", info.summary);
         // TypeScript's absence is not a complaint to make about a static site.
         assert!(
-            !info.warnings.iter().any(|w| w.contains("TypeScript")),
+            !info.notes.iter().any(|w| w.contains("TypeScript")),
             "{:?}",
-            info.warnings
+            info.notes
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -675,9 +1005,9 @@ mod tests {
         assert_eq!(info.framework, Framework::Static);
         assert_eq!(info.static_dir.as_deref(), Some("www"));
         assert!(
-            info.warnings.iter().any(|w| w.contains("`www/`")),
+            info.notes.iter().any(|w| w.contains("`www/`")),
             "{:?}",
-            info.warnings
+            info.notes
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -695,7 +1025,7 @@ mod tests {
 
         let info = detect(dir.to_str().unwrap());
         assert_eq!(info.framework, Framework::Static);
-        assert_ne!(info.support, SupportLevel::Unsupported);
+        assert!(info.runnable);
         assert_eq!(info.static_dir, None, "the page is at the root");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -728,9 +1058,9 @@ mod tests {
         assert_eq!(info.framework, Framework::Static);
         assert!(info.has_tailwind);
         assert!(
-            !info.warnings.iter().any(|w| w.contains("No Tailwind")),
+            !info.notes.iter().any(|w| w.contains("No Tailwind")),
             "{:?}",
-            info.warnings
+            info.notes
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -750,27 +1080,268 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A folder dedup recognises nothing in still opens — the one thing it
+    /// lacks is a command, and that is asked for, not held against it.
     #[test]
-    fn unsupported_without_package_json() {
-        let dir = temp_dir("empty");
+    fn an_unrecognised_folder_is_asked_for_a_command_not_refused() {
+        let dir = temp_dir("mystery");
+        write(&dir, "main.go", "package main");
         let info = detect(dir.to_str().unwrap());
-        assert_eq!(info.support, SupportLevel::Unsupported);
         assert_eq!(info.framework, Framework::Unknown);
+        assert!(!info.runnable);
+        assert!(!info.is_empty);
+        assert!(
+            info.notes.iter().any(|w| w.contains("command you use")),
+            "{:?}",
+            info.notes
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn unsupported_when_no_dev_script() {
+    fn vite_without_a_script_or_a_binary_needs_a_command() {
         let dir = temp_dir("noscript");
+        write(&dir, "package.json", r#"{"dependencies":{"vite":"^5"}}"#);
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Vite);
+        assert!(!info.runnable);
+        assert!(
+            info.notes.iter().any(|w| w.contains("npm install")),
+            "{:?}",
+            info.notes
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Any framework with a dev script runs, tagger or no tagger.
+    #[test]
+    fn a_framework_dedup_has_no_tagger_for_still_runs() {
+        for (dep, stack, script) in [
+            ("astro", "Astro", "astro dev"),
+            ("gatsby", "Gatsby", "gatsby develop"),
+            ("@angular/core", "Angular", "ng serve"),
+            ("nuxt", "Nuxt", "nuxt dev"),
+        ] {
+            let dir = temp_dir("otherfw");
+            write(
+                &dir,
+                "package.json",
+                &format!(r#"{{"scripts":{{"dev":"{script}"}},"dependencies":{{"{dep}":"1"}}}}"#),
+            );
+            let info = detect(dir.to_str().unwrap());
+            assert_eq!(info.framework, Framework::Unknown, "{stack}");
+            assert_eq!(info.stack, stack);
+            assert!(info.runnable, "{stack}");
+            assert_eq!(info.dev_script.as_deref(), Some(script));
+            assert!(
+                info.notes.iter().any(|w| w.contains("its `dev` script")),
+                "{:?}",
+                info.notes
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Create React App keeps a template at `public/index.html`. Static
+    /// detection used to win that race and serve the template as a page —
+    /// an empty `<div id="root">`.
+    #[test]
+    fn create_react_app_is_run_not_served_as_flat_files() {
+        let dir = temp_dir("cra");
+        std::fs::create_dir_all(dir.join("public")).unwrap();
+        std::fs::write(dir.join("public/index.html"), "<div id=\"root\"></div>").unwrap();
         write(
             &dir,
             "package.json",
-            r#"{"dependencies":{"vite":"^5"}}"#,
+            r#"{"scripts":{"start":"react-scripts start"},"dependencies":{"react":"18","react-scripts":"5"}}"#,
         );
         let info = detect(dir.to_str().unwrap());
-        // Vite in the dependency list but nothing to run it with: no script,
-        // and no installed binary to spawn directly either.
-        assert_eq!(info.support, SupportLevel::Unsupported);
+        assert_eq!(info.framework, Framework::Unknown);
+        assert_eq!(info.stack, "Create React App");
+        assert_eq!(info.dev_script_name.as_deref(), Some("start"));
+        assert!(info.runnable);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other side of that rule: a hand-written site that happens to have
+    /// a package.json (prettier, a CSS watcher) is still dedup's to serve —
+    /// its script starts no server, and dedup's is the one that stamps.
+    #[test]
+    fn a_site_with_a_tooling_package_json_is_still_static() {
+        let dir = temp_dir("sitepkg");
+        write(&dir, "index.html", "<h1>hi</h1>");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"dev":"tailwindcss -i in.css -o out.css --watch"},"devDependencies":{"tailwindcss":"^3"}}"#,
+        );
+        assert_eq!(detect(dir.to_str().unwrap()).framework, Framework::Static);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A backend app is started by its own command — and is recognised before
+    /// the JS heuristics, which would each get it wrong: Laravel depends on
+    /// `vite`, Rails ships `public/404.html`.
+    #[test]
+    fn backend_apps_start_with_their_own_command() {
+        let dir = temp_dir("django");
+        write(&dir, "manage.py", "");
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.stack, "Django");
+        assert_eq!(info.run_command.as_deref(), Some("python3 manage.py runserver"));
+        assert!(info.runnable);
+        // The project's own virtualenv is the python that has its packages.
+        std::fs::create_dir_all(dir.join(".venv/bin")).unwrap();
+        write(&dir, ".venv/bin/python", "");
+        assert_eq!(
+            detect(dir.to_str().unwrap()).run_command.as_deref(),
+            Some(".venv/bin/python manage.py runserver")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_dir("laravel");
+        write(&dir, "artisan", "");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^5"}}"#,
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Unknown, "not a Vite project");
+        assert_eq!(info.stack, "Laravel");
+        assert_eq!(info.run_command.as_deref(), Some("php artisan serve"));
+        assert_eq!(info.dev_script, None, "one way to start, not two");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_dir("rails");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("public")).unwrap();
+        write(&dir, "bin/rails", "");
+        write(&dir, "public/404.html", "<h1>404</h1>");
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Unknown, "not a static site");
+        assert_eq!(info.run_command.as_deref(), Some("bin/rails server"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_dir("php");
+        write(&dir, "index.php", "<?php");
+        write(&dir, "about.html", "<h1>about</h1>");
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Unknown);
+        assert_eq!(info.stack, "PHP");
+        assert_eq!(info.run_command.as_deref(), Some("php -S localhost:8000"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mobile app opens through its web build when it has one — and is told
+    /// plainly when it doesn't, instead of being run by a `start` script that
+    /// boots Metro and never prints an address.
+    #[test]
+    fn mobile_apps_open_through_their_web_build() {
+        let dir = temp_dir("expo");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"start":"expo start","web":"expo start --web"},"dependencies":{"expo":"52","react-native":"0.76","react-native-web":"0.19"}}"#,
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.stack, "Expo");
+        assert_eq!(info.framework, Framework::Unknown);
+        assert_eq!(info.run_command.as_deref(), Some("npm run web"));
+        assert_eq!(info.dev_script, None, "never Metro's `start`");
+        assert!(info.runnable);
+        assert!(!info.notes.iter().any(|n| n.contains("no web target")), "{:?}", info.notes);
+        std::fs::remove_dir_all(&dir).ok();
+
+        // No web script and no react-native-web: still Expo's own command,
+        // with the one line that adds the target.
+        let dir = temp_dir("exponoweb");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"start":"expo start"},"dependencies":{"expo":"52","react-native":"0.76"}}"#,
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.run_command.as_deref(), Some("npx expo start --web"));
+        assert!(info.notes.iter().any(|n| n.contains("expo install react-native-web")), "{:?}", info.notes);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_dir("barern");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"start":"react-native start"},"dependencies":{"react-native":"0.76"}}"#,
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.stack, "React Native");
+        assert!(!info.runnable, "Metro alone is nothing a browser can load");
+        assert_eq!(info.dev_script, None);
+        assert!(info.notes.iter().any(|n| n.contains("no web target")), "{:?}", info.notes);
+        assert!(
+            !info.notes.iter().any(|n| n.contains("couldn't tell")),
+            "it knows exactly what this is: {:?}",
+            info.notes
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_dir("flutter");
+        write(&dir, "pubspec.yaml", "name: app\ndependencies:\n  flutter:\n    sdk: flutter\n");
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.stack, "Flutter");
+        assert_eq!(info.run_command.as_deref(), Some("flutter run -d web-server"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Swift and Kotlin have no web build. That is said, not guessed around.
+    #[test]
+    fn a_native_app_is_named_and_told_the_truth() {
+        let dir = temp_dir("ios");
+        std::fs::create_dir_all(dir.join("Notes.xcodeproj")).unwrap();
+        std::fs::create_dir_all(dir.join("Notes")).unwrap();
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.stack, "iOS app");
+        assert!(!info.runnable);
+        assert!(info.notes.iter().any(|n| n.contains("no web build")), "{:?}", info.notes);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_dir("android");
+        write(&dir, "settings.gradle.kts", "");
+        write(&dir, "gradlew", "");
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.stack, "Android app");
+        assert!(!info.runnable);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tauri_app_says_what_the_canvas_can_show() {
+        let dir = temp_dir("tauri");
+        std::fs::create_dir_all(dir.join("src-tauri")).unwrap();
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"dev":"vite"},"dependencies":{"@tauri-apps/api":"2"},"devDependencies":{"vite":"^7"}}"#,
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Vite, "tagged like any Vite app");
+        assert!(info.runnable);
+        assert!(info.notes.iter().any(|n| n.contains("without the Rust side")), "{:?}", info.notes);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Vite project that isn't React is named for what it is.
+    #[test]
+    fn a_vite_metaframework_is_named() {
+        let dir = temp_dir("sveltekit");
+        write(
+            &dir,
+            "package.json",
+            r#"{"scripts":{"dev":"vite dev"},"devDependencies":{"vite":"^5","@sveltejs/kit":"2","svelte":"4"}}"#,
+        );
+        let info = detect(dir.to_str().unwrap());
+        assert_eq!(info.framework, Framework::Vite);
+        assert_eq!(info.stack, "SvelteKit on Vite");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -803,7 +1374,7 @@ mod tests {
         let info = detect(dir.to_str().unwrap());
         assert_eq!(info.dev_script_name.as_deref(), Some("start"));
         assert_eq!(info.dev_script.as_deref(), Some("vite --port 3001"));
-        assert_ne!(info.support, SupportLevel::Unsupported);
+        assert!(info.runnable);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -833,16 +1404,11 @@ mod tests {
 
         let info = detect(dir.to_str().unwrap());
         assert!(info.dev_script.is_none());
-        assert_ne!(
-            info.support,
-            SupportLevel::Unsupported,
-            "{:?}",
-            info.warnings
-        );
+        assert!(info.runnable, "{:?}", info.notes);
         assert!(
-            info.warnings.iter().any(|w| w.contains("node_modules/.bin/vite")),
+            info.notes.iter().any(|w| w.contains("node_modules/.bin/vite")),
             "the card must say what it will run instead: {:?}",
-            info.warnings
+            info.notes
         );
         std::fs::remove_dir_all(&dir).ok();
     }

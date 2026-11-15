@@ -1,4 +1,10 @@
-# dedup — demo runbook
+# Historical demo — dedup — demo runbook
+
+> Retired on 2026-11-10: this script demonstrates deduplication features that
+> have been removed. For the current product, demonstrate opening a project,
+> inspecting and styling an element, reviewing source edits, scanning the
+> component gallery, and undoing a save from history.
+
 
 Demo project: **Harbor**, a seller dashboard at
 `../harbor` (sibling of this repo). Vite + React 19 + Tailwind v4 +

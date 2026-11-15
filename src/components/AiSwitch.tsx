@@ -1,10 +1,11 @@
-// TopBar AI menu: coding-agent CLIs the user already pays for, and a raw API
-// key — each with its own on/off switch.
+// AI backends: coding-agent CLIs the user already pays for, and a raw API key
+// — each with its own on/off switch. Lives in Settings → AI (⌘,), and only
+// there.
 //
 // Switches rather than one choice, because a chat message names its agent
-// (`@claude`, `@codex`): with both on, both are one `@` away, and the menu's
-// only remaining question is who answers when nobody was named — the first
-// one on, marked "default".
+// (`@claude`, `@codex`): with both on, both are one `@` away, and the only
+// remaining question is who answers when nobody was named — the first one on,
+// marked "default".
 //
 // Every CLI agent is still opt-in through a live round-trip: switching one on
 // for the first time *is* Connect, and the switch only lands on if the test
@@ -13,7 +14,7 @@
 //
 // The cards are generated from CLI_AGENTS rather than written per agent, so
 // adding a third is a row in that list.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useStore } from "../lib/store";
 import { CLI_AGENTS, agentOn } from "../lib/types";
 import { mentionAlias } from "../lib/mentions";
@@ -142,8 +143,8 @@ function AgentCard({
   );
 }
 
-export function AiSwitch() {
-  const agents = useStore((s) => s.agents);
+/** Settings → AI: the agents' cards and the API key. */
+export function AiBackends() {
   const anthropicKey = useStore((s) => s.anthropicKey);
   const apiEnabled = useStore((s) => s.apiEnabled);
   const setAnthropicKey = useStore((s) => s.setAnthropicKey);
@@ -151,133 +152,88 @@ export function AiSwitch() {
   const detectAgent = useStore((s) => s.detectAgent);
   const loadAgentModels = useStore((s) => s.loadAgentModels);
   const active = useStore((s) => s.activeAiBackend());
-
-  const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
-  const panelRef = useRef<HTMLDivElement>(null);
 
-  // Click-away closes the popover.
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (!panelRef.current?.contains(e.target as Node)) setOpen(false);
-    };
-    window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
-  }, [open]);
-
-  // Ask each installed CLI for its models the first time the menu opens.
+  // Ask each installed CLI for its models when the section is first shown.
   // Each is asked once per app run (the store remembers the answer).
   useEffect(() => {
-    if (!open) return;
     for (const meta of CLI_AGENTS) {
       void detectAgent(meta.id).then(() => loadAgentModels(meta.id));
     }
-  }, [open, detectAgent, loadAgentModels]);
+  }, [detectAgent, loadAgentModels]);
 
-  const onNames = [
-    ...CLI_AGENTS.filter((a) => agentOn(agents[a.id])).map((a) => a.label),
-    ...(apiEnabled && anthropicKey ? ["API"] : []),
-  ];
-  const label = onNames.length === 0 ? "AI: off" : `AI: ${onNames.join(" + ")}`;
   const apiOn = apiEnabled && !!anthropicKey;
 
   return (
-    <div className="relative" ref={panelRef}>
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className={`rounded-md px-2 py-1 text-2xs ${
-          open
-            ? "bg-surface-3 text-ink"
-            : active
-              ? "bg-surface-2 text-ink-dim hover:text-ink"
-              : "bg-warn/15 text-warn hover:bg-warn/25"
+    <div>
+      {CLI_AGENTS.map((meta) => (
+        <AgentCard key={meta.id} meta={meta} isDefault={active === meta.id} />
+      ))}
+
+      {/* Raw API key */}
+      <div
+        className={`rounded-lg border p-2.5 ${
+          apiOn ? "border-accent/50 bg-accent/5" : "border-line"
         }`}
-        title="Choose which AI backends dedup may use"
       >
-        {label}
-      </button>
-
-      {open && (
-        <div className="panel absolute right-0 top-full mt-1.5 z-50 w-80 p-3">
-          <div className="text-2xs uppercase tracking-wider text-ink-faint mb-2">
-            AI backends
-          </div>
-
-          {CLI_AGENTS.map((meta) => (
-            <AgentCard key={meta.id} meta={meta} isDefault={active === meta.id} />
-          ))}
-
-          {/* Raw API key */}
-          <div
-            className={`rounded-lg border p-2.5 ${
-              apiOn ? "border-accent/50 bg-accent/5" : "border-line"
-            }`}
-          >
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-ink">Anthropic API</span>
-              <span className="text-2xs text-ink-faint">pay per token</span>
-              <span className="flex-1" />
-              {active === "api" && (
-                <span className="text-2xs text-positive">default</span>
-              )}
-              {anthropicKey && (
-                <Toggle
-                  on={apiOn}
-                  label={apiOn ? "Turn the API key off" : "Turn the API key on"}
-                  onChange={setApiEnabled}
-                />
-              )}
-            </div>
-            {anthropicKey ? (
-              <div className="mt-1.5 flex items-center gap-2">
-                <span className="text-2xs font-mono text-ink-faint">
-                  sk-…{anthropicKey.slice(-4)}
-                </span>
-                <span className="flex-1" />
-                <button
-                  onClick={() => {
-                    setAnthropicKey("");
-                    setApiEnabled(false);
-                  }}
-                  className="text-2xs text-ink-faint hover:text-ink"
-                >
-                  Remove
-                </button>
-              </div>
-            ) : (
-              <div className="mt-1.5 flex gap-1">
-                <input
-                  type="password"
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  placeholder="sk-ant-…"
-                  className="min-w-0 flex-1 rounded bg-surface-2 px-2 py-1 text-2xs text-ink placeholder:text-ink-faint outline-none focus:ring-1 focus:ring-accent"
-                />
-                <button
-                  onClick={() => {
-                    const key = draft.trim();
-                    if (!key) return;
-                    setAnthropicKey(key);
-                    setApiEnabled(true);
-                    setDraft("");
-                  }}
-                  disabled={!draft.trim()}
-                  className="rounded px-2 py-1 text-2xs bg-surface-2 text-ink-dim hover:text-ink disabled:opacity-50"
-                >
-                  Save
-                </button>
-              </div>
-            )}
-          </div>
-
-          <div className="mt-2 text-2xs text-ink-faint leading-relaxed">
-            A chat message goes to the agent it @mentions; with no mention — and
-            for organizing scans and merges — the first one that&rsquo;s on
-            answers. The API key is used only when no agent is on.
-          </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-ink">Anthropic API</span>
+          <span className="text-2xs text-ink-faint">pay per token</span>
+          <span className="flex-1" />
+          {active === "api" && <span className="text-2xs text-positive">default</span>}
+          {anthropicKey && (
+            <Toggle
+              on={apiOn}
+              label={apiOn ? "Turn the API key off" : "Turn the API key on"}
+              onChange={setApiEnabled}
+            />
+          )}
         </div>
-      )}
+        {anthropicKey ? (
+          <div className="mt-1.5 flex items-center gap-2">
+            <span className="text-2xs font-mono text-ink-faint">sk-…{anthropicKey.slice(-4)}</span>
+            <span className="flex-1" />
+            <button
+              onClick={() => {
+                setAnthropicKey("");
+                setApiEnabled(false);
+              }}
+              className="text-2xs text-ink-faint hover:text-ink"
+            >
+              Remove
+            </button>
+          </div>
+        ) : (
+          <div className="mt-1.5 flex gap-1">
+            <input
+              type="password"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder="sk-ant-…"
+              className="min-w-0 flex-1 rounded bg-surface-2 px-2 py-1 text-2xs text-ink placeholder:text-ink-faint outline-none focus:ring-1 focus:ring-accent"
+            />
+            <button
+              onClick={() => {
+                const key = draft.trim();
+                if (!key) return;
+                setAnthropicKey(key);
+                setApiEnabled(true);
+                setDraft("");
+              }}
+              disabled={!draft.trim()}
+              className="rounded px-2 py-1 text-2xs bg-surface-2 text-ink-dim hover:text-ink disabled:opacity-50"
+            >
+              Save
+            </button>
+          </div>
+        )}
+      </div>
+
+      <p className="mt-3 text-2xs text-ink-faint leading-relaxed">
+        A chat message goes to the agent it @mentions; with no mention — and for
+        organizing scans and merges — the first one that&rsquo;s on answers. The
+        API key is used only when no agent is on.
+      </p>
     </div>
   );
 }

@@ -40,12 +40,13 @@ import {
   TextAlignRightIcon,
   WidthIcon,
 } from "@radix-ui/react-icons";
-import { ColorPicker } from "./ColorPicker";
+import { ColorPicker, hexOf } from "./ColorPicker";
 import { useStore } from "../lib/store";
 import {
   fromTokens,
   KNOBS,
   mergeClasses,
+  pageColor,
   readKnob,
   readSpacing,
   setKnob,
@@ -165,8 +166,12 @@ function BaseTypography({ tokens, commit }: SectionProps) {
 
 function ReferenceStyles({ tokens, commit }: SectionProps) {
   const fill = readKnob(tokens, KNOBS.background);
-  const display = fill?.match(/^\[#([a-fA-F0-9]+)\]$/)?.[1]?.toUpperCase() ?? (fill === "white" ? "FFFFFF" : fill === "black" ? "000000" : fill ?? "");
-  return <ReferenceSection title="Styles" open><PropertyRow label="Fill"><div className="reference-fill has-color-picker"><ColorPicker value={fill} onChange={(hex, group) => commit(setKnob(tokens, KNOBS.background, `bg-[${hex}]`), group)} /><Field mono={false} title="Fill color" value={display} onCommit={v => commit(setKnob(tokens, KNOBS.background, v ? `bg-${/^[a-fA-F0-9]{3,8}$/.test(v) ? `[#${v}]` : v}` : null))} /><button aria-label="Remove fill" onClick={() => commit(setKnob(tokens, KNOBS.background, null))}><Cross2Icon /></button></div></PropertyRow><PropertyRow label="Overflow"><Select title="Overflow" value={readKnob(tokens, /^overflow-(visible|hidden|clip|scroll|auto)$/)} options={["visible", "hidden", "clip", "scroll", "auto"].map(v => ({ v, label: v[0].toUpperCase() + v.slice(1) }))} onChange={v => commit(setKnob(tokens, /^overflow-(visible|hidden|clip|scroll|auto)$/, v && `overflow-${v}`))} /></PropertyRow></ReferenceSection>;
+  const selected = useStore((s) => s.selected);
+  // A project token (`primary`) is a name only the page can resolve; show the
+  // colour it resolved to, and keep the name in the tooltip and under Effects.
+  const painted = pageColor(fill, "bg", selected);
+  const display = fill?.match(/^\[#([a-fA-F0-9]+)\]$/)?.[1]?.toUpperCase() ?? (fill === "white" ? "FFFFFF" : fill === "black" ? "000000" : (painted && hexOf(painted)) || (fill ?? ""));
+  return <ReferenceSection title="Styles" open><PropertyRow label="Fill"><div className="reference-fill has-color-picker" title={fill ? `bg-${fill}` : undefined}><ColorPicker value={fill} css={painted} onChange={(hex, group) => commit(setKnob(tokens, KNOBS.background, `bg-[${hex}]`), group)} /><Field mono={false} title="Fill color" value={display} onCommit={v => commit(setKnob(tokens, KNOBS.background, v ? `bg-${/^[a-fA-F0-9]{3,8}$/.test(v) ? `[#${v}]` : v}` : null))} /><button aria-label="Remove fill" onClick={() => commit(setKnob(tokens, KNOBS.background, null))}><Cross2Icon /></button></div></PropertyRow><PropertyRow label="Overflow"><Select title="Overflow" value={readKnob(tokens, /^overflow-(visible|hidden|clip|scroll|auto)$/)} options={["visible", "hidden", "clip", "scroll", "auto"].map(v => ({ v, label: v[0].toUpperCase() + v.slice(1) }))} onChange={v => commit(setKnob(tokens, /^overflow-(visible|hidden|clip|scroll|auto)$/, v && `overflow-${v}`))} /></PropertyRow></ReferenceSection>;
 }
 
 type Axis = "row" | "col";
@@ -484,6 +489,7 @@ const TEXT_ALIGN: Array<{ v: string; icon: IconType; title: string }> = [
 
 function TypographySection({ tokens, commit }: SectionProps) {
   const color = readKnob(tokens, KNOBS.textColor);
+  const selected = useStore((s) => s.selected);
   return (
     <div className="reference-group">
       <Row>
@@ -530,7 +536,7 @@ function TypographySection({ tokens, commit }: SectionProps) {
       <Group label="Colour">
         <Row>
           <Field
-            prefix={<Swatch value={color} />}
+            prefix={<Swatch value={color} css={pageColor(color, "text", selected)} />}
             title="text-* (colour)"
             value={color ?? ""}
             placeholder="zinc-400"
@@ -548,12 +554,13 @@ function StylesSection({ tokens, commit }: SectionProps) {
   const borderW = readKnob(tokens, KNOBS.borderWidth);
   const fill = readKnob(tokens, KNOBS.background);
   const borderColor = readKnob(tokens, KNOBS.borderColor);
+  const selected = useStore((s) => s.selected);
   return (
     <div className="reference-group">
       <Group label="Fill">
         <Row>
           <Field
-            prefix={<Swatch value={fill} />}
+            prefix={<Swatch value={fill} css={pageColor(fill, "bg", selected)} />}
             title="bg-*"
             value={fill ?? ""}
             placeholder="zinc-900"
@@ -582,7 +589,7 @@ function StylesSection({ tokens, commit }: SectionProps) {
             options={[{ v: "0" }, { v: "1" }, { v: "2" }, { v: "4" }, { v: "8" }]}
           />
           <Field
-            prefix={<Swatch value={borderColor} />}
+            prefix={<Swatch value={borderColor} css={pageColor(borderColor, "border", selected)} />}
             title="border-* (colour)"
             value={borderColor ?? ""}
             placeholder="colour"

@@ -4,7 +4,14 @@
 **Author:** Sadaf Kasim (GetBega Tech)
 **Date:** July 2026
 **Platform:** macOS desktop (Tauri 2.x)
-**Status:** Draft
+**Status:** Historical MVP specification
+
+**Scope update — 2026-11-10:** Deduplication has been removed. Duplicate and
+Drift detection, similarity scoring, cluster review, merge proposals, call-site
+merge rewrites, deletion staging, and merge gates are retired requirements.
+The product is a visual web editor with component inventory/previews, source
+editing, AI chat, and save history. The original requirements below document
+the earlier plan; use README.md and the latest PROGRESS.md entry for current scope.
 
 ---
 

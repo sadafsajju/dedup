@@ -9,8 +9,8 @@ const PRESETS = ["#FFFFFF", "#111111", "#71717A", "#EF4444", "#F97316", "#FACC15
 let gesture = 0;
 
 /** Resolve theme colors through the browser, including Tailwind's oklch palette. */
-function resolveColor(value: string | null): HSV | null {
-  const css = cssColor(value);
+function resolveColor(value: string | null, painted?: string | null): HSV | null {
+  const css = painted ?? cssColor(value);
   if (!css) return null;
   const probe = document.createElement("span");
   probe.style.color = css;
@@ -27,7 +27,14 @@ function resolveColor(value: string | null): HSV | null {
   return parseHex([...bytes].map(n => n.toString(16).padStart(2, "0")).join(""));
 }
 
-export function ColorPicker({ value, onChange }: { value: string | null; onChange: (hex: string, group?: string) => void }) {
+/** A CSS colour as the hex the picker would show for it (RRGGBB, or RRGGBBAA
+ *  when translucent); null when the browser can't paint it. */
+export function hexOf(css: string | null): string | null {
+  const hsv = css ? resolveColor(null, css) : null;
+  return hsv ? toHex(hsv).slice(1) : null;
+}
+
+export function ColorPicker({ value, css, onChange }: { value: string | null; css?: string | null; onChange: (hex: string, group?: string) => void }) {
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
   const [position, setPosition] = useState({ left: 0, top: 0 });
@@ -37,12 +44,12 @@ export function ColorPicker({ value, onChange }: { value: string | null; onChang
       const rect = trigger.current!.getBoundingClientRect();
       setPosition({ left: Math.max(12, Math.min(rect.left - 294, window.innerWidth - 298)), top: Math.max(12, Math.min(rect.top - 120, window.innerHeight - 450)) });
       setOpen(true);
-    }}><Swatch value={value} /></button>
-    {open && createPortal(<ColorDialog id={id} value={value} position={position} onChange={onChange} onClose={() => { setOpen(false); requestAnimationFrame(() => trigger.current?.focus()); }} />, document.body)}
+    }}><Swatch value={value} css={css} /></button>
+    {open && createPortal(<ColorDialog id={id} value={value} css={css} position={position} onChange={onChange} onClose={() => { setOpen(false); requestAnimationFrame(() => trigger.current?.focus()); }} />, document.body)}
   </>;
 }
 
-function ColorDialog({ id, value, position, onChange, onClose }: { id: string; value: string | null; position: { left: number; top: number }; onChange: (hex: string, group?: string) => void; onClose: () => void }) {
+function ColorDialog({ id, value, css, position, onChange, onClose }: { id: string; value: string | null; css?: string | null; position: { left: number; top: number }; onChange: (hex: string, group?: string) => void; onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [location, setLocation] = useState(position);
   const [dragging, setDragging] = useState(false);
@@ -55,7 +62,7 @@ function ColorDialog({ id, value, position, onChange, onClose }: { id: string; v
     };
   };
   const endDrag = () => { drag.current = null; setDragging(false); };
-  const [color, setColor] = useState<HSV>(() => resolveColor(value) ?? { h: 0, s: 0, v: 1, a: 1 });
+  const [color, setColor] = useState<HSV>(() => resolveColor(value, css) ?? { h: 0, s: 0, v: 1, a: 1 });
   const [draft, setDraft] = useState(() => toHex(color).slice(1));
   const [invalid, setInvalid] = useState(false);
   const group = useRef<string | undefined>(undefined);

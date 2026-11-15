@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import { captureCanvasThumbnail, stopDevServer } from "../lib/api";
 import { SetUpGit } from "./SetUpGit";
 import { useStore } from "../lib/store";
@@ -7,15 +6,12 @@ import { VIEWPORTS } from "../lib/types";
 import type { DevServerStatus } from "../lib/types";
 import {
   ChevronLeftIcon,
-  CopyIcon,
   DesktopIcon,
   LaptopIcon,
   MobileIcon,
   Share2Icon,
 } from "@radix-ui/react-icons";
-import { ReviewPanel } from "./ReviewPanel";
-import { AiSwitch } from "./AiSwitch";
-import { HistoryButton } from "./History";
+import { CommitTabButton } from "./CommitTab";
 import type { IconType } from "./ui";
 
 /** Device glyph per viewport preset (FR-1.4). */
@@ -51,33 +47,14 @@ export function TopBar() {
   const pendingEdit = useStore((s) => s.pendingEdit);
   const setInspectorTab = useStore((s) => s.setInspectorTab);
   const saveAll = useStore((s) => s.saveAll);
-  const scanning = useStore((s) => s.scanning);
-  const categorizing = useStore((s) => s.categorizing);
-  const runScan = useStore((s) => s.runScan);
-  const editorTab = useStore((s) => s.editorTab);
-  const driftCount = useStore(
-    (s) =>
-      s.driftResult?.candidates.find((c) => c.id === s.openDriftId)
-        ?.occurrences.length ?? 0,
-  );
-  const setEditorTab = useStore((s) => s.setEditorTab);
-  const selectedRoute = useStore((s) => s.selectedRoute);
-  const instrumentation = useStore((s) => s.instrumentation);
-  const galleryCount = useStore((s) => s.scanResult?.gallery.length ?? 0);
-  // A live, tagged canvas scans one artboard at a time — Scan waits for the
-  // user to pick one (click its name). Untagged sessions keep the honest
-  // whole-project fallback, so no selection is demanded there.
-  const needsArtboard =
-    devStatus === "ready" && !!instrumentation?.active && !selectedRoute;
+  const sidebarTab = useStore((s) => s.sidebarTab);
+  const setSidebarTab = useStore((s) => s.setSidebarTab);
   const dirtyCount = actions.filter(
     (a) => !isValueAction(a) || a.before !== a.after,
   ).length;
-  const [reviewOpen, setReviewOpen] = useState(false);
-
-  // Nothing left to review → close the popover.
-  useEffect(() => {
-    if (dirtyCount === 0) setReviewOpen(false);
-  }, [dirtyCount]);
+  // The staged-changes review lives in the sidebar's Commit tab now, beside
+  // the commits it turns into; this bar keeps the count and the quick save.
+  const reviewOpen = sidebarTab === "commit";
 
   async function goBack() {
     // Snapshot the canvas first — it's the launch grid's card image, and it
@@ -114,9 +91,9 @@ export function TopBar() {
           >
             <Share2Icon width={11} height={11} />
             <span className="font-mono">{git.branch ?? "?"}</span>
-            {/* The compatibility card used to be the only place the dirty
-                tree was ever mentioned, and it is now skipped on a project
-                whose verdict the user has already seen. The signal moves
+            {/* The open-time panel used to be the only place the dirty
+                tree was ever mentioned, and it is skipped once the tree has
+                been acknowledged. The signal moves
                 here, where it stays visible for the whole session instead of
                 flashing past once. */}
             {git.isDirty && (
@@ -138,41 +115,6 @@ export function TopBar() {
             <SetUpGit compact />
           </span>
         )}
-      </div>
-
-      <div className="flex-1" />
-
-      {/* Top-level view switch: live canvas vs. scanned component gallery. */}
-      <div className="flex items-center gap-0.5 bg-surface-2 rounded-[10px] p-0.5">
-        {(
-          [
-            ["canvas", "Canvas"],
-            ["components", "Components"],
-            ["drift", "Drift"],
-          ] as const
-        ).map(([id, label]) => (
-          <button
-            key={id}
-            onClick={() => setEditorTab(id)}
-            className={`h-6 px-2.5 rounded-lg text-2xs ${
-              editorTab === id
-                ? "bg-surface-3 text-ink"
-                : "text-ink-dim hover:text-ink"
-            }`}
-          >
-            {label}
-            {id === "components" && galleryCount > 0 && (
-              <span className="ml-1 text-ink-faint tabular-nums">
-                {galleryCount}
-              </span>
-            )}
-            {id === "drift" && driftCount > 0 && (
-              <span className="ml-1 text-ink-faint tabular-nums">
-                {driftCount}
-              </span>
-            )}
-          </button>
-        ))}
       </div>
 
       <div className="flex-1" />
@@ -247,7 +189,7 @@ export function TopBar() {
               Save failed: {saveError}
             </span>
             <button
-              onClick={saveAll}
+              onClick={() => void saveAll()}
               disabled={saving}
               className="rounded-lg px-2.5 py-1 text-2xs bg-danger/15 text-danger hover:bg-danger/25 disabled:opacity-60"
             >
@@ -264,21 +206,21 @@ export function TopBar() {
         ) : dirtyCount > 0 ? (
           <>
             <button
-              onClick={() => setReviewOpen((v) => !v)}
+              onClick={() => setSidebarTab("commit")}
               className={`rounded-lg px-2 py-1 text-2xs ${
                 reviewOpen
                   ? "bg-surface-3 text-ink"
                   : "bg-surface-2 text-ink-dim hover:text-ink"
               }`}
-              title="Review staged changes"
+              title="Review staged changes in the Commit tab"
             >
               {dirtyCount} edit{dirtyCount === 1 ? "" : "s"}
             </button>
             <button
-              onClick={saveAll}
+              onClick={() => void saveAll()}
               disabled={saving}
               className="rounded-lg px-2.5 py-1 text-2xs font-medium bg-accent text-white hover:brightness-110 disabled:opacity-60"
-              title="⌘S"
+              title="Commit the staged edits with a generated message (⌘S). Write your own in the Commit tab."
             >
               {saving ? "Saving…" : "Save ⌘S"}
             </button>
@@ -301,36 +243,9 @@ export function TopBar() {
             )}
           </span>
         ) : null}
-        {reviewOpen && <ReviewPanel onClose={() => setReviewOpen(false)} />}
       </div>
 
-      <HistoryButton />
-
-      <AiSwitch />
-
-      <button
-        onClick={runScan}
-        disabled={scanning || categorizing || needsArtboard}
-        className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-2xs ${
-          scanning || categorizing
-            ? "bg-surface-2 text-ink-faint cursor-wait"
-            : needsArtboard
-              ? "bg-surface-2 text-ink-faint cursor-not-allowed"
-              : "bg-surface-2 text-ink-dim hover:text-ink"
-        }`}
-        title={
-          needsArtboard
-            ? "Select an artboard first — click its name above the frame"
-            : "Scan the selected artboard for duplicate components"
-        }
-      >
-        <CopyIcon
-          width={13}
-          height={13}
-          className={scanning || categorizing ? "animate-pulse" : ""}
-        />
-        {scanning ? "Scanning…" : categorizing ? "Organizing…" : "Scan"}
-      </button>
+      <CommitTabButton />
     </header>
   );
 }

@@ -33,7 +33,7 @@ const STARTERS: Starter[] = [
     title: "React app",
     stack: "Vite · TypeScript · Tailwind v4",
     blurb:
-      "The full editor: component inspection, the duplicate scan, and the typecheck and build gates behind every merge.",
+      "The full editor: component inspection, Tailwind styling, and source edits.",
     note: "Installs dependencies — needs a minute and a network connection.",
     icon: <ComponentInstanceIcon width={17} height={17} />,
   },

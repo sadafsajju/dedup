@@ -1,6 +1,7 @@
 // Smoke tests for the tagger transform. Run: pnpm test:plugin
 // Tests the BUILT bundle (what actually ships inside the app).
 import assert from "node:assert/strict";
+import dedupTagger from "../src-tauri/assets/dedup-tagger.mjs";
 import {
   buildBootScript,
   discoverRoutes,
@@ -134,25 +135,18 @@ test("returns null on unparseable garbage instead of throwing", () => {
   assert.equal(tagCode(`const = <<<>>;;;`, "src/bad.tsx"), null);
 });
 
-test("appends a virtual export for file-local components when asked", () => {
-  const out = tagCode(
+test("tagging leaves file-local declarations private", () => {
+  const plugin = dedupTagger({ root: "/project" });
+  const out = plugin.transform(
     `function LocalCard() { return <div className="p-4">x</div>; }
-export function Page() { return <LocalCard />; }\n`,
-    "src/Page.tsx",
-    "LocalCard",
+export function Page() { return <LocalCard />; }`,
+    "/project/src/Page.tsx?dedup-export=LocalCard",
   );
   assert.ok(out);
-  assert.match(out.code, /export \{ LocalCard \};/);
-});
-
-test("rejects unsafe virtual export names", () => {
-  const out = tagCode(
-    `export const A = () => <p>x</p>;\n`,
-    "src/A.tssx".replace("tssx", "tsx"),
-    "x; alert(1)",
-  );
-  assert.ok(out); // still tags the JSX
-  assert.doesNotMatch(out.code, /alert/);
+  assert.match(out.code, /data-dedup-id="src\/Page\.tsx@0"/);
+  assert.doesNotMatch(out.code, /export\s*\{\s*LocalCard/);
+  assert.equal(plugin.resolveId, undefined);
+  assert.equal(plugin.load, undefined);
 });
 
 test("produces a sourcemap", () => {

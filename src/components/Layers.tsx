@@ -9,6 +9,7 @@
 // from a `.map()` shows once per instance — same as on the page.
 import { useEffect, useRef, useState } from "react";
 import { sendToOverlay } from "../lib/bridge";
+import { toggleId } from "../lib/multiSelect";
 import { useStore } from "../lib/store";
 import type { LayerNode } from "../lib/types";
 import { LayersIcon, TriangleRightIcon } from "@radix-ui/react-icons";
@@ -46,7 +47,11 @@ function Row({
   collapsed: Set<string>;
   onToggle: (key: string) => void;
 }) {
-  const isSelected = useStore((s) => s.selected?.dedupId === node.id);
+  // Every row of a multi-selection is lit, not just one of them.
+  const isSelected = useStore(
+    (s) =>
+      s.selected?.dedupId === node.id || s.multi.some((m) => m.dedupId === node.id),
+  );
   const selectById = useStore((s) => s.selectById);
   const open = !collapsed.has(rowKey);
   const hasKids = node.children.length > 0;
@@ -58,7 +63,19 @@ function Row({
     <>
       <div
         data-layer-selected={isSelected || undefined}
-        onClick={() => selectById(node.id)}
+        onClick={(e) => {
+          if (!e.shiftKey) return selectById(node.id);
+          // Shift-click adds this row to the selection or takes it out — the
+          // canvas's own gesture. The overlay answers with the elements'
+          // payloads, which is what actually changes the selection.
+          const s = useStore.getState();
+          const current = s.selected
+            ? [s.selected.dedupId]
+            : s.multi.map((m) => m.dedupId);
+          const ids = toggleId(current, node.id);
+          if (ids.length === 0) s.clearSelection();
+          else sendToOverlay({ type: "select-ids", ids, report: true });
+        }}
         onMouseEnter={() => sendToOverlay({ type: "hover-id", id: node.id })}
         className={`flex items-center gap-1 pr-2 py-0.75 text-2xs cursor-pointer select-none ${
           isSelected

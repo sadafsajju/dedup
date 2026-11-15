@@ -75,6 +75,7 @@ const TOOLS = [
 
 export function Toolbar() {
   const consoleOpen = useStore((s) => s.consoleOpen);
+  const consoleHeight = useStore((s) => s.consoleHeight);
   const tool = useStore((s) => s.tool);
   const setTool = useStore((s) => s.setTool);
   const textEditing = useStore((s) => s.textEditing);
@@ -88,10 +89,10 @@ export function Toolbar() {
   return (
     <div
       // Sits above an open console rather than under it: the tools have to
-      // stay reachable while the user is reading a build error.
-      className={`panel absolute left-1/2 -translate-x-1/2 z-30 flex items-center gap-0.5 px-1.5 py-1 select-none transition-[bottom] duration-150 ${
-        consoleOpen ? "bottom-[15rem]" : "bottom-4"
-      }`}
+      // stay reachable while the user is reading a build error. The drawer is
+      // resizable, so the lift is its live height: inset + header + body + gap.
+      className="panel absolute left-1/2 -translate-x-1/2 z-30 flex items-center gap-0.5 px-1.5 py-1 select-none transition-[bottom] duration-150"
+      style={{ bottom: consoleOpen ? 12 + 33 + consoleHeight + 12 : 16 }}
     >
       {TOOLS.map((t) => {
         const Icon = t.icon;

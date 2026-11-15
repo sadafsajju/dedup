@@ -404,8 +404,10 @@ const CHECKER = {
   backgroundPosition: "0 0,3px 3px",
 } as const;
 
-export function Swatch({ value }: { value: string | null }) {
-  const css = cssColor(value);
+export function Swatch({ value, css: painted }: { value: string | null; css?: string | null }) {
+  // `painted` is the colour the page resolved the token to, when known — the
+  // only way a project's own token (`primary`) gets a real swatch.
+  const css = painted ?? cssColor(value);
   return (
     <span
       title={css ?? (value ? `${value} — not a resolvable colour` : "no colour")}

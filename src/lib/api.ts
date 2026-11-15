@@ -1,6 +1,6 @@
 // Typed wrappers over the Tauri command + event surface.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
@@ -15,19 +15,11 @@ import type {
   ProjectInfo,
   ReadyEvent,
   RecentProject,
-  DriftProgress,
-  DriftResult,
-  ScanProgress,
-  ScanResult,
   SessionSeed,
   AuthContext,
   StatusEvent,
-  MergePlan,
-  MergePreview,
-  GateResult,
   HistoryEntry,
-  TrashEntry,
-  VisualDiff,
+  SyncStatus,
   NextStatus,
   CliAgent,
   StarterKind,
@@ -38,6 +30,11 @@ export const detectProject = (root: string) =>
 
 export const gitStatus = (root: string) =>
   invoke<GitStatus>("git_status", { root });
+
+/** The menu bar's Settings… (⌘,) — the native menu item lives in Rust
+ *  (appmenu.rs) and says so with this event. Resolves to the unsubscribe. */
+export const onOpenSettings = (cb: () => void): Promise<UnlistenFn> =>
+  listen("open-settings", () => cb());
 
 /** One artboard export. Rendered by WebKit at the artboard's real size in an
  *  off-screen view — not a crop of the canvas (see export.rs). */
@@ -93,6 +90,8 @@ export const startDevServer = (project: ProjectInfo, customCommand?: string) =>
     devScript: project.devScript,
     devScriptName: project.devScriptName,
     staticDir: project.staticDir,
+    runCommand: project.runCommand,
+    stack: project.stack,
     customCommand: customCommand ?? null,
   });
 
@@ -221,25 +220,6 @@ export const grepProject = (root: string, pattern: string) =>
     error?: string;
   }>("grep_project", { root, pattern });
 
-// --- Duplicate scan (FR-5.x) -----------------------------------------------
-
-/** `files` scopes clustering to the current canvas page; omit for project-wide. */
-export const scanProject = (root: string, files?: string[] | null) =>
-  invoke<ScanResult>("scan_project", { root, files: files ?? null });
-
-/** Last persisted scan for the project, or null when never scanned. */
-export const loadScanResult = (root: string) =>
-  invoke<ScanResult | null>("load_scan_result", { root });
-
-/** Inline drift (FR-5.10): repeated JSX subtrees that were never components.
- * `files` scopes it to the current canvas page, as with the scan. */
-export const extractProject = (root: string, files?: string[] | null) =>
-  invoke<DriftResult>("extract_project", { root, files: files ?? null });
-
-/** Last persisted drift run, or null when it has never run here. */
-export const loadExtractResult = (root: string) =>
-  invoke<DriftResult | null>("load_extract_result", { root });
-
 /** Is this coding-agent CLI installed? (preferred AI backends — they run on
  *  a subscription the user already has; an API key is the fallback). */
 export const agentAvailable = (agent: CliAgent) =>
@@ -280,7 +260,7 @@ export const importAgentAsset = (
     adaptExtension,
   });
 
-/** Cached AI category assignments (file#name → {hash, category}). */
+/** Reviewed mock-session seed, if configured. */
 export const loadSessionSeed = (root: string) =>
   invoke<SessionSeed | null>("load_session_seed", { root });
 
@@ -289,27 +269,6 @@ export const saveSessionSeed = (root: string, enabled: boolean, script: string) 
 
 export const collectAuthContext = (root: string) =>
   invoke<AuthContext>("collect_auth_context", { root });
-
-export const loadCategories = (root: string) =>
-  invoke<Record<string, { hash: string; category: string }> | null>(
-    "load_categories",
-    { root },
-  );
-
-export const saveCategories = (
-  root: string,
-  categories: Record<string, { hash: string; category: string }>,
-) => invoke<void>("save_categories", { root, categories });
-
-export const onDriftProgress = (
-  cb: (e: DriftProgress) => void,
-): Promise<UnlistenFn> =>
-  listen<DriftProgress>("drift://progress", (e) => cb(e.payload));
-
-export const onScanProgress = (
-  cb: (e: ScanProgress) => void,
-): Promise<UnlistenFn> =>
-  listen<ScanProgress>("scan://progress", (e) => cb(e.payload));
 
 /** Returns [branch, shortHash]. */
 export const commitSession = (root: string, message: string, paths: string[]) =>
@@ -391,6 +350,46 @@ export const onDevServerStatus = (
 ): Promise<UnlistenFn> =>
   listen<StatusEvent>("devserver://status", (e) => cb(e.payload));
 
+// --- Terminals (console drawer) ---------------------------------------------
+
+/** A login shell on a PTY in `cwd`. Output arrives on `onOutput` as raw bytes
+ *  (a multi-byte character can straddle two chunks, so it is never decoded
+ *  here — xterm reassembles it). */
+export const openTerminal = (
+  cwd: string,
+  cols: number,
+  rows: number,
+  onOutput: (bytes: Uint8Array) => void,
+) => {
+  const output = new Channel<ArrayBuffer>();
+  output.onmessage = (buf) => onOutput(new Uint8Array(buf));
+  return invoke<{ id: number; shell: string }>("terminal_open", {
+    cwd,
+    cols,
+    rows,
+    output,
+  });
+};
+
+export const writeTerminal = (id: number, data: string) =>
+  invoke<void>("terminal_write", { id, data });
+
+export const resizeTerminal = (id: number, cols: number, rows: number) =>
+  invoke<void>("terminal_resize", { id, cols, rows });
+
+export const closeTerminal = (id: number) =>
+  invoke<void>("terminal_close", { id });
+
+export const closeAllTerminals = () => invoke<void>("terminal_close_all");
+
+/** The shell ended on its own (`exit`, ^D) — not sent for one we closed. */
+export const onTerminalExit = (
+  cb: (e: { id: number; code: number | null }) => void,
+): Promise<UnlistenFn> =>
+  listen<{ id: number; code: number | null }>("terminal://exit", (e) =>
+    cb(e.payload),
+  );
+
 export const onInstrumentation = (
   cb: (e: InstrumentationInfo) => void,
 ): Promise<UnlistenFn> =>
@@ -411,35 +410,6 @@ export const detectRoutesFromSource = (root: string, framework: Framework) =>
 export const nextStatus = (root: string) =>
   invoke<NextStatus>("next_status", { root });
 
-// --- Guarded merge (FR-5.4 → FR-5.7) ----------------------------------------
-
-/** Read-only: member sources, prop signatures, behaviour, traced call sites. */
-export const mergePlan = (root: string, members: { file: string; name: string }[]) =>
-  invoke<MergePlan>("merge_plan", { root, members });
-
-/** `dryRun` returns every file's before/after and writes nothing. */
-export const mergeApply = (
-  root: string,
-  canonical: { name: string; file: string; source: string },
-  mapping: { name: string; file: string; props: Record<string, unknown> }[],
-  dryRun: boolean,
-) => invoke<MergePreview>("merge_apply", { root, canonical, mapping, dryRun });
-
-/** Staged-deletion lifecycle (FR-5.5). */
-export const mergeTrash = (
-  root: string,
-  action: "list" | "restore" | "empty",
-  files?: string[] | null,
-) =>
-  invoke<{ ok: boolean; files?: TrashEntry[]; restored?: string[]; deleted?: number }>(
-    "merge_trash",
-    { root, action, files: files ?? null },
-  );
-
-/** One safety gate. A project with no such script reports `skipped`. */
-export const runCheck = (root: string, kind: "typecheck" | "build") =>
-  invoke<GateResult>("run_check", { root, kind });
-
 /** dedup's own commits on the session branch, newest first (FR-5.7). */
 export const sessionHistory = (root: string, limit?: number) =>
   invoke<HistoryEntry[]>("session_history", { root, limit: limit ?? null });
@@ -448,43 +418,20 @@ export const sessionHistory = (root: string, limit?: number) =>
 export const revertCommit = (root: string, hash: string) =>
   invoke<string>("revert_commit", { root, hash });
 
-// --- Visual pass (FR-5.2 visual signal, FR-5.6 #3) --------------------------
+/** Branch/remote standing for the Commit tab. Reads refs; never fetches. */
+export const gitSyncStatus = (root: string) =>
+  invoke<SyncStatus>("git_sync_status", { root });
+
+/** Push one named branch to one named remote. Never forced. */
+export const gitPush = (root: string, remote: string, branch: string) =>
+  invoke<{ remote: string; branch: string }>("git_push", { root, remote, branch });
+
+/** Fast-forward `target` to the session branch, or throw the refusal. */
+export const gitLand = (root: string, session: string, target: string) =>
+  invoke<{ target: string; from: string; commits: number }>("git_land", {
+    root,
+    session,
+    target,
+  });
 
 export type Rect = { x: number; y: number; width: number; height: number };
-
-/** Snapshot a canvas region under `label`, held in Rust for a later compare. */
-export const visualCapture = (label: string, rect?: Rect | null) =>
-  invoke<void>("visual_capture", { label, rect: rect ?? null });
-
-export const visualCompare = (before: string, after: string) =>
-  invoke<VisualDiff>("visual_compare", { before, after });
-
-/** Perceptual hash of a canvas region, as hex. */
-export const visualHash = (rect?: Rect | null) =>
-  invoke<string>("visual_hash", { rect: rect ?? null });
-
-export const visualSimilarity = (a: string, b: string) =>
-  invoke<number>("visual_similarity", { a, b });
-
-export const visualForget = (prefix?: string) =>
-  invoke<void>("visual_forget", { prefix: prefix ?? null });
-
-/**
- * Where an artboard sits in the app window right now, in CSS px — the region
- * the snapshot API captures. Returns null when that artboard isn't mounted
- * (off-screen frames unmount), which the caller must treat as "cannot check",
- * never as "nothing changed".
- */
-export function artboardRect(route: string): Rect | null {
-  const el = document.querySelector(`[data-artboard="${CSS.escape(route)}"]`);
-  const r = el?.getBoundingClientRect();
-  if (!r || r.width < 1 || r.height < 1) return null;
-  // Clip to the visible window: a frame scrolled half off-screen would
-  // otherwise capture a region the webview cannot rasterise.
-  const x = Math.max(0, r.x);
-  const y = Math.max(0, r.y);
-  const width = Math.min(r.right, window.innerWidth) - x;
-  const height = Math.min(r.bottom, window.innerHeight) - y;
-  if (width < 1 || height < 1) return null;
-  return { x, y, width, height };
-}

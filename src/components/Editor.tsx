@@ -1,13 +1,12 @@
 import { useEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  closeAllTerminals,
   onDevServerExit,
   onDevServerLog,
   onDevServerReady,
   onDevServerStatus,
   onInstrumentation,
-  onDriftProgress,
-  onScanProgress,
   startDevServer,
   stopDevServer,
 } from "../lib/api";
@@ -16,15 +15,10 @@ import { CLI_AGENTS } from "../lib/types";
 import { TopBar } from "./TopBar";
 import { Sidebar } from "./Sidebar";
 import { Canvas } from "./Canvas";
-import { ComponentsView } from "./ComponentsView";
-import { DriftView } from "./DriftView";
 import { Inspector } from "./Inspector";
 import { ConsoleDrawer } from "./ConsoleDrawer";
 import { SessionModal } from "./SessionModal";
 import { DirectWritePrompt } from "./DirectWritePrompt";
-import { ClusterReview } from "./Duplicates";
-import { MergeReview } from "./MergeReview";
-import { HistoryPanel } from "./History";
 import { CodePanel } from "./CodePanel";
 
 export function Editor() {
@@ -61,12 +55,6 @@ export function Editor() {
         }),
       );
       await track(
-        onScanProgress((p) => useStore.getState().setScanProgress(p)),
-      );
-      await track(
-        onDriftProgress((p) => useStore.getState().setDriftProgress(p)),
-      );
-      await track(
         onInstrumentation((i) => useStore.getState().setInstrumentation(i)),
       );
       await track(
@@ -93,20 +81,17 @@ export function Editor() {
       );
 
       if (disposed) return;
-      // A previous session's scan renders immediately instead of demanding
-      // a rescan every time the project is reopened.
-      void useStore.getState().restoreScan();
-      void useStore.getState().restoreDrift();
-      // Probe every agent so the AI switch can say which are installed.
+      // Shells belong to the panes that render them. A webview that reloaded
+      // under a running app has forgotten its panes, so any shell still open
+      // in the core is an orphan nobody can type into.
+      void closeAllTerminals();
+      // Probe every agent so Settings → AI can say which are installed.
       for (const agent of CLI_AGENTS) {
         void useStore.getState().detectAgent(agent.id);
       }
       void useStore.getState().loadSessionSeed();
-      // The history panel is the session branch read back, and the trash tray
-      // may hold files a previous session staged — both are project state, so
-      // they load with the project rather than on first open.
+      // Read the session branch back for the history panel.
       void useStore.getState().loadHistory();
-      void useStore.getState().loadTrash();
       if (!startedRef.current) {
         startedRef.current = true;
         setDevStatus("starting");
@@ -165,17 +150,7 @@ export function Editor() {
         e.preventDefault();
       } else if (e.key === "Escape" && !inField) {
         const s = useStore.getState();
-        // A merge in flight owns Escape first — it is the modal on top, and
-        // dismissing something under it would leave it stranded.
-        if (s.merge) {
-          // Only when it is safe to walk away: mid-apply, closing would
-          // orphan a rollback the user still needs to see.
-          if (s.merge.stage !== "applying" && s.merge.stage !== "gating") {
-            s.cancelMerge();
-          }
-        } else if (s.historyOpen) s.toggleHistory(false);
-        else if (s.codePanel) s.closeCode();
-        else if (s.openClusterId) s.openCluster(null);
+        if (s.codePanel) s.closeCode();
         else if (s.insertKind) s.setInsertKind(null);
         // Escape *while typing* is handled inside the canvas (it puts the
         // original text back), so reaching here means the caret is already
@@ -185,7 +160,7 @@ export function Editor() {
         // (it cancels the stroke); reaching here means there is none, and
         // only the tool is left to leave.
         else if (s.tool === "annotate") s.setTool("select");
-        else if (s.selected) s.clearSelection();
+        else if (s.selected || s.multi.length > 0) s.clearSelection();
         else s.toggleConsole(false);
       } else if ((e.key === "Delete" || e.key === "Backspace") && !inField) {
         // Delete the selected element (staged like any other edit). Refused
@@ -220,20 +195,13 @@ export function Editor() {
     // thing at the centre of the screen.
     <div className="relative h-full bg-surface-0 overflow-hidden">
       <div className="absolute inset-0 flex">
-        {/* Canvas and ComponentsView both stay mounted (hidden via CSS) so
-            switching tabs never reloads the app or harness iframes. */}
         <Canvas />
-        <ComponentsView />
-        <DriftView />
       </div>
       <TopBar />
       <Sidebar />
       <CodePanel />
       <Inspector />
       <ConsoleDrawer />
-      <ClusterReview />
-      <MergeReview />
-      <HistoryPanel />
       <SessionModal />
       <DirectWritePrompt />
     </div>

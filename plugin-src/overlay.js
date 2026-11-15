@@ -8,13 +8,12 @@
 // uses, so a gesture is refused before it starts rather than after a failed
 // save. Nothing here writes to source: gestures become staged actions in the
 // editor, and this file only shows what they would look like.
+import { marqueeHits, marqueeRect } from "./marquee.mjs";
+
 (() => {
   "use strict";
   if (window.__dedupOverlay) return;
   window.__dedupOverlay = true;
-  // Harness pages get the overlay via the shared HTML transform, but they're
-  // static previews — hover/select/page reports would fight the real canvas.
-  if (location.pathname.startsWith("/__dedup/harness")) return;
 
   const ACCENT = "#4c7fff";
   const Z = 2147483646;
@@ -34,6 +33,18 @@
   // this IIFE silently kills every listener after it.
   let drag = null;
   let resizing = null;
+  // Several elements selected at once. Either this holds two or more and
+  // `selectedEl` is null, or it is empty — so everything that belongs to a
+  // single selection (grips, the re-parent drag) is off by construction
+  // rather than by a check someone has to remember.
+  let multiEls = [];
+  // A marquee being drawn in the select tool (see the pointer handlers).
+  let marquee = null;
+  // A marquee release is never also a click: the browser fires one after the
+  // pointer comes up, and it would select whatever the drag happened to end
+  // over. Set on release (and on Escape), spent by that click, and reset by
+  // the next press in case the click never came.
+  let suppressClick = false;
 
   // The staged (unsaved) program, as state — see the `stage` message. Kept
   // whole rather than as deltas so it can be re-applied verbatim whenever
@@ -95,6 +106,13 @@
     borderRadius: "2px",
     zIndex: String(Z + 2),
   });
+
+  // The marquee, and one outline per element of a multi-selection. Screen
+  // pixels like the rest of the chrome. The outlines are a pool grown on
+  // demand in `paintMulti` — a selection has no fixed size to build for.
+  const marqueeBox = makeBox("rgba(76,127,255,0.10)");
+  marqueeBox.style.zIndex = String(Z + 2);
+  const multiBoxes = [];
 
   const dropBox = makeBox("rgba(76,127,255,0.12)");
   dropBox.style.borderStyle = "dashed";
@@ -315,6 +333,7 @@
     document.documentElement.appendChild(dropLine);
     document.documentElement.appendChild(dropBox);
     document.documentElement.appendChild(dropGhost);
+    document.documentElement.appendChild(marqueeBox);
     document.documentElement.appendChild(cursorStyle);
     document.documentElement.appendChild(busyStyle);
     document.documentElement.appendChild(busyBox);
@@ -375,12 +394,6 @@
   // it means undo whatever we applied last, then replay from scratch. Undo,
   // redo, reverting one action out of the middle, and recovering after React
   // re-renders a node we touched all take that same path.
-
-  /** dedup ids are `<file>@<ordinal>`; the file half is the scan's unit. */
-  function fileOfId(id) {
-    const at = (id || "").lastIndexOf("@");
-    return at > 0 ? id.slice(0, at) : null;
-  }
 
   const byId = (id) => document.querySelector(`[data-dedup-id="${CSS.escape(id)}"]`);
   const allById = (id) =>
@@ -885,8 +898,18 @@
       cur = cur.parentElement;
     }
     const r = el.getBoundingClientRect();
+    // What the element is actually painted with. A class like `bg-primary`
+    // names a token only this page can resolve — the editor has its own theme,
+    // not the project's — so the inspector would otherwise show the name and
+    // an empty swatch. Read once, with the class list it belongs to.
+    const cs = getComputedStyle(el) || {};
     return {
       ...describe(el),
+      colors: {
+        background: cs.backgroundColor || null,
+        text: cs.color || null,
+        border: cs.borderTopColor || null,
+      },
       rect: { x: r.x, y: r.y, width: r.width, height: r.height },
       instanceCount: document.querySelectorAll(
         `[data-dedup-id="${CSS.escape(id)}"]`,
@@ -975,11 +998,15 @@
       // tool leaves the select tool's drag armed, and a grab cursor over the
       // words you are typing is the wrong answer to "what happens if I click".
       !editingEl &&
+      !(marquee && marquee.active) &&
       hoverEl &&
       hoverEl.isConnected &&
-      structurallyEditable(hoverEl)
+      // Only the selection can be picked up (see `dragOwner`): anywhere else
+      // a drag draws a marquee, and a grab cursor there would be a promise
+      // the gesture does not keep.
+      dragOwner(hoverEl)
     ) {
-      setCursor("grab", hoverEl.getAttribute("data-dedup-id"));
+      setCursor("grab", selectedEl.getAttribute("data-dedup-id"));
     } else setCursor(null);
     if (selectedEl && selectedEl.isConnected) {
       const r = position(selectBox, selectedEl);
@@ -987,6 +1014,29 @@
     } else {
       selectBox.style.display = "none";
       hideHandles();
+    }
+    paintMulti();
+  }
+
+  /** One outline per element of a multi-selection — or, while a marquee is
+   *  being drawn, per element it would select, so the answer to "what am I
+   *  about to get" is on screen before the pointer comes up. */
+  function paintMulti() {
+    let els = multiEls;
+    if (marquee && marquee.active) {
+      els = marquee.additive ? unionById(marquee.base, marquee.hits) : marquee.hits;
+    }
+    els = els.filter((el) => el.isConnected);
+    while (multiBoxes.length < els.length) {
+      const box = makeBox("transparent");
+      box.style.borderWidth = "1.5px";
+      box.setAttribute("data-dedup-multi", "");
+      document.documentElement.appendChild(box);
+      multiBoxes.push(box);
+    }
+    for (let i = 0; i < multiBoxes.length; i++) {
+      if (i < els.length) position(multiBoxes[i], els[i]);
+      else multiBoxes[i].style.display = "none";
     }
   }
 
@@ -1100,10 +1150,25 @@
       if (el) select(el);
       else {
         selectedEl = null;
+        multiEls = [];
         repaint();
       }
+    } else if (m.type === "select-ids") {
+      // The editor's multi-selection, mirrored: broadcast to every frame, so
+      // each outlines the ones it holds and drops the rest. With `report`
+      // the frame holding any of them answers the way a marquee would — the
+      // editor needs each element's payload, and only the page has those.
+      const ids = Array.isArray(m.ids) ? m.ids : [];
+      const els = [];
+      for (const id of ids) {
+        const el = typeof id === "string" ? byId(id) : null;
+        if (el) els.push(el);
+      }
+      setSelection(inDocumentOrder(els));
+      if (m.report && els.length > 0) reportSelection();
     } else if (m.type === "clear") {
       selectedEl = null;
+      multiEls = [];
       hoverEl = null;
       repaint();
     } else if (m.type === "stage") {
@@ -1140,6 +1205,8 @@
       dragEnabled = !!m.drag;
       insertArmed = !!m.insert;
       if (!insertArmed) hideDropIndicator();
+      // The marquee belongs to the select tool; leaving it mid-drag ends it.
+      if (!dragEnabled || insertArmed) cancelMarquee();
       repaint();
     } else if (m.type === "set-resizable") {
       // The editor answers "may this element's size be edited?" from the
@@ -1157,6 +1224,8 @@
       if (mode === "browse") {
         hoverEl = null;
         selectedEl = null;
+        multiEls = [];
+        cancelMarquee();
         repaint();
       }
     } else if (m.type === "release-hold") {
@@ -1178,46 +1247,6 @@
       repaint();
     } else if (m.type === "copy-element") {
       reportElementHtml(m.id);
-    } else if (m.type === "list-files") {
-      // Source files behind everything currently rendered (FR-5.1 canvas
-      // scope). dedupId is "file@ordinal" — strip the ordinal.
-      const files = new Set();
-      for (const el of document.querySelectorAll("[data-dedup-id]")) {
-        const file = fileOfId(el.getAttribute("data-dedup-id"));
-        if (file) files.add(file);
-      }
-      post("files", { files: [...files] });
-    } else if (m.type === "list-sizes") {
-      // Rendered size of each component as it appears on THIS page: for every
-      // (file, component) pair, the outermost tagged element of its first
-      // on-page instance — the component gallery sizes its preview cards to
-      // match the site. Nested elements of the same component (its inner
-      // markup, or recursive instances) are skipped.
-      const keyFor = (el) => {
-        const name = el.getAttribute("data-dedup-component");
-        const file = fileOfId(el.getAttribute("data-dedup-id"));
-        return name && file ? file + "#" + name : null;
-      };
-      const sizes = {};
-      for (const el of document.querySelectorAll("[data-dedup-id]")) {
-        const key = keyFor(el);
-        if (!key || sizes[key]) continue; // first instance wins
-        let cur = el.parentElement;
-        let nested = false;
-        while (cur) {
-          if (cur.hasAttribute("data-dedup-id") && keyFor(cur) === key) {
-            nested = true;
-            break;
-          }
-          cur = cur.parentElement;
-        }
-        if (nested) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width >= 1 && r.height >= 1) {
-          sizes[key] = { w: Math.ceil(r.width), h: Math.ceil(r.height) };
-        }
-      }
-      post("component-sizes", { sizes });
     } else if (m.type === "navigate") {
       // Snap this frame back to its pinned route after a navigation spawned
       // a new artboard. Soft first (react-router listens to popstate, no
@@ -1258,8 +1287,183 @@
 
   function select(el) {
     selectedEl = el;
+    multiEls = [];
     repaint();
     post("selected", { payload: payload(el) });
+  }
+
+  // --- multi-selection ------------------------------------------------------
+  // A selection is a set of *source* elements, so it is unique by dedup id:
+  // two rows of one `.map()` are one element to the editor, and counting them
+  // twice would put "2 elements selected" over a delete that removes one.
+
+  function currentSelection() {
+    return multiEls.length > 0 ? multiEls : selectedEl ? [selectedEl] : [];
+  }
+
+  function uniqueById(els) {
+    const seen = new Set();
+    const out = [];
+    for (const el of els) {
+      const id = el.getAttribute("data-dedup-id");
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(el);
+    }
+    return out;
+  }
+
+  function unionById(a, b) {
+    return uniqueById([...a, ...b]);
+  }
+
+  /** Page order, whatever order the elements were picked in — it is the
+   *  order a copy of them is pasted in, so it has to be the one on screen. */
+  function inDocumentOrder(els) {
+    const want = new Set(els);
+    const out = [];
+    for (const el of document.querySelectorAll("[data-dedup-id]")) {
+      if (want.has(el)) out.push(el);
+    }
+    return out;
+  }
+
+  function setSelection(els) {
+    const list = uniqueById(els);
+    selectedEl = list.length === 1 ? list[0] : null;
+    multiEls = list.length > 1 ? list : [];
+    repaint();
+  }
+
+  /** Tell the editor what is selected now, in whichever shape fits. */
+  function reportSelection() {
+    const els = currentSelection();
+    if (els.length === 0) post("deselected", {});
+    else if (els.length === 1) post("selected", { payload: payload(els[0]) });
+    else post("selected-many", { payloads: els.map(payload) });
+  }
+
+  // --- marquee --------------------------------------------------------------
+  // The rule for which drag is which lives in `dragOwner`: a drag that starts
+  // inside the one selected element picks it up, and every other drag in the
+  // select tool draws a marquee. What the rectangle selects is decided by
+  // marquee.mjs, not here.
+
+  /**
+   * The element a press at `el` would pick up, or null when the press should
+   * draw a marquee instead. Only a single selection can be dragged, and only
+   * from inside itself: select, then move — Figma's order. Asking for it the
+   * other way round (any press on any element is a drag) left no room on a
+   * page for a marquee at all, because a page has no empty space: every pixel
+   * of it is inside some element.
+   */
+  function dragOwner(el) {
+    if (!el || !selectedEl || multiEls.length > 0) return null;
+    if (!selectedEl.isConnected || !selectedEl.contains(el)) return null;
+    return structurallyEditable(selectedEl) ? selectedEl : null;
+  }
+
+  /** The elements the marquee `m` currently selects. */
+  function marqueeTargets(m) {
+    const all = [];
+    for (const el of document.querySelectorAll("[data-dedup-id]")) {
+      if (!el.hasAttribute("data-dedup-ui")) all.push(el);
+    }
+    const indexOf = new Map();
+    all.forEach((el, i) => indexOf.set(el, i));
+    const nodes = all.map((el) => {
+      const r = el.getBoundingClientRect();
+      const parent = tagged(el.parentElement);
+      return {
+        parent: parent && indexOf.has(parent) ? indexOf.get(parent) : -1,
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+      };
+    });
+    const rect = marqueeRect(m.x, m.y, m.x1, m.y1);
+    return marqueeHits(nodes, rect).map((i) => all[i]);
+  }
+
+  function paintMarquee(m) {
+    // Drawn only as far as the page goes: the pointer is captured and can be
+    // well past the frame's edge, where there is nothing to draw on.
+    const x0 = Math.max(0, Math.min(m.x, m.x1));
+    const y0 = Math.max(0, Math.min(m.y, m.y1));
+    const x1 = Math.min(window.innerWidth, Math.max(m.x, m.x1));
+    const y1 = Math.min(window.innerHeight, Math.max(m.y, m.y1));
+    Object.assign(marqueeBox.style, {
+      display: "block",
+      left: x0 + "px",
+      top: y0 + "px",
+      width: Math.max(0, x1 - x0) + "px",
+      height: Math.max(0, y1 - y0) + "px",
+    });
+  }
+
+  /** Put a marquee away without selecting anything. */
+  function cancelMarquee() {
+    if (!marquee) return;
+    const wasActive = marquee.active;
+    marquee = null;
+    marqueeBox.style.display = "none";
+    // The pointer is usually still down; the click its release produces must
+    // not select whatever it lands on.
+    if (wasActive) suppressClick = true;
+  }
+
+  /** ~60/sec, like the resize: hit-testing reads every tagged element's
+   *  rect, which is too much to do per pointer event on a long page. The
+   *  release always computes afresh, so a throttled-away move is never the
+   *  answer. */
+  const MARQUEE_THROTTLE_MS = 16;
+
+  function moveMarquee(e) {
+    const m = marquee;
+    if (!m.active) {
+      const moved = Math.abs(e.clientX - m.x) + Math.abs(e.clientY - m.y);
+      if (moved < DRAG_THRESHOLD) return;
+      m.active = true;
+      hoverEl = null;
+      // Same reason a re-parent drag captures: without it the frame goes
+      // deaf at its own edge and a marquee dragged past it never ends.
+      try {
+        document.documentElement.setPointerCapture(m.pointerId);
+      } catch {
+        // No capture: the marquee still works inside the frame.
+      }
+    }
+    // Otherwise the browser reads the drag as a text selection.
+    e.preventDefault();
+    m.x1 = e.clientX;
+    m.y1 = e.clientY;
+    const now = Date.now();
+    if (now - m.lastHit >= MARQUEE_THROTTLE_MS) {
+      m.lastHit = now;
+      m.hits = marqueeTargets(m);
+    }
+    paintMarquee(m);
+    repaint();
+  }
+
+  function endMarquee(e) {
+    const m = marquee;
+    marquee = null;
+    marqueeBox.style.display = "none";
+    if (!m.active) {
+      // Never travelled: an ordinary click, and the click handler's to read.
+      repaint();
+      return;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    suppressClick = true;
+    m.x1 = e.clientX;
+    m.y1 = e.clientY;
+    const hits = marqueeTargets(m);
+    setSelection(inDocumentOrder(m.additive ? unionById(m.base, hits) : hits));
+    reportSelection();
   }
 
   // --- drag to re-parent, click to insert ----------------------------------
@@ -1549,16 +1753,40 @@
     (e) => {
       if (mode !== "inspect" || !dragEnabled || insertArmed) return;
       if (e.button !== 0 || isEditing(e.target)) return;
+      suppressClick = false;
+      // The grips are chrome with a gesture of their own.
+      if (e.target && e.target.hasAttribute && e.target.hasAttribute("data-dedup-ui")) {
+        return;
+      }
       const el = tagged(e.target);
-      if (!structurallyEditable(el)) return;
-      drag = {
-        el,
+      // Which drag this press could become. Inside the single selection it is
+      // the re-parent drag, of the selected element; anywhere else — or with
+      // Shift, which always means "add to the selection" — it is a marquee.
+      const owner = e.shiftKey ? null : dragOwner(el);
+      if (owner) {
+        drag = {
+          el: owner,
+          x: e.clientX,
+          y: e.clientY,
+          active: false,
+          target: null,
+          pointerId: e.pointerId,
+          outside: false,
+        };
+        return;
+      }
+      marquee = {
         x: e.clientX,
         y: e.clientY,
-        active: false,
-        target: null,
+        x1: e.clientX,
+        y1: e.clientY,
         pointerId: e.pointerId,
-        outside: false,
+        active: false,
+        additive: !!e.shiftKey,
+        // What Shift adds to: the selection as it stood when the drag began.
+        base: e.shiftKey ? currentSelection().slice() : [],
+        hits: [],
+        lastHit: 0,
       };
     },
     true,
@@ -1576,6 +1804,10 @@
       }
       if (insertArmed && mode === "inspect") {
         showDropIndicator(dropTargetAt(e.clientX, e.clientY, null));
+        return;
+      }
+      if (marquee) {
+        moveMarquee(e);
         return;
       }
       if (!drag) return;
@@ -1648,6 +1880,12 @@
         }
         return;
       }
+      if (marquee) {
+        // Before the drag branch and returning from it: a marquee release is
+        // a selection and nothing else — never a `drop`.
+        endMarquee(e);
+        return;
+      }
       if (!drag) return;
       const finished = drag;
       drag = null;
@@ -1685,6 +1923,7 @@
     dropLifted(drag);
     drag = null;
     hideDropIndicator();
+    cancelMarquee();
     repaint();
   });
 
@@ -1736,6 +1975,15 @@
             e.key === "b" ||
             e.key === "t"));
       if (!forwarded) return;
+      if (marquee?.active && e.key === "Escape") {
+        // Escape mid-marquee takes back the marquee, not the selection that
+        // was there before it — so it is not forwarded as the editor's
+        // "deselect".
+        cancelMarquee();
+        repaint();
+        e.preventDefault();
+        return;
+      }
       if (drag?.active && e.key === "Escape") {
         dropLifted(drag);
         drag = null;
@@ -1756,6 +2004,7 @@
     "mousemove",
     (e) => {
       if (mode === "browse" || drag?.active || insertArmed) return;
+      if (marquee && marquee.active) return;
       const el = tagged(e.target);
       if (el !== hoverEl) {
         hoverEl = el;
@@ -1786,10 +2035,32 @@
       endTextEdit();
       e.preventDefault();
       e.stopImmediatePropagation();
+      // The click a marquee's release produces: already answered.
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
       // A click that ended a drag or placed an element is not a selection.
       if (drag?.active || insertArmed) return;
       const el = tagged(e.target);
+      if (el && e.shiftKey && dragEnabled) {
+        // Shift-click adds one element to the selection, or takes it out.
+        const id = el.getAttribute("data-dedup-id");
+        const current = currentSelection();
+        const without = current.filter((c) => c.getAttribute("data-dedup-id") !== id);
+        setSelection(
+          inDocumentOrder(without.length < current.length ? without : [...current, el]),
+        );
+        reportSelection();
+        return;
+      }
       if (el) select(el);
+      else if (dragEnabled) {
+        // Nothing of the project's under the pointer: the page's own empty
+        // space, which in the select tool means "select nothing".
+        setSelection([]);
+        reportSelection();
+      }
     },
     true,
   );

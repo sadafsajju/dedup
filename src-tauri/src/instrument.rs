@@ -27,6 +27,49 @@ pub struct Instrumentation {
     /// Absolute path to the executable to spawn (node_modules/.bin/vite).
     pub program: PathBuf,
     pub args: Vec<String>,
+    /// Env assignments lifted off the front of the dev script, so whatever it
+    /// set up still applies when dedup spawns the binary itself.
+    pub env: Vec<(String, String)>,
+}
+
+/// A dev script read as `KEY=value… command args…`: the env it sets, then its
+/// words. None for anything that chains, pipes or substitutes — a command
+/// dedup cannot claim to understand well enough to rewrite.
+///
+/// `cross-env` in front is the same thing spelled portably, and `npx`/`bunx`
+/// only locate the binary dedup is about to spawn by path anyway, so both are
+/// read through rather than treated as a different command.
+pub(crate) fn split_script(script: &str) -> Option<(Vec<(String, String)>, Vec<&str>)> {
+    let script = script.trim();
+    if ["&&", "||", ";", "|", "$(", "`", ">", "<"]
+        .iter()
+        .any(|op| script.contains(op))
+    {
+        return None;
+    }
+    let mut env = Vec::new();
+    let mut tokens = script.split_whitespace().peekable();
+    if tokens.peek() == Some(&"cross-env") {
+        tokens.next();
+    }
+    while let Some(token) = tokens.peek() {
+        // `KEY=value` before the command is an env assignment, not an argument.
+        let Some((key, value)) = token.split_once('=') else { break };
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || key.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            break;
+        }
+        env.push((key.to_string(), value.trim_matches(['"', '\'']).to_string()));
+        tokens.next();
+    }
+    if matches!(tokens.peek(), Some(&"npx") | Some(&"bunx")) {
+        tokens.next();
+    }
+    Some((env, tokens.collect()))
 }
 
 pub fn setup(root: &str, dev_script: Option<&str>) -> Result<Option<Instrumentation>, String> {
@@ -37,10 +80,14 @@ pub fn setup(root: &str, dev_script: Option<&str>) -> Result<Option<Instrumentat
         return Ok(None);
     }
 
-    // Only rewrite dev scripts that are a bare vite invocation (`vite`,
-    // `vite --port 3001`, `vite dev`). Anything fancier runs untouched.
-    let script = dev_script.unwrap_or("vite");
-    let mut parts = script.split_whitespace();
+    // Rewrite dev scripts that are a vite invocation dedup can read: `vite`,
+    // `vite --port 3001`, `vite dev`, and the same behind env assignments
+    // (`NODE_ENV=development vite`, `cross-env FOO=1 vite`) or `npx`.
+    // Anything fancier runs untouched.
+    let Some((env, words)) = split_script(dev_script.unwrap_or("vite")) else {
+        return Ok(None);
+    };
+    let mut parts = words.into_iter();
     if parts.next() != Some("vite") {
         return Ok(None);
     }
@@ -67,6 +114,7 @@ pub fn setup(root: &str, dev_script: Option<&str>) -> Result<Option<Instrumentat
     Ok(Some(Instrumentation {
         program: vite_bin,
         args,
+        env,
     }))
 }
 
@@ -94,6 +142,11 @@ export default async (env) => {{
   let user = userMod ?? {{}};
   if (typeof user === 'function') user = await user(env);
   user.plugins = [dedupTagger({{ root: '{root_str}' }}), ...(user.plugins || [])];
+  // A pinned port is a promise to something else — a Tauri or Electron shell
+  // that loads a fixed devUrl. dedup starts only Vite and reads the address it
+  // prints, so when that port is taken (by the app's own `tauri dev`, say)
+  // the next free one is as good, and refusing to start helps nobody.
+  if (user.server?.strictPort) user.server = {{ ...user.server, strictPort: false }};
   return user;
 }};
 "#
@@ -118,6 +171,30 @@ mod tests {
         dir
     }
 
+    /// An env assignment in front of `vite` is still a vite script. Declining
+    /// it cost the project its tagging over a `NODE_ENV=` it never needed
+    /// dedup to understand — only to carry.
+    #[test]
+    fn reads_through_env_prefixes_and_carries_them() {
+        let dir = temp_project("envprefix", true, true);
+        for script in [
+            "NODE_ENV=development vite --host",
+            "cross-env NODE_ENV=development vite --host",
+            "NODE_ENV=development npx vite --host",
+        ] {
+            let out = setup(dir.to_str().unwrap(), Some(script))
+                .unwrap()
+                .unwrap_or_else(|| panic!("should instrument `{script}`"));
+            assert_eq!(out.env, vec![("NODE_ENV".to_string(), "development".to_string())]);
+            assert_eq!(out.args[0], "--host");
+        }
+        // A chained command is not one dedup rewrites.
+        assert!(setup(dir.to_str().unwrap(), Some("tsc && vite"))
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn rewrites_plain_vite_script_and_writes_assets() {
         let dir = temp_project("basic", true, true);
@@ -132,6 +209,8 @@ mod tests {
         let wrapper =
             std::fs::read_to_string(dir.join("node_modules/.dedup/vite.config.mjs")).unwrap();
         assert!(wrapper.contains("vite.config.ts';"));
+        // Tauri's template pins its port; dedup's launch must not inherit that.
+        assert!(wrapper.contains("strictPort: false"));
         assert!(dir.join("node_modules/.dedup/dedup-tagger.mjs").exists());
         assert!(dir.join("node_modules/.dedup/dedup-overlay.js").exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -216,6 +295,7 @@ pub fn static_setup(root: &str, static_dir: Option<&str>) -> Result<Instrumentat
             "--session".into(),
             dir.join("session.json").to_string_lossy().to_string(),
         ],
+        env: Vec::new(),
     })
 }
 
@@ -320,43 +400,16 @@ pub struct NextLaunch {
 const BUNDLER_FLAGS: [&str; 3] = ["--turbopack", "--turbo", "--webpack"];
 
 pub fn next_webpack_launch(root: &str, dev_script: Option<&str>) -> Option<NextLaunch> {
-    let script = dev_script?.trim();
-    // Anything that chains, pipes or substitutes is a command we cannot claim
-    // to understand well enough to rewrite.
-    if ["&&", "||", ";", "|", "$(", "`", ">", "<"]
-        .iter()
-        .any(|op| script.contains(op))
-    {
-        return None;
-    }
+    let (env, words) = split_script(dev_script?)?;
 
     let bin = Path::new(root).join("node_modules/.bin/next");
     if !bin.exists() {
         return None;
     }
 
-    let mut env = Vec::new();
-    let mut tokens = script.split_whitespace().peekable();
-    while let Some(token) = tokens.peek() {
-        // `KEY=value` before the command is an env assignment, not an argument.
-        let Some((key, value)) = token.split_once('=') else { break };
-        if key.is_empty()
-            || !key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || key.chars().next().is_some_and(|c| c.is_ascii_digit())
-        {
-            break;
-        }
-        env.push((key.to_string(), value.trim_matches(['"', '\'']).to_string()));
-        tokens.next();
-    }
-
-    // The command itself must be `next` (possibly `npx next`, which we skip).
-    let mut command = tokens.next()?;
-    if command == "npx" || command == "bunx" {
-        command = tokens.next()?;
-    }
+    // The command itself must be `next`.
+    let mut tokens = words.into_iter();
+    let command = tokens.next()?;
     if !(command == "next" || command.ends_with("/next")) {
         return None;
     }

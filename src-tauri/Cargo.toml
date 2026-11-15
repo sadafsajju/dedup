@@ -1,8 +1,10 @@
 [package]
 name = "dedup"
 version = "0.1.0"
-description = "Detect and merge near-duplicate React components"
+description = "Visual inspection and editing for web projects"
 authors = ["Sadaf Kasim (GetBega Tech)"]
+license = "MIT"
+repository = "https://github.com/sadafsajju/dedup"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -30,9 +32,6 @@ tokio-native-tls = "0.3"
 
 # Launch-screen thumbnails are base64 data URLs over the IPC boundary.
 base64 = "0.22"
-# Decoding our own WKWebView snapshots for the visual gate + similarity pass
-# (see visual.rs) — pure Rust, so the comparison is testable off a real screen.
-png = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

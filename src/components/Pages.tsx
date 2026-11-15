@@ -205,9 +205,9 @@ export function PagesTab() {
               {selectedRoute === route && (
                 <span
                   className="shrink-0 text-accent"
-                  title="Scan targets this artboard"
+                  title="Selected artboard"
                 >
-                  scan
+                  selected
                 </span>
               )}
               {!open && <span className="shrink-0 text-ink-faint">＋</span>}

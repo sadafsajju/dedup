@@ -706,7 +706,7 @@ mod tests {
             " ",
             "- Local: http://localhost:3000",
             "- PID: 67063",
-            "- Dir: /Users/admin/Documents/sadaf/Apps/web/umrah",
+            "- Dir: /Users/me/projects/shop",
             "- Log: .next/dev/logs/next-development.log",
             "Run kill 67063 to stop it.",
         ] {
@@ -714,7 +714,7 @@ mod tests {
         }
         assert_eq!(
             info.complete(),
-            Some((67063, "/Users/admin/Documents/sadaf/Apps/web/umrah"))
+            Some((67063, "/Users/me/projects/shop"))
         );
     }
 
@@ -733,6 +733,25 @@ mod tests {
         note_stale_lock("- PID: 999", &mut info); // no refusal line seen
         note_stale_lock("- Dir: /tmp/x", &mut info);
         assert_eq!(info.complete(), None);
+    }
+
+    /// The servers dedup starts for backend projects each announce their URL
+    /// in their own words — and two of them wrap it in punctuation that used
+    /// to end up in the address the canvas loaded.
+    #[test]
+    fn reads_the_url_other_dev_servers_announce() {
+        for (line, url) in [
+            ("Starting development server at http://127.0.0.1:8000/", "http://localhost:8000"),
+            ("   INFO  Server running on [http://127.0.0.1:8000].", "http://localhost:8000"),
+            ("PHP 8.3 Development Server (http://localhost:8000) started", "http://localhost:8000"),
+            ("* Listening on http://127.0.0.1:3000", "http://localhost:3000"),
+            ("Web Server is available at http://localhost:1313/ (bind address 127.0.0.1)", "http://localhost:1313"),
+            ("    Server address: http://127.0.0.1:4000/", "http://localhost:4000"),
+            ("INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)", "http://localhost:8000"),
+            ("  Local:            http://localhost:3000", "http://localhost:3000"),
+        ] {
+            assert_eq!(extract_local_url(line).map(|(u, _)| u).as_deref(), Some(url), "{line}");
+        }
     }
 
     #[test]
@@ -764,9 +783,11 @@ fn extract_local_url(line: &str) -> Option<(String, u16)> {
             };
             // Grab any trailing path up to whitespace, normalize host to localhost.
             let after_port = &rest[port_str.len()..];
+            // …and up to the punctuation a log line wraps a URL in: Laravel
+            // prints `[http://127.0.0.1:8000].`, PHP `(http://localhost:8000)`.
             let path: String = after_port
                 .chars()
-                .take_while(|c| !c.is_whitespace())
+                .take_while(|c| !c.is_whitespace() && !matches!(c, ']' | ')' | '"' | '\'' | ',' | '>'))
                 .collect();
             let path = path.trim_end_matches('/');
             let url = format!("{scheme}://localhost:{port}{path}");

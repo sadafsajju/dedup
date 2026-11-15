@@ -191,6 +191,7 @@ export function ChatPanel() {
   const agents = useStore((s) => s.agents);
   const chatActivity = useStore((s) => s.chatActivity);
   const noGit = useStore((s) => s.git?.isRepo === false);
+  const openSettings = useStore((s) => s.openSettings);
   const chat = sessions.find((x) => x.id === activeChatId)?.messages ?? [];
 
   const [draft, setDraft] = useState("");
@@ -475,7 +476,10 @@ export function ChatPanel() {
         )}
         {!anyConnected ? (
           <div className="text-2xs text-warn leading-relaxed mb-1.5">
-            Switch on an AI backend (top-bar AI menu) to chat.
+            Switch on an AI backend in Settings → AI (⌘,) to chat.{" "}
+            <button onClick={() => openSettings("ai")} className="underline hover:text-ink">
+              Open Settings
+            </button>
           </div>
         ) : selected && src ? (
           // The selection *is* the attached context, so removing the chip

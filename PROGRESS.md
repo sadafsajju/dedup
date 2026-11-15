@@ -5,7 +5,25 @@ Updated at the end of every phase (and for significant mid-phase decisions).
 Format per phase: what shipped, FR coverage, deviations from the PRD, and
 known limitations accepted knowingly.
 
-**Current state: Phases 0–5 complete.**
+**Current state (2026-11-10): visual editor; deduplication removed.**
+
+The Canvas/Components tab switch and component gallery have also been removed.
+The editor now opens directly onto its canvas. Component scan controls and
+frontend gallery state no longer run or restore in the editor. The remaining
+implementation has now also been deleted: inventory sidecar and native commands,
+AI categorization and mock props, gallery types and APIs, isolated render harness,
+virtual component exports, and overlay file/size reporting. Shared AI backend
+types now live in `types.ts` for chat and mock-session generation.
+
+Removed duplicate clusters, inline Drift detection, visual similarity scoring,
+merge proposals and codemods, merge gates, the merge deletion tray, associated
+commands, sidecars, and tests. Save history and scoped undo now live
+in `history.rs`.
+
+The phase entries below record earlier implementations and decisions; references
+to the removed features describe historical behavior.
+
+**Earlier milestone: Phases 0–5 complete.**
 (Plus a 2026-08-22 inspector/chrome UI pass, a 2026-08-23 structural-editing
 + element-identity rework, a 2026-08-28 floating-canvas redesign, a
 2026-08-29 pass widening what dedup can open — static HTML sites, and empty
@@ -21,10 +39,10 @@ Tauri 2 shell + project open + dev-server child process + webview canvas.
 | FR | Status | Notes |
 |---|---|---|
 | FR-1.1 open/drag/recents | ✅ | Native picker, drag-onto-window, persisted recents |
-| FR-1.2 detection + compat card | ✅ | pm / Vite·Next / Tailwind / TS / git, full/partial/unsupported verdict |
+| FR-1.2 detection | ✅ | pm / framework / Tailwind / TS / git. The full/partial/unsupported verdict and its card were removed 2026-11-10 — see "Every project opens" |
 | FR-1.3 managed dev server | ✅ | Own process group (killpg teardown), log streaming, ready-URL parse, custom command escape hatch |
 | FR-1.4 canvas + viewports | ✅ | iframe; mobile/tablet/desktop widths, ⌘-scroll zoom |
-| FR-1.5 git state check | ✅ | Dirty-tree acknowledgement gate on the compat card |
+| FR-1.5 git state check | ✅ | Dirty-tree acknowledgement, asked once per project (project details panel) |
 | FR-1.6 failure states | ✅ | Crash panel + restart, slow-start hint, console drawer; port conflicts delegated to Vite's auto-increment |
 
 **Decisions / deviations**
@@ -2671,3 +2689,282 @@ with it.
 put while a new one joins past the rightmost, a board moved far left not
 dragging arrivals with it, positions round-tripping per viewport and dirty
 ones dropped. Not clicked through in the running app.
+
+## A Settings page, from the menu bar (2026-10-25)
+
+AI backends moved out of the top-bar popover into a Settings page, opened from
+the menu bar — **dedup → Settings… (⌘,)**, where every Mac app keeps it — or
+from the top bar's AI status chip ("AI: Claude Code + Codex"), which stays so
+it is always visible whether AI is on.
+
+The menu is Tauri's default with one item inserted after About (`appmenu.rs`),
+not a menu built from scratch: on macOS the Edit menu's items *are* what gives
+text fields ⌘C/⌘V/⌘Z/⌘A, so a hand-written menu that forgot one would break
+copy and paste in every input. Being a native accelerator, ⌘, also works with
+focus inside a canvas iframe, which a keydown listener in the editor window
+could not hear.
+
+The page mounts at the app root, so it opens over the launch screen as well as
+the editor (a backend is chosen once, for every project), with a section rail
+that has one entry today — a new section is a row in `SECTIONS`. Escape closes
+it, taken in the capture phase so the editor's own Escape doesn't also fire.
+Every message that said "the AI menu (top bar)" now says Settings → AI (⌘,),
+and the chat's "no backend" note links straight to it.
+
+Not clicked through in the running app.
+
+Follow-up, same day: the top bar's AI status chip is gone too, at the owner's
+request — the backends live in Settings only. The ways in are the menu bar
+(⌘,) and the chat's "Open Settings", shown exactly when no backend is on, which
+is the moment the chip's orange "AI: off" used to matter.
+
+## Scan moves into the Duplicates tab (2026-10-25)
+
+The top bar's Scan button is gone; scanning lives in the sidebar's Duplicates
+tab, beside the results it produces — the same arrangement Drift already had
+with its own Rerun. "Scan now" in the empty tab and a new **Rescan** in the
+results summary both carry the rule the header button enforced (a live, tagged
+canvas scans the artboard you picked, so they wait for one, saying why), and
+Rescan reads "Organizing…" while the last scan's components are categorized.
+The top bar is now project, view switch, viewport, server status, save and
+history.
+
+## Terminals in the console drawer (2026-10-25)
+
+The console was a read-only feed of the dev server. It is now a tabbed,
+resizable drawer: **Dev server** (the stream and its parsed errors, as before)
+plus any number of shells opened with **+**, each the user's own login shell
+on a PTY in the project root (`terminal.rs`). Drag the drawer's top edge to
+resize it (remembered across projects; the toolbar lifts by the live height).
+⌘K or Clear clears a terminal; a shell that exits leaves its tab readable
+until a key is pressed, as Terminal.app does.
+
+- **A PTY, opened with `libc::openpty` + `setsid`/`TIOCSCTTY`** rather than a
+  crate: libc was already a dependency and the whole thing is ~100 lines with
+  tests driving a real shell. Both ends are `FD_CLOEXEC` — a dev server that
+  inherited a master would keep a closed terminal's tty alive and its shell
+  would never see the hangup.
+- **The pane owns the shell.** Mounting a `TerminalPane` opens it, unmounting
+  hangs it up (SIGHUP to the group, SIGKILL after 800ms, reaped). Panes stay
+  mounted while the drawer is folded, so folding is not closing; leaving the
+  project unmounts them; quitting closes every one (`RunEvent::Exit`), and
+  opening a project sweeps any a reloaded webview orphaned.
+- **Output is raw bytes over a Tauri `Channel`**, never decoded in Rust or in
+  `api.ts` — a UTF-8 character split across two reads would come out as two
+  replacement characters. xterm reassembles it.
+- **Nothing but the user types into a terminal.** The chat agent has no tools
+  by design; a shell would be the most unaudited path to the source there is.
+
+Not clicked through in the running app.
+
+## Every project opens: no compatibility verdict (2026-11-10)
+
+By the owner's decision: there is no "unsupported" or "partially supported"
+dialog any more, and dedup opens almost any web project.
+
+**What changed**
+
+- `project::detect` no longer grades. `SupportLevel` is gone; `ProjectInfo`
+  gains `stack` (what the project is called — "Astro", "Django"), `run_command`
+  (the shell command that starts a project with no package script) and
+  `runnable` (did dedup find a way to start it). `warnings` became `notes`.
+- `Framework` keeps its four values and now means only *how dedup drives it*.
+  `Unknown` is no longer a failure: it is "run the project's own server as
+  written, untagged".
+- Detection recognises more: any package.json with a `dev`/`start`/`develop`/
+  `serve`/`storybook` script; Astro, Remix, Nuxt, SvelteKit, Gatsby, Create
+  React App, Angular, Vue CLI, Docusaurus, Eleventy, Parcel, Rsbuild/Rspack,
+  webpack by dependency; Django, Rails, Laravel, Phoenix, Hugo, Jekyll, MkDocs,
+  FastAPI, Flask and bare PHP by their marker file, each started with the
+  command its own docs give (through the project's virtualenv / uv / poetry /
+  pipenv when it has one).
+- Backends are recognised **before** the JS heuristics, which each got them
+  wrong: Laravel depends on `vite` (was "Vite", and the canvas showed Vite's
+  asset server), Rails ships `public/404.html` (was a static site). Create
+  React App's `public/index.html` template was likewise being served as a flat
+  page; a framework with a server of its own and a script now outranks static.
+- The Vite tagger launch reads through `KEY=value` prefixes, `cross-env` and
+  `npx` (`instrument::split_script`, shared with the Next launch), carrying the
+  env. `NODE_ENV=development vite` used to cost a project its tagging.
+- `extract_local_url` stops at closing punctuation — Laravel prints
+  `[http://127.0.0.1:8000].` and the `]` was ending up in the canvas URL.
+- `CompatCard` → `ProjectDetails`: no badge, no struck-out chips, an always
+  visible start-command field. `reasonToShowCard` → `reasonToAsk`, which
+  returns only `needs-command` (not runnable and none remembered) or
+  `needs-ack` (FR-1.5, once per project). First opens and changed projects go
+  straight in.
+
+**What "opens" means for a project with no tagger** — and what it does not.
+The canvas, routes-by-browsing, viewports, markup, export, the console and
+terminals all work. Click-to-inspect, the Style panel and structural edits do
+not: they need element ids, which only the Vite+React, Next and static-HTML
+pipelines stamp. The editor already says so in place (the instrumentation
+event → Inspector / Layers / Pages). The chat and code panel still write only
+what the write-back can gate — JS/TS, CSS, HTML — so `.vue`, `.svelte`,
+`.astro`, templates and server code are shown, not written. That gate was
+deliberately **not** widened here: "written hopefully" is the thing the safety
+model forbids.
+
+**Kept on purpose:** the dirty-tree acknowledgement. It is not a verdict about
+the project, it is FR-1.5, and dropping it is a safety-model decision that
+was not asked for.
+
+**Known gaps:** a backend that needs a second process for assets (Laravel +
+Vite, Rails + vite_ruby) gets only its app server — two servers print two
+URLs and the first line wins; run the asset watcher in a terminal tab.
+Dependencies that aren't installed are noted in project details, not
+installed. A workspace root is run by its root script and noted as such.
+
+Tests: `cargo test` (detection per stack, env-prefixed vite scripts, URL
+forms), `pnpm test:openprefs` (rewritten for the new rule). Not clicked
+through in the running app.
+
+## Mobile apps open through their web build (2026-11-10)
+
+dedup's canvas is a browser, so a mobile app can be shown only where it has a
+web build. `project::detect_mobile` (the tail of `detect_backend`) names each
+kind and says which case it is:
+
+- **Expo** — `npx expo start --web`, or the project's own `web` script when it
+  has one. Without `react-native-web` the note gives the one install line.
+- **React Native (bare)** — runnable only through a `web` script. Otherwise
+  `runnable: false` with the reason; never the `start` script, which boots
+  Metro and prints no address a browser can open (the canvas would wait
+  forever). A recognised backend/mobile project no longer falls back to a
+  package script at all.
+- **Flutter** — `flutter run -d web-server`. Flutter paints its own canvas, so
+  it is a live preview with no DOM elements to select.
+- **Swift / Kotlin** (`*.xcodeproj` / `*.xcworkspace`, or a Gradle root) —
+  named "iOS app" / "Android app", `runnable: false`, and told plainly there is
+  no web build.
+
+Expo is JS/TS, so the chat and code panel can edit it; element tagging does
+not apply (Metro, not Vite or Next's webpack). Rendering native screens would
+mean a simulator/emulator surface instead of an iframe — a different canvas,
+not attempted. Tests in `cargo test`; not run against a real Expo or Flutter
+project.
+
+## Fix — a Tauri app wouldn't start: "Port 1420 is already in use" (2026-11-10)
+
+Tauri's Vite template sets `server.strictPort: true` on port 1420, because its
+shell loads a fixed `devUrl`. dedup starts only Vite and reads the address
+from its output, so the pin protects nothing here — and it collides whenever
+1420 is taken, which it always is while dedup itself runs under `tauri dev`
+(dedup is a Tauri app on the same template port), or while the user's own
+`tauri dev` is up. The generated wrapper config (`instrument::wrapper_source`)
+now turns `strictPort` off, so Vite takes the next free port. Only in dedup's
+wrapper under `node_modules/.dedup`; the user's config is untouched.
+
+Detection adds a note for Tauri projects: the canvas shows the web frontend
+without the Rust side, so `invoke` calls get no answer.
+
+## Commit tab: one place to review, commit, roll back, push and land (2026-11-10)
+
+The left sidebar has three tabs — **Pages**, **Layers**, **Commit**. The
+Commit tab lists every state a change can be in, top to bottom: staged edits
+(not on disk), a chat proposal (on disk, uncommitted on purpose), and dedup's
+commits on the branch (newest first, files touched, pushed/local, each with
+Undo). Below that, **Publish**.
+
+**Decision (owner, 2026-11-10): dedup may now push, and may move the user's
+own branch — main included.** Until today every git write stayed on
+`dedup/session-*`. The exception is narrow and lives in `publish.rs`:
+
+- Explicit only. Each action is a button whose first click builds a sentence
+  naming the branch, the remote (with its URL) and the commit count; nothing
+  runs until that sentence is confirmed. Nothing here is triggered by a save.
+- **Push**: one named local branch to the same name on one named remote.
+  The refspec is built by dedup with no `+`, so a force is not expressible.
+  No `-u` (no config written), no `--no-verify` (the user's pre-push hook is
+  theirs), `GIT_TERMINAL_PROMPT=0` so a missing credential fails with advice
+  instead of hanging.
+- **Land** ("Bring N commits onto main"): **fast-forward or refuse.** With
+  the target not checked out it is a compare-and-swap of the ref — HEAD, the
+  index and the working tree are untouched, so uncommitted work and a chat
+  preview cannot be carried along. Target checked out in this folder: allowed
+  only on a clean tree. In another worktree: refused. Landing does not push;
+  "Push main" is its own button and its own confirmation.
+- **Diverged is refused, not merged.** A merge commit would be a tree nobody
+  has seen rendered, written to the trunk by a tool. The message gives the
+  two ways on: merge with your own tools, or push the session branch and open
+  a pull request. (An in-memory `merge-tree` merge is possible if this turns
+  out to be the common case — it needs its own decision.)
+- A session cut from a feature branch carries that branch's commits; the
+  button says "5 commits: 3 dedup saves and 2 from the branch this session
+  started on" rather than a bare number. The preselected target is the branch
+  the session most plausibly started from, not always main.
+- Status is read from refs only; dedup never fetches.
+
+**Folded in, nothing dropped.** The top bar's staged-changes popover
+(`ReviewPanel`) and session-history popover (`History`) are gone; their rows —
+per-edit discard, discard all, select on canvas, the class/text diff, per-commit
+Undo — are the Commit tab's. Two popovers and a tab would have been three
+copies of one list. Kept in the top bar: **Save ⌘S** (the quick commit with a
+generated message), the "N edits" chip (now opens the tab), the AI-preview
+chip, the save-failed/Retry/Discard state, and a Commit button where the
+history clock was. Undo is still `history::revert` (restore the commit's own
+paths) — no `git revert`.
+
+**Commit with a message.** `saveAll(message?)`; the subject is always
+`dedup: …` because history and undo recognise dedup's commits by it.
+
+**Fixed on the way: a save could commit an unaccepted AI preview.** A save
+commits whole files, so a staged edit saved into a file a live preview had
+changed took the preview into history. `previewClash` now refuses that save
+(and the code panel's), and blocks Undo on a commit whose file holds a preview.
+
+**No git:** the tab says so first, offers "Set up git", and the button reads
+"Save N edits in place" — still through `needsDirectWriteWarning` +
+`commitOrDirect`. No commits list, no Publish.
+
+Tests: `cargo test` — 18 in `publish.rs` (push: sends only the named branch and
+only commits, no git, no remote, unknown remote/branch, option- and
+refspec-shaped names, detached HEAD, non-fast-forward never forced; land:
+fast-forward leaves tracked/staged/untracked work untouched, diverged, dirty
+checked-out target, other worktree, detached, no git, non-session source,
+session target). `pnpm test:commit` — 23 (the list, the message, when each
+button is offered and the reason when it isn't, the preselected target).
+`pnpm build` typechecks.
+
+**Not clicked through in the running app**, and not run against a real remote:
+the push tests use a local bare repository, so credential prompts, SSH and a
+hosting provider's branch protection are untested. Known limits: undo of a
+commit still overwrites the user's own uncommitted edits to that commit's
+files (older behaviour, unchanged); only the 24 most recent branches plus
+main/master are offered as targets.
+
+## Marquee and multi-selection (2026-11-10)
+
+Asked for in the owner's words: "if i want to select multiple elements i can
+just drag across an artboard which selects the elements".
+
+**Decision — which drag is which.** A press inside the single selected element
+is the re-parent drag (unchanged after that: ghost, park, cross-artboard);
+every other press-and-drag in the select tool draws a marquee. Shift always
+marquees and adds; with several selected a drag is a marquee. Moving an
+element is therefore select-then-drag, where it used to be one gesture on
+anything — the price of having a marquee on a page with no empty space.
+
+**What it does.** Marquee selects the outermost elements it touches and looks
+through a container that encloses it (`plugin-src/marquee.mjs`, pure; the
+overlay is now bundled so it can import it). Shift-click (canvas or a Layers
+row) adds/removes one. Every selected element is outlined; Layers lights all
+of them; the inspector says "N elements selected" and offers Delete / Copy /
+Cut for all of them as one undo step. A copy of several pastes as several,
+also one step. Class edits, text and resize stay single-selection — the store
+keeps `selected` null while `multi` is non-empty, so they cannot act on one of
+several by accident — and the panel says so.
+
+Tests: `pnpm test:overlay` (52; 14 new — start, threshold, geometry, release,
+one/none/many, Escape and blur, never a click or a drop, drag-from-selection
+still re-parents, Shift, shift-click, `select-ids`, select-tool only);
+`pnpm test:marquee` (15 — the hit rule, `outermostOnly`, `toggleId`). The
+drag tests now select before dragging. `pnpm build` typechecks.
+
+**Not tried in the running app.** Nothing here was clicked through: real
+hit-testing and layout, the trailing click under real pointer capture, the
+store's multi delete/copy/cut/paste against a real write-back (they are
+composed from the tested single-element paths but have no test of their own),
+and the Layers and inspector rendering. Known limits: no multi-element
+re-parent drag or class edit; a selection cannot span artboards; multi-delete
+asks the write-back once per element (one sidecar spawn each).

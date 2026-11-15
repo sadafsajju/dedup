@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { startDevServer, stopDevServer } from "../lib/api";
+import { defaultCommand } from "../lib/openPrefs";
 import {
   registerCanvasIframe,
   routeOfWindow,
   sendToFrame,
+  sendToOtherFrames,
   sendToOverlay,
 } from "../lib/bridge";
 import { Toolbar } from "./Toolbar";
@@ -28,9 +30,6 @@ import { DragOutGhost, ParkedPieces, useDragOffArtboard } from "./Parking";
  * point visually fixed (Figma semantics). */
 function zoomAt(cx: number, cy: number, factor: number) {
   const s = useStore.getState();
-  // The math lives in lib/panZoom so the drift view zooms identically — two
-  // canvas-like surfaces that anchored zoom differently would feel like two
-  // different apps.
   const next = zoomToward({ zoom: s.zoom, pan: s.pan }, cx, cy, factor);
   if (next) s.setZoomPan(next.zoom, next.pan);
 }
@@ -111,7 +110,6 @@ export function Canvas() {
   const pageMeta = useStore((s) => s.pageMeta);
   const mockSession = useStore((s) => s.sessionSeed?.enabled ?? false);
   const tool = useStore((s) => s.tool);
-  const editorTab = useStore((s) => s.editorTab);
   const selectedRoute = useStore((s) => s.selectedRoute);
   const setSelectedRoute = useStore((s) => s.setSelectedRoute);
   const clearSelection = useStore((s) => s.clearSelection);
@@ -146,6 +144,17 @@ export function Canvas() {
           lastSelectRef.current = sel.dedupId;
           sendToOverlay({ type: "select-id", id: sel.dedupId });
         }
+      } else if (m.type === "selected-many") {
+        // A marquee or a shift-click: several elements, all on the artboard
+        // that reported them. A selection never spans artboards, so the
+        // others drop whatever they were showing.
+        lastSelectRef.current = null;
+        useStore.getState().setMultiSelected(m.payloads as SelectedElement[]);
+        sendToOtherFrames(e.source, { type: "clear" });
+      } else if (m.type === "deselected") {
+        // The page's own empty space was clicked, or a marquee caught nothing.
+        lastSelectRef.current = null;
+        useStore.getState().clearSelection();
       } else if (m.type === "page-size") {
         // Height belongs to the frame that measured it, keyed by its route.
         const route = routeOfWindow(e.source) ?? (m.path as string) ?? "/";
@@ -526,11 +535,7 @@ export function Canvas() {
     <div
       ref={containerRef}
       data-canvas-root
-      // Hidden (not unmounted) on the Components tab: unmounting would
-      // reload the app frames and drop live state + staged class previews.
-      className={`flex-1 min-w-0 relative overflow-hidden bg-surface-0 ${
-        editorTab === "canvas" ? "" : "hidden"
-      }`}
+      className="flex-1 min-w-0 relative overflow-hidden bg-surface-0"
       style={{
         backgroundImage:
           "radial-gradient(circle, var(--color-line) 1px, transparent 1px)",
@@ -567,7 +572,7 @@ export function Canvas() {
         }
         if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 4) return;
         clearSelection();
-        // "Nothing selected" includes the artboard the scan was pointed at —
+        // "Nothing selected" includes the selected artboard —
         // it is drawn as a selection (the accent ring) and reads as one.
         setSelectedRoute(null);
       }}
@@ -603,7 +608,8 @@ export function Canvas() {
           </div>
           <div className="text-2xs text-ink-faint mt-1 font-mono">
             {useStore.getState().customCommand ??
-              `${project?.packageManager} run dev`}
+              (project ? defaultCommand(project) : null) ??
+              "dedup's own server"}
           </div>
           {slowStart && (
             <div className="mt-5 max-w-xs text-center">
@@ -651,7 +657,7 @@ export function Canvas() {
           )}
           {/* Frame labels (Figma artboard names): pan with their frame but
               keep constant size — positioned in container space, not scaled.
-              Clicking one selects the artboard — the scan's scope. */}
+              Clicking one selects the artboard. */}
           {routes.map((route, i) => (
             <div
               key={route}
@@ -700,8 +706,8 @@ export function Canvas() {
               }}
               title={
                 selectedRoute === route
-                  ? "Selected — Scan targets this artboard. Drag the name to move it."
-                  : "Click to select this artboard for Scan; drag the name to move it"
+                  ? "Selected artboard. Drag the name to move it."
+                  : "Click to select this artboard; drag the name to move it"
               }
             >
               <span

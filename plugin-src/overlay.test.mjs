@@ -1053,9 +1053,12 @@ const ev = (x, y) => ({
   stopImmediatePropagation() {},
 });
 
-/** Arm dragging, pick `from` up and move the pointer to (x, y) over `over`. */
+/** Arm dragging, pick `from` up and move the pointer to (x, y) over `over`.
+ *  Selected first: only the selection can be picked up — a drag anywhere
+ *  else in the select tool draws a marquee (see the marquee tests). */
 function beginDrag({ send, fire, hit }, from, over, x, y) {
   send({ type: "set-edit-mode", drag: true });
+  send({ type: "select-id", id: from.getAttribute("data-dedup-id") });
   hit(over);
   fire("pointerdown", { ...ev(0, 0), target: from });
   fire("pointermove", { ...ev(x, y), target: over });
@@ -1068,6 +1071,14 @@ test("hovering something draggable offers a grab cursor — and only there", () 
 
   send({ type: "set-edit-mode", drag: true });
   fire("mousemove", { target: nodes.title });
+  assert.equal(
+    cursorRule(nodes),
+    "",
+    "armed but not selected: a drag here draws a marquee, so no grab is promised",
+  );
+
+  send({ type: "select-id", id: "src/App.tsx@1" });
+  fire("mousemove", { target: nodes.title });
   assert.match(cursorRule(nodes), /cursor:grab/);
   assert.match(
     cursorRule(nodes),
@@ -1075,11 +1086,17 @@ test("hovering something draggable offers a grab cursor — and only there", () 
     "the rule is keyed by dedup id, so nothing is written into the page",
   );
 
-  // The tagger's own verdict decides: the list item is dynamic, so a drag
-  // would be refused — promising one with a cursor is worse than saying no.
+  // Off the selection there is nothing to pick up.
   fire("mousemove", { target: nodes.item });
   assert.equal(cursorRule(nodes), "");
 
+  // The tagger's own verdict decides: the list item is dynamic, so a drag
+  // would be refused — promising one with a cursor is worse than saying no.
+  send({ type: "select-id", id: "src/App.tsx@2" });
+  fire("mousemove", { target: nodes.item });
+  assert.equal(cursorRule(nodes), "");
+
+  send({ type: "select-id", id: "src/App.tsx@1" });
   fire("mousemove", { target: nodes.title });
   assert.match(cursorRule(nodes), /cursor:grab/);
   send({ type: "set-edit-mode", drag: false });
@@ -1169,6 +1186,7 @@ test("a drag keeps the pointer past the frame's edge and says where it went", ()
   nodes.html.setPointerCapture = (id) => void (captured = id);
 
   h.send({ type: "set-edit-mode", drag: true });
+  h.send({ type: "select-id", id: "src/App.tsx@1" });
   h.hit(nodes.item);
   h.fire("pointerdown", { ...ev(0, 0), pointerId: 7, target: nodes.title });
   h.fire("pointermove", { ...ev(10, 155), pointerId: 7, target: nodes.item });
@@ -1275,6 +1293,297 @@ test("a drop still reports the move it previewed", () => {
   assert.equal(drop.id, "src/App.tsx@1");
   assert.equal(drop.to, "src/App.tsx@2");
   assert.equal(drop.position, "after");
+});
+
+// --- marquee and multi-selection ---------------------------------------------
+//
+// In the select tool a drag is one of two gestures, and which one is decided
+// at the press: inside the single selected element it picks that element up;
+// anywhere else it draws a marquee. A page has no empty space to start a
+// marquee from — every pixel is inside some element — so "drag anything to
+// move it" and "drag across to select" cannot both be the unselected default.
+
+/** A page with real geometry: the root around a title and an item. */
+function loadPage() {
+  const h = loadOverlay();
+  const { nodes } = h;
+  rect(nodes.root, 0, 0, 1000, 600);
+  rect(nodes.title, 50, 50, 300, 40);
+  rect(nodes.item, 50, 150, 300, 40);
+  h.send({ type: "set-edit-mode", drag: true });
+  return h;
+}
+
+const marqueeBoxOf = (nodes) =>
+  chrome(nodes, (c) => c.style.background === "rgba(76,127,255,0.10)")[0];
+/** Outlines drawn for a multi-selection (the pool grown in paintMulti). */
+const outlinesOf = (nodes) =>
+  chrome(nodes, (c) => c.hasAttribute("data-dedup-multi") && c.style.display === "block");
+const types = (posted) => posted.map((m) => m.type);
+const idsOf = (msg) => Array.from(msg.payloads, (p) => p.dedupId);
+
+/** Press at (x0,y0) on `from`, drag to (x1,y1). No release. */
+function drawMarquee(h, from, x0, y0, x1, y1, extra = {}) {
+  h.fire("pointerdown", { ...ev(x0, y0), pointerId: 3, target: from, ...extra });
+  h.fire("pointermove", { ...ev(x1, y1), pointerId: 3, target: from, ...extra });
+}
+
+test("a drag on an unselected element draws a marquee, not a re-parent drag", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  let captured = null;
+  nodes.html.setPointerCapture = (id) => void (captured = id);
+
+  // A press alone is not a marquee yet: a click must stay a click.
+  h.fire("pointerdown", { ...ev(20, 20), pointerId: 3, target: nodes.title });
+  h.fire("pointermove", { ...ev(21, 21), pointerId: 3, target: nodes.title });
+  assert.equal(marqueeBoxOf(nodes).style.display, "none", "under the threshold");
+
+  h.fire("pointermove", { ...ev(200, 120), pointerId: 3, target: nodes.title });
+  const box = marqueeBoxOf(nodes);
+  assert.equal(box.style.display, "block");
+  assert.deepEqual(
+    [box.style.left, box.style.top, box.style.width, box.style.height],
+    ["20px", "20px", "180px", "100px"],
+  );
+  assert.equal(captured, 3, "captured, so it survives leaving the frame");
+  assert.equal(types(posted).includes("drag-start"), false, "nothing was picked up");
+  assert.equal(ghostOf(nodes).style.display, "none");
+  assert.equal(nodes.title.style.opacity, "", "nothing fades");
+  assert.equal(cursorRule(nodes), "");
+});
+
+test("the marquee is drawn whichever way it is dragged, and only on the page", () => {
+  const h = loadPage();
+  const { nodes } = h;
+  // Up and to the left, past the frame's top-left corner.
+  drawMarquee(h, nodes.root, 400, 300, -50, -80);
+  const box = marqueeBoxOf(nodes);
+  assert.deepEqual(
+    [box.style.left, box.style.top, box.style.width, box.style.height],
+    ["0px", "0px", "400px", "300px"],
+  );
+});
+
+test("releasing a marquee selects what it touched — outermost, not the container", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  // Starts in the root's padding and crosses both children. The root encloses
+  // the marquee, so it is looked through rather than selected.
+  drawMarquee(h, nodes.root, 20, 20, 200, 180);
+  assert.equal(outlinesOf(nodes).length, 2, "what it would select is shown while dragging");
+  h.fire("pointerup", { ...ev(200, 180), pointerId: 3, target: nodes.root });
+
+  const many = posted.filter((m) => m.type === "selected-many").pop();
+  assert.ok(many, `no selected-many in ${JSON.stringify(types(posted))}`);
+  assert.deepEqual(idsOf(many), ["src/App.tsx@1", "src/App.tsx@2"]);
+  assert.ok(many.payloads[0].ancestry, "each element travels with its full payload");
+  assert.equal(marqueeBoxOf(nodes).style.display, "none");
+  assert.equal(outlinesOf(nodes).length, 2, "every selected element keeps an outline");
+});
+
+test("a marquee over one element is an ordinary selection", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  drawMarquee(h, nodes.root, 20, 20, 200, 80);
+  h.fire("pointerup", { ...ev(200, 80), pointerId: 3, target: nodes.root });
+  const selected = posted.filter((m) => m.type === "selected").pop();
+  assert.equal(selected.payload.dedupId, "src/App.tsx@1");
+  assert.equal(types(posted).includes("selected-many"), false);
+  assert.equal(outlinesOf(nodes).length, 0, "one element wears the single selection box");
+});
+
+test("a marquee that catches nothing clears the selection", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  h.send({ type: "select-ids", ids: ["src/App.tsx@1", "src/App.tsx@2"] });
+  assert.equal(outlinesOf(nodes).length, 2);
+  drawMarquee(h, nodes.root, 500, 300, 700, 500);
+  h.fire("pointerup", { ...ev(700, 500), pointerId: 3, target: nodes.root });
+  assert.equal(types(posted).pop(), "deselected");
+  assert.equal(outlinesOf(nodes).length, 0);
+});
+
+test("a marquee release is never also a click, a drop or a drag", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  drawMarquee(h, nodes.root, 20, 20, 200, 180);
+  let stopped = false;
+  h.fire("pointerup", {
+    ...ev(200, 180),
+    pointerId: 3,
+    target: nodes.title,
+    stopImmediatePropagation: () => void (stopped = true),
+  });
+  assert.ok(stopped, "the page never sees the release");
+  const before = posted.length;
+  // The click the browser fires after the pointer comes up, over the title.
+  h.fire("click", { ...ev(200, 180), target: nodes.title });
+  assert.equal(posted.length, before, "the trailing click selected nothing");
+  assert.equal(outlinesOf(nodes).length, 2, "and the marquee's selection stands");
+  for (const type of ["drop", "drop-outside", "drag-start", "drag-end", "drag-outside"]) {
+    assert.equal(types(posted).includes(type), false, type);
+  }
+  // Only that one click is swallowed: the next is a click again.
+  h.fire("pointerdown", { ...ev(60, 60), pointerId: 4, target: nodes.title });
+  h.fire("pointerup", { ...ev(60, 60), pointerId: 4, target: nodes.title });
+  h.fire("click", { ...ev(60, 60), target: nodes.title });
+  assert.equal(posted.pop().payload.dedupId, "src/App.tsx@1");
+});
+
+test("Escape and losing focus put a marquee away without touching the selection", () => {
+  const ends = {
+    Escape: (h) => h.fire("keydown", { key: "Escape", ...ev(0, 0) }),
+    "the frame losing focus": (h) => h.fire("blur", {}),
+  };
+  for (const [how, end] of Object.entries(ends)) {
+    const h = loadPage();
+    const { nodes, posted } = h;
+    h.send({ type: "select-id", id: "src/App.tsx@2" });
+    // Shift, so the press on the page is a marquee whatever is selected.
+    drawMarquee(h, nodes.root, 20, 20, 200, 80);
+    assert.equal(marqueeBoxOf(nodes).style.display, "block", how);
+    const before = posted.length;
+
+    end(h);
+    assert.equal(marqueeBoxOf(nodes).style.display, "none", how);
+    assert.equal(outlinesOf(nodes).length, 0, `${how}: the would-be selection is gone`);
+    // The pointer comes up later, and the browser clicks: neither selects.
+    h.fire("pointerup", { ...ev(200, 80), pointerId: 3, target: nodes.title });
+    h.fire("click", { ...ev(200, 80), target: nodes.title });
+    assert.deepEqual(
+      types(posted.slice(before)),
+      [],
+      `${how}: nothing reported — not a selection, and Escape is not forwarded as "deselect"`,
+    );
+    assert.equal(h.sandbox.consoleCalls.length, 0, how);
+  }
+});
+
+test("a drag that starts inside the selection is still the re-parent drag", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  h.send({ type: "select-id", id: "src/App.tsx@1" });
+  h.hit(nodes.item);
+  h.fire("pointerdown", { ...ev(60, 60), pointerId: 3, target: nodes.title });
+  h.fire("pointermove", { ...ev(60, 185), pointerId: 3, target: nodes.item });
+  assert.ok(types(posted).includes("drag-start"));
+  assert.equal(marqueeBoxOf(nodes).style.display, "none", "no marquee");
+  h.fire("pointerup", { ...ev(60, 185), pointerId: 3, target: nodes.item });
+  const drop = posted.find((m) => m.type === "drop");
+  assert.equal(drop.id, "src/App.tsx@1");
+  assert.equal(drop.to, "src/App.tsx@2");
+});
+
+test("with several selected, or with Shift, a drag is a marquee even on the selection", () => {
+  // Several selected: the re-parent drag belongs to a single selection.
+  const many = loadPage();
+  many.send({ type: "select-ids", ids: ["src/App.tsx@1", "src/App.tsx@2"] });
+  drawMarquee(many, many.nodes.title, 60, 60, 200, 120);
+  assert.equal(marqueeBoxOf(many.nodes).style.display, "block");
+  assert.equal(types(many.posted).includes("drag-start"), false);
+
+  // Shift on the selected element: add to the selection, never move it.
+  const h = loadPage();
+  const { nodes, posted } = h;
+  h.send({ type: "select-id", id: "src/App.tsx@1" });
+  drawMarquee(h, nodes.title, 60, 160, 200, 180, { shiftKey: true });
+  h.fire("pointerup", { ...ev(200, 180), pointerId: 3, target: nodes.item, shiftKey: true });
+  assert.equal(types(posted).includes("drag-start"), false);
+  assert.deepEqual(
+    idsOf(posted.filter((m) => m.type === "selected-many").pop()),
+    ["src/App.tsx@1", "src/App.tsx@2"],
+    "the marquee caught only the item; Shift kept the title",
+  );
+});
+
+test("shift-click adds an element to the selection and takes it back out", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  h.fire("click", { ...ev(60, 60), target: nodes.title });
+  h.fire("click", { ...ev(60, 160), target: nodes.item, shiftKey: true });
+  assert.deepEqual(
+    idsOf(posted.filter((m) => m.type === "selected-many").pop()),
+    ["src/App.tsx@1", "src/App.tsx@2"],
+  );
+  assert.equal(outlinesOf(nodes).length, 2);
+
+  // Out again: one left, which is an ordinary selection once more.
+  h.fire("click", { ...ev(60, 60), target: nodes.title, shiftKey: true });
+  const last = posted.pop();
+  assert.equal(last.type, "selected");
+  assert.equal(last.payload.dedupId, "src/App.tsx@2");
+  assert.equal(outlinesOf(nodes).length, 0);
+
+  // And the last one out leaves nothing.
+  h.fire("click", { ...ev(60, 160), target: nodes.item, shiftKey: true });
+  assert.equal(posted.pop().type, "deselected");
+});
+
+test("a plain click still selects exactly one, and ends a multi-selection", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  h.send({ type: "select-ids", ids: ["src/App.tsx@1", "src/App.tsx@2"] });
+  h.fire("pointerdown", { ...ev(60, 160), pointerId: 3, target: nodes.item });
+  h.fire("pointerup", { ...ev(60, 160), pointerId: 3, target: nodes.item });
+  h.fire("click", { ...ev(60, 160), target: nodes.item });
+  const last = posted.pop();
+  assert.equal(last.type, "selected");
+  assert.equal(last.payload.dedupId, "src/App.tsx@2");
+  assert.equal(outlinesOf(nodes).length, 0);
+});
+
+test("clicking the page's own empty space selects nothing", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  h.send({ type: "select-id", id: "src/App.tsx@1" });
+  // <body> is not tagged: nothing of the project's is under the pointer.
+  h.fire("click", { ...ev(900, 700), target: nodes.body });
+  assert.equal(posted.pop().type, "deselected");
+});
+
+test("the editor can mirror a multi-selection in, and ask for it back", () => {
+  const h = loadPage();
+  const { nodes, posted } = h;
+  const before = posted.length;
+  h.send({ type: "select-ids", ids: ["src/App.tsx@2", "src/App.tsx@1", "nope@9"] });
+  assert.equal(outlinesOf(nodes).length, 2);
+  assert.equal(posted.length, before, "mirroring alone reports nothing back");
+
+  h.send({ type: "select-ids", ids: ["src/App.tsx@2", "src/App.tsx@1"], report: true });
+  assert.deepEqual(
+    idsOf(posted.pop()),
+    ["src/App.tsx@1", "src/App.tsx@2"],
+    "reported in page order, whatever order they were asked for in",
+  );
+
+  // A frame holding none of them stays silent rather than racing a null back.
+  h.send({ type: "select-ids", ids: ["other@1", "other@2"], report: true });
+  assert.equal(posted.length, before, "nothing further posted (the answer above was popped)");
+  assert.equal(outlinesOf(nodes).length, 0, "and drops what it was showing");
+
+  h.send({ type: "select-ids", ids: ["src/App.tsx@1", "src/App.tsx@2"] });
+  h.send({ type: "clear" });
+  assert.equal(outlinesOf(nodes).length, 0, "clear takes every outline");
+});
+
+test("the marquee belongs to the select tool, and no grips come with several", () => {
+  // Not armed (text, hand, annotate): a drag draws nothing.
+  const off = loadOverlay();
+  drawMarquee(off, off.nodes.root, 20, 20, 200, 180);
+  assert.equal(marqueeBoxOf(off.nodes).style.display, "none");
+
+  // Browse mode hands the page back, selection and all.
+  const h = loadPage();
+  const { nodes } = h;
+  h.send({ type: "set-resizable", id: "src/App.tsx@1", enabled: true });
+  h.send({ type: "select-ids", ids: ["src/App.tsx@1", "src/App.tsx@2"] });
+  const grips = nodes.html.children.filter(
+    (c) => c.hasAttribute("data-dedup-handle") && c.style.display === "block",
+  );
+  assert.equal(grips.length, 0, "resize is single-selection only");
+  h.send({ type: "set-mode", mode: "browse" });
+  assert.equal(outlinesOf(nodes).length, 0);
 });
 
 // --- viewport-height freeze --------------------------------------------------
