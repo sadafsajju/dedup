@@ -438,7 +438,7 @@ mod tests {
             std::fs::write(root.join(file), "export default function P() { return null; }").unwrap();
         }
 
-        let out = routes(root.to_str().unwrap(), "app").unwrap();
+        let out = routes(root.to_str().unwrap(), "next").unwrap();
         assert_eq!(out["ok"], true, "{out}");
         let mut found: Vec<String> = out["routes"]
             .as_array()

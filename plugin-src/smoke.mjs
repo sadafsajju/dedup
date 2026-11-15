@@ -639,6 +639,40 @@ export const router = createBrowserRouter([
   assert.deepEqual(routes, ["/", "/alpha", "/zebra"]);
 });
 
+test("routes: a Vite app's src/pages/ folder is views, not Next file routes", () => {
+  // The bug: a react-router app keeping its views in src/pages/ (a common
+  // layout) showed a phantom page per file — /Home, /Shop — beside its real
+  // routes, because pages/ was read as Next's file-based router everywhere.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dedup-routes-"));
+  const pages = path.join(dir, "src", "pages");
+  fs.mkdirSync(pages, { recursive: true });
+  for (const name of ["Home", "Shop"]) {
+    fs.writeFileSync(path.join(pages, `${name}.jsx`), `export default function ${name}() { return null; }`);
+  }
+  fs.writeFileSync(
+    path.join(dir, "src", "main.jsx"),
+    `import { BrowserRouter, Routes, Route } from "react-router-dom";
+import Home from "./pages/Home";
+import Shop from "./pages/Shop";
+export const app = (
+  <BrowserRouter>
+    <Routes>
+      <Route path="/" element={<Home />} />
+      <Route path="/shop" element={<Shop />} />
+    </Routes>
+  </BrowserRouter>
+);`,
+  );
+  const vite = discoverRoutes(dir, "vite");
+  const undetected = discoverRoutes(dir);
+  // The same tree, detected as Next, is file-routed: that is Next's rule.
+  const next = discoverRoutes(dir, "next");
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.deepEqual(vite, ["/", "/shop"]);
+  assert.deepEqual(undetected, ["/", "/shop"], "no framework named: no file routes guessed");
+  assert.deepEqual(next, ["/", "/Home", "/shop", "/Shop"]);
+});
+
 // --- boot script: mock session + hold --------------------------------------
 
 /** A stand-in XMLHttpRequest: enough surface for the offline cut to wrap. */

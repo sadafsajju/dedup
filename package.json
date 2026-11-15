@@ -27,7 +27,8 @@
     "test:mentions": "node plugin-src/run-ts.mjs plugin-src/mentions.test.mts",
     "test:parking": "node plugin-src/run-ts.mjs plugin-src/parking.test.mts",
     "test:marquee": "node plugin-src/run-ts.mjs plugin-src/marquee.test.mts",
-    "test:commit": "node plugin-src/run-ts.mjs plugin-src/committab.test.mts"
+    "test:commit": "node plugin-src/run-ts.mjs plugin-src/committab.test.mts",
+    "test:keys": "node plugin-src/run-ts.mjs plugin-src/keys.test.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

@@ -574,8 +574,12 @@ async fn detect_routes(
 ) -> Result<serde_json::Value, String> {
     // Which discovery to run is the framework the compatibility card already
     // settled on, not a second guess from inside the sidecar.
+    // Next is named because `pages/` and `app/` are routes only there; in a
+    // Vite app the same folder names are just where the views live.
     let kind = match framework {
         Some(Framework::Static) => "static",
+        Some(Framework::Next) => "next",
+        Some(Framework::Vite) => "vite",
         _ => "app",
     };
     tauri::async_runtime::spawn_blocking(move || sidecar::routes(&root, kind))

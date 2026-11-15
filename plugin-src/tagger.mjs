@@ -97,7 +97,8 @@ export default function dedupTagger(options = {}) {
         res.setHeader("content-type", "application/json");
         res.setHeader("access-control-allow-origin", "*");
         try {
-          res.end(JSON.stringify({ routes: discoverRoutes(projectRoot) }));
+          // This plugin only runs in a Vite project, where `pages/` is just a folder.
+          res.end(JSON.stringify({ routes: discoverRoutes(projectRoot, "vite") }));
         } catch {
           res.end(JSON.stringify({ routes: ["/"] }));
         }

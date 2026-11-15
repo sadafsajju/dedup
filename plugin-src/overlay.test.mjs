@@ -1151,10 +1151,74 @@ test("in a row, the ghost lands beside the target rather than under it", () => {
   assert.equal(ghost.style.left, "260px", "after → to the right of the target");
   assert.equal(ghost.style.top, "0px");
 
-  // row-reverse renders the DOM's `after` to the *left*.
+  // row-reverse: the pointer at the right edge is still the right edge — the
+  // DOM's `before` there — so the ghost stays where the pointer is.
   nodes.root.computed = { display: "flex", flexDirection: "row-reverse" };
   h.fire("pointermove", { ...ev(255, 30), target: nodes.item });
+  assert.equal(ghost.style.left, "260px");
+  // …and the left edge is the DOM's `after`, rendered on the left.
+  h.fire("pointermove", { ...ev(205, 30), target: nodes.item });
   assert.equal(ghost.style.left, "100px");
+});
+
+/** Ask the overlay where a drop at (x, y) would land, the way the editor
+ * does for a drag coming from elsewhere: the same `dropTargetAt` an in-page
+ * drag uses, without having to stage a whole gesture per point. */
+const landing = (h, x, y) => {
+  h.send({ type: "probe-drop", x, y, seq: x * 1000 + y });
+  return h.posted.filter((m) => m.type === "probe-result").pop().position;
+};
+const shownLine = (nodes) =>
+  chrome(nodes, (c) => c.style.display === "block" && c.style.width === "2px")[0];
+
+test("in a row, the side of the target decides before/after — not its height", () => {
+  // The bug this pins: a row of chips, dragged sideways, nested the chip
+  // inside its neighbour, because the before/after bands were read off y and
+  // a sideways drag spends its whole life in the middle band.
+  const h = loadOverlay();
+  const { nodes } = h;
+  nodes.root.computed = { display: "flex", flexDirection: "row" };
+  rect(nodes.item, 200, 0, 60, 40);
+  h.hit(nodes.item);
+
+  assert.equal(landing(h, 205, 20), "before", "left edge, half-way down");
+  assert.equal(landing(h, 255, 20), "after", "right edge, half-way down");
+  assert.equal(landing(h, 230, 2), "inside", "the middle of a container is still inside, at any height");
+
+  landing(h, 205, 20);
+  const line = shownLine(nodes);
+  assert.ok(line, "the insertion point is a vertical line, beside the target");
+  assert.equal(line.style.left, "199px");
+  assert.equal(line.style.top, "0px");
+  assert.equal(line.style.height, "40px");
+
+  landing(h, 255, 20);
+  assert.equal(shownLine(nodes).style.left, "259px", "after → on the right edge");
+
+  // row-reverse: the DOM's `before` renders on the right, so the right edge
+  // means before — the element goes to whichever side the pointer is on.
+  nodes.root.computed = { display: "flex", flexDirection: "row-reverse" };
+  assert.equal(landing(h, 255, 20), "before");
+  assert.equal(shownLine(nodes).style.left, "259px", "drawn where the pointer is");
+  assert.equal(landing(h, 205, 20), "after");
+  assert.equal(shownLine(nodes).style.left, "199px");
+});
+
+test("in a column, height still decides, and the line runs across the target", () => {
+  const h = loadOverlay();
+  const { nodes } = h;
+  rect(nodes.item, 0, 100, 300, 60);
+  h.hit(nodes.item);
+
+  assert.equal(landing(h, 10, 105), "before");
+  assert.equal(landing(h, 10, 130), "inside");
+  assert.equal(landing(h, 290, 155), "after", "x plays no part outside a row");
+
+  landing(h, 10, 105);
+  const line = chrome(nodes, (c) => c.style.display === "block" && c.style.height === "2px")[0];
+  assert.ok(line, "a horizontal line");
+  assert.equal(line.style.width, "300px");
+  assert.equal(line.style.top, "99px");
 });
 
 test("dropping inside a container previews the element as its last child", () => {

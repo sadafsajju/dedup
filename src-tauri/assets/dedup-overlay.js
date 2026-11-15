@@ -1097,7 +1097,14 @@
       if (!el) return null;
       const r = el.getBoundingClientRect();
       if (r.height < 1) return null;
-      const rel = (y - r.top) / r.height;
+      const row = rowLayout(el.parentElement);
+      let rel;
+      if (row && r.width >= 1) {
+        rel = (x - r.left) / r.width;
+        if (row.reverse) rel = 1 - rel;
+      } else {
+        rel = (y - r.top) / r.height;
+      }
       const acceptsChildren = !VOID_TAGS.has(el.tagName.toLowerCase());
       const position2 = acceptsChildren && rel > 0.3 && rel < 0.7 ? "inside" : rel < 0.5 ? "before" : "after";
       return { el, position: position2, rect: r };
@@ -1172,11 +1179,24 @@
         return;
       }
       dropBox.style.display = "none";
+      const row = rowLayout(target.el.parentElement);
+      if (row) {
+        const end = position2 === "after" !== row.reverse;
+        Object.assign(dropLine.style, {
+          display: "block",
+          left: (end ? rect.x + rect.width - 1 : rect.x - 1) + "px",
+          top: rect.y + "px",
+          width: "2px",
+          height: rect.height + "px"
+        });
+        return;
+      }
       Object.assign(dropLine.style, {
         display: "block",
         left: rect.x + "px",
         top: (position2 === "before" ? rect.y - 1 : rect.y + rect.height - 1) + "px",
-        width: rect.width + "px"
+        width: rect.width + "px",
+        height: "2px"
       });
     }
     function hideDropIndicator() {

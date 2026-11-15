@@ -2968,3 +2968,37 @@ composed from the tested single-element paths but have no test of their own),
 and the Layers and inspector rendering. Known limits: no multi-element
 re-parent drag or class edit; a selection cannot span artboards; multi-delete
 asks the write-back once per element (one sidecar spawn each).
+
+## Fix — four bugs found while filming the demo (2026-11-15)
+
+Recording the YouTube demo against a small Vite + react-router project turned
+up four bugs. Each now has a test.
+
+- **Drops in a row nested instead of reordering.** `dropTargetAt` read the
+  before / inside / after bands off the pointer's *y* even when the siblings
+  run horizontally, so a sideways drag spent its whole life in the middle band
+  and nested the element inside its neighbour. It now reads *x* when the
+  target's parent is a flex row (flipped for `row-reverse`, so the element
+  goes to whichever side the pointer is on), and the insertion line is drawn
+  vertically beside the target. Columns are unchanged. `pnpm test:overlay`
+  (two new tests; the old `row-reverse` assertion encoded the y rule and was
+  rewritten).
+- **Phantom pages in Vite projects.** Route discovery always added Next's
+  file routes, so a react-router app keeping its views in `src/pages/` showed
+  `/Home`, `/Shop`… beside its real routes. Next file routing now applies only
+  when the project was detected as Next: `detect_routes` passes `next`/`vite`
+  through instead of collapsing everything to `app`, and the Vite tagger says
+  `vite`. `pnpm test:plugin` (new routes test); the Rust Next-routes test now
+  asks with `next`.
+- **Chat keystrokes reaching tool shortcuts.** A keystroke the canvas overlay
+  forwards is replayed on `window`, so the shortcut handler's target-only
+  "is this a field?" check never saw the composer. It now also asks which
+  element has focus (`typingInEditor`, `src/lib/keys.ts`, `pnpm test:keys`).
+  Seen only with keystrokes delivered to a background app during recording,
+  not reproduced with ordinary typing — this closes the path either way.
+- **Stale Settings wording.** The AI note still said the default agent was
+  used "for organizing scans and merges". It now names what actually uses it:
+  drafting a mock sign-in session.
+
+**Not clicked through in the running app**: the row drop rule and the
+vertical line are covered by the overlay suite's stub layout only.
