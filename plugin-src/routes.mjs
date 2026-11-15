@@ -116,7 +116,11 @@ export function discoverRoutes(root, kind) {
       .slice(0, 40);
   }
 
-  const routes = new Set(["/", ...discoverNextRoutes(root)]);
+  // `pages/` and `app/` are routes only because Next says so. Anywhere else
+  // they are just folders: a Vite + react-router app keeping its views in
+  // `src/pages/` grew a phantom page per file (`/Home`, `/About`) beside its
+  // real routes. Only a project detected as Next gets file-based routing.
+  const routes = new Set(["/", ...(kind === "next" ? discoverNextRoutes(root) : [])]);
   const srcDir = path.join(root, "src");
   const stack = [fs.existsSync(srcDir) ? srcDir : root];
   let filesRead = 0;

@@ -26,6 +26,7 @@ pnpm test:mentions      # chat composer: which agent `@claude`/`@codex` routes t
 pnpm test:parking       # parked canvas pieces + one-gesture undo (lib/parking, lib/undo)
 pnpm test:marquee       # what a marquee selects (plugin-src/marquee.mjs) + multi-selection rules
 pnpm test:commit        # Commit tab: the one list, the message, when push/land are offered
+pnpm test:keys          # whether a keystroke is a tool shortcut or text for a focused field
 pnpm test:openprefs     # when opening a project stops to ask (command / dirty tree)
 pnpm test:canvas        # the canvas a project reopens with (routes + choices)
 pnpm test:annotate      # canvas markup: rough.js geometry + what a mark stores

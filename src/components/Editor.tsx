@@ -11,6 +11,7 @@ import {
   stopDevServer,
 } from "../lib/api";
 import { useStore } from "../lib/store";
+import { typingInEditor } from "../lib/keys";
 import { CLI_AGENTS } from "../lib/types";
 import { TopBar } from "./TopBar";
 import { Sidebar } from "./Sidebar";
@@ -119,9 +120,9 @@ export function Editor() {
   // overlay forwards them as synthetic events (see Canvas).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const inField =
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement;
+      // The focused element as well as the target: a keystroke the canvas
+      // forwards is replayed on `window`, so its target is never a field.
+      const inField = typingInEditor(e.target, document.activeElement);
       if (e.metaKey || e.ctrlKey) {
         const s = useStore.getState();
         if (e.key === "1") s.setViewport("mobile");

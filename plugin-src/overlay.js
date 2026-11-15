@@ -1490,6 +1490,13 @@ import { marqueeHits, marqueeRect } from "./marquee.mjs";
    * Which element a pointer at (x, y) would drop onto, and where relative to
    * it. `exclude` (the element being dragged) and its subtree are skipped —
    * dropping something inside itself is not a thing.
+   *
+   * The edges that mean before/after lie along the axis the siblings are laid
+   * out on. In a row that is x: people drag sideways there, and reading y
+   * instead made nearly every sideways drop land in the middle band, nesting
+   * the element inside its neighbour rather than beside it. In `row-reverse`
+   * the DOM's `before` renders on the right, so the fraction is flipped —
+   * whichever side the pointer is on is the side the element goes.
    */
   function dropTargetAt(x, y, exclude) {
     let el = tagged(document.elementFromPoint(x, y));
@@ -1499,7 +1506,14 @@ import { marqueeHits, marqueeRect } from "./marquee.mjs";
     if (!el) return null;
     const r = el.getBoundingClientRect();
     if (r.height < 1) return null;
-    const rel = (y - r.top) / r.height;
+    const row = rowLayout(el.parentElement);
+    let rel;
+    if (row && r.width >= 1) {
+      rel = (x - r.left) / r.width;
+      if (row.reverse) rel = 1 - rel;
+    } else {
+      rel = (y - r.top) / r.height;
+    }
     const acceptsChildren = !VOID_TAGS.has(el.tagName.toLowerCase());
     const position =
       acceptsChildren && rel > 0.3 && rel < 0.7
@@ -1606,11 +1620,26 @@ import { marqueeHits, marqueeRect } from "./marquee.mjs";
       return;
     }
     dropBox.style.display = "none";
+    // Beside the target in a row, above or below it in a column: the line
+    // marks the gap the element will fill, on the axis the siblings run along.
+    const row = rowLayout(target.el.parentElement);
+    if (row) {
+      const end = (position === "after") !== row.reverse;
+      Object.assign(dropLine.style, {
+        display: "block",
+        left: (end ? rect.x + rect.width - 1 : rect.x - 1) + "px",
+        top: rect.y + "px",
+        width: "2px",
+        height: rect.height + "px",
+      });
+      return;
+    }
     Object.assign(dropLine.style, {
       display: "block",
       left: rect.x + "px",
       top: (position === "before" ? rect.y - 1 : rect.y + rect.height - 1) + "px",
       width: rect.width + "px",
+      height: "2px",
     });
   }
 

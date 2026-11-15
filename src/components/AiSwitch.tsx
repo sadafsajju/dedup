@@ -230,9 +230,9 @@ export function AiBackends() {
       </div>
 
       <p className="mt-3 text-2xs text-ink-faint leading-relaxed">
-        A chat message goes to the agent it @mentions; with no mention — and for
-        organizing scans and merges — the first one that&rsquo;s on answers. The
-        API key is used only when no agent is on.
+        A chat message goes to the agent it @mentions; with no mention — and when
+        drafting a mock sign-in session — the first one that&rsquo;s on answers.
+        The API key is used only when no agent is on.
       </p>
     </div>
   );
